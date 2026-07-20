@@ -22,7 +22,7 @@ tower-http = { version = "0.7.0", features = ["cors"] }
 aes-gcm = "0.11.0"
 native-tls = "0.2.18"
 tokio-native-tls = "0.3.1"
-openssl = "=0.10.81"
+openssl = { version = "0.10.81", features = ["vendored"] }
 openssl-sys = "=0.9.117"
 indexmap = "=2.14.0"
 tokio-postgres = { version = "=0.7.10", features = ["with-chrono-0_4"] }
