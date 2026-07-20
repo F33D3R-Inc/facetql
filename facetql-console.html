@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FacetQL Console</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #151b23;
+    --panel-border: #2a323d;
+    --text: #e6edf3;
+    --text-dim: #8b96a5;
+    --accent: #5fd0a8;
+    --accent-dim: #2a5c4a;
+    --danger: #e5636b;
+    --mono: "IBM Plex Mono", "SF Mono", ui-monospace, Menlo, monospace;
+    --sans: "IBM Plex Sans", -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+  }
+  header {
+    padding: 20px 28px;
+    border-bottom: 1px solid var(--panel-border);
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  header h1 {
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  header h1::before {
+    content: "";
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    display: inline-block;
+  }
+  header h1.connected::before { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  .conn-form {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  input, textarea, select {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  input:focus, textarea:focus, select:focus {
+    outline: none;
+    border-color: var(--accent-dim);
+  }
+  button {
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 6px;
+    padding: 7px 14px;
+    font-family: var(--sans);
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.15); }
+  button.ghost {
+    background: transparent;
+    border-color: var(--panel-border);
+    color: var(--text-dim);
+  }
+  main {
+    padding: 24px 28px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 18px;
+  }
+  .panel h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin: 0 0 14px 0;
+  }
+  .field-row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .field-row input { flex: 1; min-width: 90px; }
+  .field-row textarea { flex: 1; min-width: 100%; min-height: 60px; resize: vertical; }
+  .full-span { grid-column: 1 / -1; }
+  pre.log {
+    background: #0a0e14;
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 12px;
+    font-family: var(--mono);
+    font-size: 12px;
+    max-height: 320px;
+    overflow-y: auto;
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .log-line { padding: 3px 0; border-bottom: 1px solid #161c26; }
+  .log-line:last-child { border-bottom: none; }
+  .log-line .tag { color: var(--accent); }
+  .log-line .err { color: var(--danger); }
+  .log-line .dim { color: var(--text-dim); }
+  .node-item {
+    padding: 8px 10px;
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    margin-bottom: 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .node-item:hover { border-color: var(--accent-dim); }
+  .node-item .k { color: var(--accent); }
+  .node-item .o { color: var(--text-dim); }
+  .hint { color: var(--text-dim); font-size: 11.5px; margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1 id="conn-status">FacetQL Console — not connected</h1>
+  <div class="conn-form">
+    <input id="server-url" value="http://localhost:8080" placeholder="Server URL" style="width:190px">
+    <input id="api-key" placeholder="x-api-key" style="width:130px">
+    <button onclick="connect()">Connect</button>
+  </div>
+</header>
+
+<main>
+
+  <section class="panel">
+    <h2>Create Node</h2>
+    <div class="field-row">
+      <input id="n-address" placeholder="address (e.g. Goal1)">
+      <input id="n-kind" placeholder="kind (e.g. Goal)">
+    </div>
+    <div class="field-row">
+      <input id="n-x" placeholder="x" style="max-width:50px" value="0">
+      <input id="n-y" placeholder="y" style="max-width:50px" value="0">
+      <input id="n-z" placeholder="z" style="max-width:50px" value="0">
+      <input id="n-q" placeholder="q" style="max-width:50px" value="0">
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text-dim)">
+        <input type="checkbox" id="n-public" style="width:auto"> public
+      </label>
+    </div>
+    <div class="field-row">
+      <textarea id="n-data" placeholder='data (JSON, e.g. {"title":"Get housing"})'>{}</textarea>
+    </div>
+    <button onclick="createNode()">Create node</button>
+    <div class="hint">POST /node — owner is whoever your API key authenticates as, never something you set here.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Create Edge</h2>
+    <div class="field-row">
+      <input id="e-from" placeholder="from address">
+      <input id="e-to" placeholder="to address">
+      <input id="e-kind" placeholder="kind (e.g. BELONGS_TO)">
+    </div>
+    <button onclick="createEdge()">Create edge</button>
+    <div class="hint">POST /edge — both nodes must already exist.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Query Nodes</h2>
+    <div class="field-row">
+      <input id="q-kind" placeholder="kind filter (optional)">
+      <input id="q-owner" placeholder="owner filter (optional)">
+      <button onclick="queryNodes()">Query</button>
+    </div>
+    <div id="node-results"></div>
+    <div class="hint">GET /nodes — only shows nodes you own or that are public (unless you're an admin).</div>
+  </section>
+
+  <section class="panel">
+    <h2>Live Feed <span id="feed-status" class="hint"></span></h2>
+    <pre class="log" id="feed-log"></pre>
+    <div class="hint">GET /events (SSE) — every write anywhere shows up here in real time. See SECURITY_NOTES.md: this isn't visibility-filtered yet.</div>
+  </section>
+
+  <section class="panel full-span">
+    <h2>Request Log</h2>
+    <pre class="log" id="request-log"></pre>
+  </section>
+
+</main>
+
+<script>
+let serverUrl = '';
+let apiKey = '';
+let eventSource = null;
+
+function logRequest(method, path, status, body) {
+  const el = document.getElementById('request-log');
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  const statusClass = status >= 200 && status < 300 ? 'tag' : 'err';
+  line.innerHTML = `<span class="${statusClass}">${status}</span> <span class="dim">${method}</span> ${path}` +
+    (body ? `<br><span class="dim">${escapeHtml(typeof body === 'string' ? body : JSON.stringify(body))}</span>` : '');
+  el.prepend(line);
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function api(method, path, body) {
+  const res = await fetch(serverUrl + path, {
+    method,
+    headers: {
+      'x-api-key': apiKey,
+      ...(body ? {'Content-Type': 'application/json'} : {})
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const text = await res.text();
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { parsed = text; }
+  logRequest(method, path, res.status, parsed);
+  if (!res.ok) throw new Error(`${res.status}: ${text}`);
+  return parsed;
+}
+
+function connect() {
+  serverUrl = document.getElementById('server-url').value.replace(/\/$/, '');
+  apiKey = document.getElementById('api-key').value;
+
+  fetch(serverUrl + '/').then(r => r.text()).then(() => {
+    document.getElementById('conn-status').textContent = 'FacetQL Console — connected';
+    document.getElementById('conn-status').classList.add('connected');
+    startLiveFeed();
+  }).catch(() => {
+    document.getElementById('conn-status').textContent = 'FacetQL Console — connection failed';
+    document.getElementById('conn-status').classList.remove('connected');
+  });
+}
+
+async function createNode() {
+  const address = document.getElementById('n-address').value.trim();
+  const kind = document.getElementById('n-kind').value.trim();
+  let data = document.getElementById('n-data').value.trim() || '{}';
+  try {
+    await api('POST', '/node', {
+      address, kind,
+      x: parseInt(document.getElementById('n-x').value) || 0,
+      y: parseInt(document.getElementById('n-y').value) || 0,
+      z: parseInt(document.getElementById('n-z').value) || 0,
+      q: parseInt(document.getElementById('n-q').value) || 0,
+      data,
+      public: document.getElementById('n-public').checked
+    });
+  } catch (e) { /* already logged in the request log */ }
+}
+
+async function createEdge() {
+  const from = document.getElementById('e-from').value.trim();
+  const to = document.getElementById('e-to').value.trim();
+  const kind = document.getElementById('e-kind').value.trim();
+  try {
+    await api('POST', '/edge', { from, to, kind });
+  } catch (e) { /* already logged */ }
+}
+
+async function queryNodes() {
+  const kind = document.getElementById('q-kind').value.trim();
+  const owner = document.getElementById('q-owner').value.trim();
+  const params = new URLSearchParams();
+  if (kind) params.set('kind', kind);
+  if (owner) params.set('owner', owner);
+  try {
+    const nodes = await api('GET', '/nodes?' + params.toString());
+    const el = document.getElementById('node-results');
+    el.innerHTML = '';
+    if (!nodes.length) {
+      el.innerHTML = '<div class="hint">No nodes match.</div>';
+      return;
+    }
+    nodes.forEach(n => {
+      const div = document.createElement('div');
+      div.className = 'node-item';
+      div.innerHTML = `<span class="k">${n.kind}</span> ${n.address} <span class="o">(${n.owner}, ${n.visibility})</span>`;
+      el.appendChild(div);
+    });
+  } catch (e) { /* already logged */ }
+}
+
+function startLiveFeed() {
+  if (eventSource) eventSource.close();
+  // EventSource can't send custom headers, so the key goes in the URL
+  // here specifically — see the comment on auth_middleware in
+  // src/auth.rs for the real security tradeoff this involves.
+  eventSource = new EventSource(serverUrl + '/events?key=' + encodeURIComponent(apiKey));
+  document.getElementById('feed-status').textContent = '';
+  eventSource.onmessage = (e) => {
+    const log = document.getElementById('feed-log');
+    log.textContent = e.data + '\n' + log.textContent;
+  };
+  eventSource.onerror = () => {
+    document.getElementById('feed-status').textContent = '(disconnected)';
+  };
+}
+</script>
+
+</body>
+</html>
