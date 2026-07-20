@@ -1,11 +1,11 @@
-# FacetQL (formerly EnochianDB)
+# FacetQL
 
-## The Multi-Dimensional Semantic Coordinate Database Engine
+**The Semantic Coordinate Database Engine**
 
 A standalone Rust database management system designed around entities,
-symbolic 4D coordinates (`x`, `y`, `z`, `q`), and relationships.
-It serves as the native storage backend for the Facet (`.fct`) compiler-first language.
-
+symbolic coordinates, and relationships between them. Run it the way you'd
+run Postgres or Redis — install a binary, start a server, talk to it over
+HTTP from whatever you're building (native mobile, web, another backend).
 
 ## Install
 

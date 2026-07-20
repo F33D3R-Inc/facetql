@@ -37,6 +37,15 @@ pub struct CreateNodeRequest {
     pub public: Option<bool>,
     #[serde(default)]
     pub edges: Vec<EdgeSpec>,
+    /// If true, fail with 409 instead of overwriting when `address`
+    /// already exists. Plain `POST /node` is upsert-by-default (an
+    /// existing address is silently overwritten) — fine for most
+    /// writes, actively wrong for anything that needs "only I create
+    /// this, and I need to know if I lost that race" (e.g. a cron tick
+    /// reservation across multiple app instances hitting the same
+    /// FacetQL server).
+    #[serde(default)]
+    pub if_absent: bool,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +116,7 @@ pub fn create_router(db: Arc<Database>) -> Router {
         .route("/node/:address/edges/out", get(get_edges_out))
         .route("/node/:address/edges/in", get(get_edges_in))
         .route("/events", get(subscribe_events))
+        .route("/publish", post(publish_event))
         .route("/admin/users", post(create_user))
         .route("/admin/users", get(list_users))
         .route("/admin/users/:owner", delete(revoke_user))
@@ -138,6 +148,15 @@ async fn create_node(
         payload.edges.into_iter().map(|e| (e.to, e.kind)).collect();
 
     let mut engine = db.engine.write().expect("storage engine lock poisoned");
+
+    if payload.if_absent && engine.get(&address).is_some() {
+        return (
+            StatusCode::CONFLICT,
+            format!("node already exists: {address}"),
+        )
+            .into_response();
+    }
+
     match engine.insert_with_edges(node, edge_targets) {
         Ok(edges_created) => {
             drop(engine);
@@ -443,6 +462,28 @@ async fn get_edges_in(
     }
 }
 
+#[derive(Deserialize)]
+pub struct PublishRequest {
+    pub payload: String,
+}
+
+/// Publishes an arbitrary application-level message to every `/events`
+/// subscriber, exactly like the messages FacetQL already sends itself
+/// for node/edge/user changes — this is the one FacetQL didn't have
+/// until now: a way for something OTHER than FacetQL's own internal
+/// writes to put a message on the same live feed. Specifically what
+/// Facet's `Store.Notify(payload string) error` needs: Postgres's
+/// LISTEN/NOTIFY lets any connection publish an arbitrary string that
+/// every listener receives; this is that, over the FacetQL API instead.
+async fn publish_event(
+    State(db): State<Arc<Database>>,
+    Extension(_identity): Extension<AuthIdentity>,
+    Json(payload): Json<PublishRequest>,
+) -> impl IntoResponse {
+    db.publish(payload.payload);
+    (StatusCode::OK, "published").into_response()
+}
+
 async fn subscribe_events(
     State(db): State<Arc<Database>>,
     Extension(_identity): Extension<AuthIdentity>,
@@ -541,7 +582,7 @@ async fn list_users(
 
 /// Revokes every persistent user record owned by `owner`. Note this
 /// only reaches persistent (admin-created) users — it cannot revoke a
-/// static FACETQL_TOKENS bootstrap identity, since those aren't stored
+/// static ENOCHIAN_TOKENS bootstrap identity, since those aren't stored
 /// here at all. Removing one of those means editing the env var and
 /// restarting.
 async fn revoke_user(

@@ -1,10 +1,9 @@
 use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::aead::consts::U12;
 use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
 use std::sync::OnceLock;
 
-/// An obviously-fake, all-zero key — used only when FACETQL_MASTER_KEY
+/// An obviously-fake, all-zero key — used only when ENOCHIAN_MASTER_KEY
 /// isn't set, so local development doesn't need any setup. Printed as a
 /// loud warning every time it's used, same pattern as the dev API token
 /// in auth.rs. Anything encrypted with this key is not secure — it's a
@@ -14,23 +13,23 @@ const DEV_KEY_HEX: &str = "00000000000000000000000000000000000000000000000000000
 fn cipher() -> &'static Aes256Gcm {
     static CIPHER: OnceLock<Aes256Gcm> = OnceLock::new();
     CIPHER.get_or_init(|| {
-        let key_hex = std::env::var("FACETQL_MASTER_KEY").unwrap_or_else(|_| {
+        let key_hex = std::env::var("ENOCHIAN_MASTER_KEY").unwrap_or_else(|_| {
             eprintln!(
-                "warning: FACETQL_MASTER_KEY not set — using an all-zero dev key. \
+                "warning: ENOCHIAN_MASTER_KEY not set — using an all-zero dev key. \
                  Data encrypted with this key is NOT secure. Generate a real key with \
-                 `openssl rand -hex 32` and set FACETQL_MASTER_KEY to it before running \
+                 `openssl rand -hex 32` and set ENOCHIAN_MASTER_KEY to it before running \
                  with real data."
             );
             DEV_KEY_HEX[..64].to_string()
         });
 
         let key_bytes = decode_hex(&key_hex).unwrap_or_else(|e| {
-            panic!("FACETQL_MASTER_KEY is not valid hex: {e}")
+            panic!("ENOCHIAN_MASTER_KEY is not valid hex: {e}")
         });
 
         if key_bytes.len() != 32 {
             panic!(
-                "FACETQL_MASTER_KEY must decode to exactly 32 bytes (64 hex characters) \
+                "ENOCHIAN_MASTER_KEY must decode to exactly 32 bytes (64 hex characters) \
                  for AES-256 — got {} bytes. Generate one with `openssl rand -hex 32`.",
                 key_bytes.len()
             );
@@ -41,17 +40,20 @@ fn cipher() -> &'static Aes256Gcm {
 }
 
 /// Encrypts `plaintext` with AES-256-GCM under a fresh random 12-byte
-/// nonce, and returns `nonce || ciphertext` as one blob.
+/// nonce, and returns `nonce || ciphertext` as one blob — the nonce
+/// travels with the ciphertext (it isn't secret, it just must never
+/// repeat under the same key, which a fresh random one per call
+/// guarantees with overwhelming probability). GCM's authentication tag
+/// is included in the ciphertext output automatically, so tampering
+/// with a stored record is detected on decrypt, not silently accepted.
 pub fn encrypt(plaintext: &[u8]) -> Vec<u8> {
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-
-    // FOOLPROOF FIX: Nonce<U12> implements From<[u8; 12]>. No deprecation, no generics needed.
-    let nonce = Nonce::<U12>::from(nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher()
-        .encrypt(&nonce, plaintext)
-        .expect("AES-GCM encryption failed");
+        .encrypt(nonce, plaintext)
+        .expect("AES-GCM encryption failed — should be infallible for valid key/nonce/plaintext");
 
     let mut out = Vec::with_capacity(12 + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
@@ -59,24 +61,26 @@ pub fn encrypt(plaintext: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Reverses `encrypt`. Fails if the blob is too short, wrong key, or tampered.
+/// Reverses `encrypt`. Fails if the blob is too short to contain a
+/// nonce, if it was encrypted under a different key, or if it's been
+/// tampered with — GCM's authentication check catches modification,
+/// it doesn't just decrypt garbage silently.
 pub fn decrypt(blob: &[u8]) -> Result<Vec<u8>, String> {
     if blob.len() < 12 {
         return Err("ciphertext too short to contain a nonce".to_string());
     }
     let (nonce_bytes, ciphertext) = blob.split_at(12);
-
-    // FOOLPROOF FIX: Copy the slice into a fixed-size array, then use From.
-    let mut nonce_array = [0u8; 12];
-    nonce_array.copy_from_slice(nonce_bytes);
-    let nonce = Nonce::<U12>::from(nonce_array);
+    let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher()
-        .decrypt(&nonce, ciphertext)
-        .map_err(|_| "decryption failed — wrong FACETQL_MASTER_KEY, or data is corrupted/tampered".to_string())
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| "decryption failed — wrong ENOCHIAN_MASTER_KEY, or data is corrupted/tampered".to_string())
 }
 
-/// Minimal hex codec.
+/// Minimal hex codec, written by hand rather than pulling in the `hex`
+/// crate for two lines of logic — one less dependency in a codebase
+/// that's already hit real friction from crate version drift this
+/// project (see SECURITY_NOTES.md's toolchain notes).
 pub fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

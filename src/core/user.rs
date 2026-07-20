@@ -13,7 +13,7 @@ pub enum Role {
 }
 
 /// A persistent, admin-manageable identity — the durable counterpart
-/// to the static FACETQL_TOKENS env var. The env var is still how you
+/// to the static ENOCHIAN_TOKENS env var. The env var is still how you
 /// get the *first* admin in (bootstrap problem: something has to exist
 /// before there's an admin to create more users), exactly the role
 /// POSTGRES_PASSWORD/POSTGRES_USER play for a fresh Postgres Docker
