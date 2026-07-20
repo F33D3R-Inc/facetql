@@ -3,7 +3,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
 use std::sync::OnceLock;
 
-/// An obviously-fake, all-zero key — used only when ENOCHIAN_MASTER_KEY
+/// An obviously-fake, all-zero key — used only when FACETQL_MASTER_KEY
 /// isn't set, so local development doesn't need any setup. Printed as a
 /// loud warning every time it's used, same pattern as the dev API token
 /// in auth.rs. Anything encrypted with this key is not secure — it's a
@@ -13,23 +13,23 @@ const DEV_KEY_HEX: &str = "00000000000000000000000000000000000000000000000000000
 fn cipher() -> &'static Aes256Gcm {
     static CIPHER: OnceLock<Aes256Gcm> = OnceLock::new();
     CIPHER.get_or_init(|| {
-        let key_hex = std::env::var("ENOCHIAN_MASTER_KEY").unwrap_or_else(|_| {
+        let key_hex = std::env::var("FACETQL_MASTER_KEY").unwrap_or_else(|_| {
             eprintln!(
-                "warning: ENOCHIAN_MASTER_KEY not set — using an all-zero dev key. \
+                "warning: FACETQL_MASTER_KEY not set — using an all-zero dev key. \
                  Data encrypted with this key is NOT secure. Generate a real key with \
-                 `openssl rand -hex 32` and set ENOCHIAN_MASTER_KEY to it before running \
+                 `openssl rand -hex 32` and set FACETQL_MASTER_KEY to it before running \
                  with real data."
             );
             DEV_KEY_HEX[..64].to_string()
         });
 
         let key_bytes = decode_hex(&key_hex).unwrap_or_else(|e| {
-            panic!("ENOCHIAN_MASTER_KEY is not valid hex: {e}")
+            panic!("FACETQL_MASTER_KEY is not valid hex: {e}")
         });
 
         if key_bytes.len() != 32 {
             panic!(
-                "ENOCHIAN_MASTER_KEY must decode to exactly 32 bytes (64 hex characters) \
+                "FACETQL_MASTER_KEY must decode to exactly 32 bytes (64 hex characters) \
                  for AES-256 — got {} bytes. Generate one with `openssl rand -hex 32`.",
                 key_bytes.len()
             );
@@ -74,7 +74,7 @@ pub fn decrypt(blob: &[u8]) -> Result<Vec<u8>, String> {
 
     cipher()
         .decrypt(nonce, ciphertext)
-        .map_err(|_| "decryption failed — wrong ENOCHIAN_MASTER_KEY, or data is corrupted/tampered".to_string())
+        .map_err(|_| "decryption failed — wrong FACETQL_MASTER_KEY, or data is corrupted/tampered".to_string())
 }
 
 /// Minimal hex codec, written by hand rather than pulling in the `hex`

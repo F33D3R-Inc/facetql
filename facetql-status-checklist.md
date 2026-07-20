@@ -19,7 +19,7 @@ marked ⬜ is a real, open gap, not a minor detail.
 
 ## Auth & access control
 
-- ✅ Per-identity tokens (not one shared key) — `ENOCHIAN_TOKENS` for bootstrap, persistent admin-managed users for everything after
+- ✅ Per-identity tokens (not one shared key) — `FACETQL_TOKENS` for bootstrap, persistent admin-managed users for everything after
 - ✅ Roles: User and Admin — Admin bypasses ownership checks the way a Postgres superuser bypasses row-level security
 - ✅ `POST/GET/DELETE /admin/users` — create, list, and revoke users at runtime; tokens are hashed at rest, shown once at creation
 - ✅ Ownership enforcement on every read/write (ownership or public visibility required, unless Admin)

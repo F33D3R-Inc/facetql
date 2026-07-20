@@ -292,7 +292,7 @@ impl StorageEngine {
     }
 
     /// Every persistent user, for `GET /admin/users`. Static
-    /// ENOCHIAN_TOKENS bootstrap identities are NOT included here —
+    /// FACETQL_TOKENS bootstrap identities are NOT included here —
     /// they're not stored in the engine at all, so there's nothing for
     /// this to list. Document that distinction to whoever's consuming
     /// this endpoint: it shows admin-created users, not every identity

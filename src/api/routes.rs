@@ -541,7 +541,7 @@ async fn list_users(
 
 /// Revokes every persistent user record owned by `owner`. Note this
 /// only reaches persistent (admin-created) users — it cannot revoke a
-/// static ENOCHIAN_TOKENS bootstrap identity, since those aren't stored
+/// static FACETQL_TOKENS bootstrap identity, since those aren't stored
 /// here at all. Removing one of those means editing the env var and
 /// restarting.
 async fn revoke_user(

@@ -23,8 +23,8 @@ struct Cli {
     command: Option<Command>,
 
     /// Where data files live. Defaults to ~/.facetql if unset.
-    /// Also settable via ENOCHIAN_DATA_DIR.
-    #[arg(long, global = true, env = "ENOCHIAN_DATA_DIR")]
+    /// Also settable via FACETQL_DATA_DIR.
+    #[arg(long, global = true, env = "FACETQL_DATA_DIR")]
     data_dir: Option<PathBuf>,
 }
 
@@ -35,17 +35,17 @@ enum Command {
     /// Start the server. Also what running `facetql` with no
     /// subcommand does, for backward compatibility.
     Start {
-        #[arg(long, env = "ENOCHIAN_PORT", default_value_t = 8080)]
+        #[arg(long, env = "FACETQL_PORT", default_value_t = 8080)]
         port: u16,
         /// Path to a PKCS#12 (.p12/.pfx) file containing both the TLS
         /// certificate and private key. If set (along with --tls-cert-password),
         /// the server speaks HTTPS instead of HTTP. Generate a dev one with:
         /// `openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"`
         /// `openssl pkcs12 -export -out identity.p12 -inkey key.pem -in cert.pem -passout pass:<password>`
-        #[arg(long, env = "ENOCHIAN_TLS_IDENTITY")]
+        #[arg(long, env = "FACETQL_TLS_IDENTITY")]
         tls_identity: Option<PathBuf>,
         /// Password for the PKCS#12 file above.
-        #[arg(long, env = "ENOCHIAN_TLS_IDENTITY_PASSWORD")]
+        #[arg(long, env = "FACETQL_TLS_IDENTITY_PASSWORD")]
         tls_identity_password: Option<String>,
     },
     /// Copy every data file to `output_dir`, for offline backup — the
@@ -99,7 +99,7 @@ enum ImportSource {
         /// FacetQL x-api-key to authenticate the import as. Imported
         /// rows are owned by whichever identity this token maps to —
         /// same rule as every other write.
-        #[arg(long, env = "ENOCHIAN_TOKEN")]
+        #[arg(long, env = "FACETQL_TOKEN")]
         token: String,
     },
 }
@@ -229,9 +229,9 @@ async fn run_server(port: u16, tls_identity: Option<PathBuf>, tls_identity_passw
     println!("Data directory: {}", config::data_dir().display());
     println!(
         "Auth: requests to /node* and /edge* require header 'x-api-key', mapped to an \
-         owner identity via ENOCHIAN_TOKENS (format: token1:alice,token2:bob) plus any \
+         owner identity via FACETQL_TOKENS (format: token1:alice,token2:bob) plus any \
          users created via POST /admin/users. A single admin dev token is used if \
-         ENOCHIAN_TOKENS is unset — do not run production traffic against that."
+         FACETQL_TOKENS is unset — do not run production traffic against that."
     );
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))

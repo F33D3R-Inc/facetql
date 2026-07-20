@@ -15,7 +15,7 @@ HTTP from whatever you're building (native mobile, web, another backend).
 curl -fsSL https://raw.githubusercontent.com/FACETQL-LLC/facetql/main/install.sh | sh
 ```
 
-Installs to `/usr/local/bin/facetql`. Set `ENOCHIAN_INSTALL_DIR` first to
+Installs to `/usr/local/bin/facetql`. Set `FACETQL_INSTALL_DIR` first to
 install elsewhere.
 
 ### Windows
@@ -37,14 +37,14 @@ cargo build --release
 
 ```bash
 facetql init          # creates ~/.facetql
-ENOCHIAN_TOKENS="mytoken:myself:admin" ENOCHIAN_MASTER_KEY="$(openssl rand -hex 32)" facetql start
+FACETQL_TOKENS="mytoken:myself:admin" FACETQL_MASTER_KEY="$(openssl rand -hex 32)" facetql start
 ```
 
 The server listens on port 8080 by default. Every request needs an
-`x-api-key` header matching a token from `ENOCHIAN_TOKENS`
+`x-api-key` header matching a token from `FACETQL_TOKENS`
 (`token1:alice,token2:bob:admin` — one token per identity, `:admin`
 marks a bootstrap identity as an admin). All data on disk is encrypted
-with `ENOCHIAN_MASTER_KEY` (AES-256-GCM) — generate a real one with
+with `FACETQL_MASTER_KEY` (AES-256-GCM) — generate a real one with
 `openssl rand -hex 32` and keep it safe; losing it means losing access
 to everything encrypted with it, and running without one falls back to
 an insecure, publicly-known dev key (a loud warning prints every time
@@ -72,7 +72,7 @@ facetql import postgres --pg-url <url> --table <t> --kind <k> --token <token> [-
 ```
 
 `--data-dir` defaults to `~/.facetql` and is also settable via
-`ENOCHIAN_DATA_DIR`. `--port` is also settable via `ENOCHIAN_PORT`.
+`FACETQL_DATA_DIR`. `--port` is also settable via `FACETQL_PORT`.
 `import postgres` needs a *running* `facetql start` to import into — it
 talks to the API, not the data files directly.
 

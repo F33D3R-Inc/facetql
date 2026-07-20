@@ -1,52 +1,43 @@
 #!/usr/bin/env python3
 """
-FacetQL Renaming Script
-Safely renames 'facetql' / 'FacetQL' references to 'facetql' / 'FacetQL'
-across Rust source files, documentation, and configuration files.
+FacetQL Renaming Script (v2)
+Fixes underscore-boundary misses (e.g., FACETQL_TOKENS -> FACETQL_TOKENS)
 """
-
 import os
 import re
 import argparse
 from pathlib import Path
 
-# Directories and files to ignore
 IGNORE_DIRS = {'.git', 'target', 'venv', 'env', 'node_modules', '__pycache__'}
 IGNORE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.ico', '.lock', '.bin', '.exe', '.dll', '.so', '.dylib'}
 
-# Precise replacement mappings (Order matters: more specific first)
+# ORDER MATTERS: More specific patterns (with underscores) MUST come first
 REPLACEMENTS = [
-    # Brand names
+    # 1. Underscore prefixes/suffixes (Env vars, constants, snake_case)
+    (r'FACETQL_', 'FACETQL_'),
+    (r'facetql_', 'facetql_'),
+    (r'FacetQL_', 'FacetQL_'),
+
+    # 2. Exact brand matches
     (r'\bEnochianDB\b', 'FacetQL'),
     (r'\benochianDB\b', 'FacetQL'),
-    (r'\bENOCHIAN-LLC\b', 'FACETQL-LLC'), # Update org name if desired, or keep as is
     (r'\bEnochian\b', 'FacetQL'),
     (r'\benochian\b', 'facetql'),
     (r'\bENOCHIAN\b', 'FACETQL'),
 
-    # Snake_case variables/paths
-    (r'\benochian_db\b', 'facetql'),
-    (r'\benochian_db_', 'facetql_'),
-
-    # CLI commands (e.g., "facetql import" -> "facetql import")
+    # 3. CLI commands (e.g., "facetql import" -> "facetql import")
     (r'\benochian\s+([a-z]+)', r'facetql \1'),
 ]
 
 def is_binary(file_path: Path) -> bool:
-    """Check if a file is binary by reading the first 1024 bytes."""
     try:
         with open(file_path, 'rb') as f:
-            chunk = f.read(1024)
-            return b'\0' in chunk
+            return b'\0' in f.read(1024)
     except Exception:
         return True
 
 def process_file(file_path: Path, dry_run: bool) -> bool:
-    """Process a single file and apply replacements."""
-    if file_path.suffix in IGNORE_EXTENSIONS:
-        return False
-
-    if is_binary(file_path):
+    if file_path.suffix in IGNORE_EXTENSIONS or is_binary(file_path):
         return False
 
     try:
@@ -59,11 +50,9 @@ def process_file(file_path: Path, dry_run: bool) -> bool:
     changes_made = []
 
     for pattern, replacement in REPLACEMENTS:
-        # Use re.IGNORECASE for the base 'facetql' to catch weird casing,
-        # but our specific patterns above handle the most common cases.
         new_content, count = re.subn(pattern, replacement, new_content)
         if count > 0:
-            changes_made.append(f"  - Replaced '{pattern}' -> '{replacement}' ({count} times)")
+            changes_made.append(f"  - '{pattern}' -> '{replacement}' ({count}x)")
 
     if new_content != original_content:
         if dry_run:
@@ -75,65 +64,28 @@ def process_file(file_path: Path, dry_run: bool) -> bool:
                 f.write(new_content)
             print(f"[UPDATED] {file_path}")
         return True
-
     return False
 
-def rename_files_and_dirs(root_dir: Path, dry_run: bool):
-    """Rename files and directories that contain 'facetql' in their name."""
-    for path in root_dir.rglob('*'):
-        if any(ignore in path.parts for ignore in IGNORE_DIRS):
-            continue
-
-        if 'facetql' in path.name.lower():
-            new_name = path.name.lower().replace('facetql', 'facetql')
-            # Handle PascalCase if it was EnochianSomething
-            if 'FacetQL' in path.name:
-                new_name = path.name.replace('FacetQL', 'FacetQL')
-            elif 'FACETQL' in path.name:
-                new_name = path.name.replace('FACETQL', 'FACETQL')
-            else:
-                new_name = new_name # already lowercase facetql
-
-            if new_name != path.name:
-                new_path = path.parent / new_name
-                if dry_run:
-                    print(f"[DRY RUN] Would rename: {path.name} -> {new_name}")
-                else:
-                    path.rename(new_path)
-                    print(f"[RENAMED] {path.name} -> {new_name}")
-
 def main():
-    parser = argparse.ArgumentParser(description="Rename FacetQL to FacetQL")
-    parser.add_argument('--execute', action='store_true', help="Actually perform the changes (default is dry-run)")
+    parser = argparse.ArgumentParser(description="Rename FacetQL remnants to FacetQL (v2)")
+    parser.add_argument('--execute', action='store_true', help="Actually perform the changes")
     args = parser.parse_args()
 
     dry_run = not args.execute
-    mode = "DRY RUN" if dry_run else "EXECUTION"
-
-    print(f"=== FacetQL Refactoring Script ({mode}) ===")
-    print(f"Target Directory: {Path.cwd()}")
-    if dry_run:
-        print("⚠️  Running in DRY RUN mode. No files will be modified.")
-        print("   Use '--execute' to apply changes.\n")
+    print(f"=== FacetQL Refactoring Script v2 ({'DRY RUN' if dry_run else 'EXECUTION'}) ===")
 
     root_dir = Path.cwd()
     files_modified = 0
 
-    # 1. Process file contents
-    print("--- Scanning file contents ---")
     for file_path in root_dir.rglob('*'):
         if file_path.is_file() and not any(ignore in file_path.parts for ignore in IGNORE_DIRS):
             if process_file(file_path, dry_run):
                 files_modified += 1
 
-    # 2. Rename files and directories
-    print("\n--- Scanning file/directory names ---")
-    rename_files_and_dirs(root_dir, dry_run)
-
     print(f"\n=== Summary ===")
-    print(f"Files that would be/were modified: {files_modified}")
+    print(f"Files modified: {files_modified}")
     if dry_run:
-        print("Review the output above. If it looks correct, run: python rename_to_facetql.py --execute")
+        print("Run with '--execute' to apply these changes.")
 
 if __name__ == '__main__':
     main()

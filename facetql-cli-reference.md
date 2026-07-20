@@ -30,8 +30,8 @@ facetql start --port 9090
 
 | Flag / env var | Default | What it does |
 |---|---|---|
-| `--port` / `ENOCHIAN_PORT` | 8080 | Port to listen on |
-| `--data-dir` / `ENOCHIAN_DATA_DIR` | `~/.facetql` | Where data files live |
+| `--port` / `FACETQL_PORT` | 8080 | Port to listen on |
+| `--data-dir` / `FACETQL_DATA_DIR` | `~/.facetql` | Where data files live |
 
 ## `facetql backup <output_dir>`
 
@@ -75,7 +75,7 @@ facetql import postgres \
 | `--pg-url` | yes | — | Postgres connection string |
 | `--table` | yes | — | Table to import |
 | `--kind` | yes | — | Node `kind` assigned to every imported row |
-| `--token` / `ENOCHIAN_TOKEN` | yes | — | FacetQL token to authenticate the import as |
+| `--token` / `FACETQL_TOKEN` | yes | — | FacetQL token to authenticate the import as |
 | `--id-column` | no | `id` | Column used to build a stable node address |
 | `--server` | no | `http://localhost:8080` | FacetQL server to import into |
 
@@ -83,16 +83,16 @@ facetql import postgres \
 
 | Flag / env var | Default | What it does |
 |---|---|---|
-| `--data-dir` / `ENOCHIAN_DATA_DIR` | `~/.facetql` | Where all data files live |
+| `--data-dir` / `FACETQL_DATA_DIR` | `~/.facetql` | Where all data files live |
 
 ## Environment variables (not tied to a specific command)
 
 | Variable | What it does |
 |---|---|
-| `ENOCHIAN_TOKENS` | Bootstrap identities, e.g. `token1:alice,token2:bob:admin` (the `:admin` suffix marks that identity as Admin) |
-| `ENOCHIAN_DATA_DIR` | Same as `--data-dir` |
-| `ENOCHIAN_PORT` | Same as `--port` |
-| `ENOCHIAN_TOKEN` | Default `--token` for `import postgres` |
+| `FACETQL_TOKENS` | Bootstrap identities, e.g. `token1:alice,token2:bob:admin` (the `:admin` suffix marks that identity as Admin) |
+| `FACETQL_DATA_DIR` | Same as `--data-dir` |
+| `FACETQL_PORT` | Same as `--port` |
+| `FACETQL_TOKEN` | Default `--token` for `import postgres` |
 
 ## What's NOT a CLI command (common asks that don't exist yet)
 

@@ -56,7 +56,7 @@ pub fn hash_token(token: &str) -> String {
 fn static_token_map() -> &'static HashMap<String, (String, Role)> {
     static MAP: OnceLock<HashMap<String, (String, Role)>> = OnceLock::new();
     MAP.get_or_init(|| {
-        match std::env::var("ENOCHIAN_TOKENS") {
+        match std::env::var("FACETQL_TOKENS") {
             Ok(raw) => raw
                 .split(',')
                 .filter_map(|entry| {
@@ -76,7 +76,7 @@ fn static_token_map() -> &'static HashMap<String, (String, Role)> {
                 .collect(),
             Err(_) => {
                 eprintln!(
-                    "warning: ENOCHIAN_TOKENS not set — using a single dev token \
+                    "warning: FACETQL_TOKENS not set — using a single dev token \
                      ('{DEV_TOKEN}' -> owner '{DEV_OWNER}', role Admin) so there's a way \
                      to bootstrap the first real admin via POST /admin/users. \
                      Do not run production traffic against this."

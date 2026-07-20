@@ -10,7 +10,7 @@ Base URL: `http://<host>:8080` (no TLS in this checkpoint — see Known Gaps).
 ## Authentication
 
 Every route except `GET /` requires an `x-api-key` header. The server maps
-that key to an owner identity via the `ENOCHIAN_TOKENS` environment variable
+that key to an owner identity via the `FACETQL_TOKENS` environment variable
 it was started with (`token1:alice,token2:bob`). **There is no per-request
 identity field anywhere else in the API** — whatever `owner` ends up on a
 node or edge you create is determined entirely by which token you sent, not
@@ -201,7 +201,7 @@ carry structured edge-creation results.
 
 Every identity is `User` or `Admin`. An Admin bypasses ownership checks
 entirely on reads/writes/queries — the same idea as a Postgres superuser.
-Bootstrap your first admin via `ENOCHIAN_TOKENS=token:owner:admin`; create
+Bootstrap your first admin via `FACETQL_TOKENS=token:owner:admin`; create
 every subsequent user through the API below instead of growing that env var.
 
 ### `POST /admin/users` — create a user (admin only)
@@ -221,14 +221,14 @@ there's no way to retrieve it again. If it's lost, revoke and recreate.
 ### `GET /admin/users` — list persistent users (admin only)
 
 Returns `[{ "owner": "bob", "role": "User" }, ...]` — never tokens or
-hashes. Does **not** include static `ENOCHIAN_TOKENS` bootstrap identities,
+hashes. Does **not** include static `FACETQL_TOKENS` bootstrap identities,
 only ones created through this API.
 
 ### `DELETE /admin/users/:owner` — revoke a user (admin only)
 
 Immediately invalidates that owner's token(s). `204` on success, `404` if
 no persistent user has that owner name (a static bootstrap identity isn't
-revocable this way — remove it from `ENOCHIAN_TOKENS` and restart instead).
+revocable this way — remove it from `FACETQL_TOKENS` and restart instead).
 
 ## Known gaps a client team should plan around
 

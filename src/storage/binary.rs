@@ -87,7 +87,7 @@ pub fn read_all_records<T: DeserializeOwned>(path: &std::path::Path) -> std::io:
         let decrypted = crypto::decrypt(&data_buf).unwrap_or_else(|e| {
             panic!(
                 "failed to decrypt record at offset {offset} in {}: {e} — wrong \
-                 ENOCHIAN_MASTER_KEY, or this file predates encryption at rest",
+                 FACETQL_MASTER_KEY, or this file predates encryption at rest",
                 path.display()
             )
         });

@@ -7,7 +7,7 @@ research_notes/
 
 # Runtime data — generated when the server runs. Default location is
 # now ~/.facetql (see config.rs), not the repo root, but these are
-# still ignored in case ENOCHIAN_DATA_DIR or --data-dir points at "."
+# still ignored in case FACETQL_DATA_DIR or --data-dir points at "."
 facetql.data
 facetql.wal
 facetql.edges

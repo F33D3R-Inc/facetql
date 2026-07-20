@@ -38,7 +38,7 @@
 2. **No auth on the API**: `/node` and `/node/:address` were fully
    open — any request from anywhere could create or read data. Added
    `auth_middleware` requiring a matching `x-api-key` header on both
-   routes. Key comes from `ENOCHIAN_API_KEY`; a dev-only default is
+   routes. Key comes from `FACETQL_API_KEY`; a dev-only default is
    used (and a boot-time warning printed) if that env var isn't set.
 
 3. **No permissions on nodes**: `Node` had no concept of who owns it
@@ -84,7 +84,7 @@ change closes the biggest remaining gap.
   This was the biggest functional gap for any real data model (people, orgs,
   goals, steps, resources all need to reference each other) — v0.1 had no way
   to connect two nodes at all.
-- **Per-client tokens, replacing the single shared API key.** `ENOCHIAN_TOKENS`
+- **Per-client tokens, replacing the single shared API key.** `FACETQL_TOKENS`
   env var (`token1:alice,token2:bob`) maps each token to an owner identity.
   `owner` is no longer read from the request body on `create_node` — it comes
   entirely from the authenticated token via request extensions
@@ -192,7 +192,7 @@ crash recovery, and any kind of schema validation on `data` itself.
   (`binary.rs`, `wal.rs`, `tombstone.rs`, `recovery.rs`) now reads/writes
   through this instead of hardcoded `"facetql.data"`-style literals in the
   repo root — the thing that made this feel like a dev script instead of an
-  installed service. Overridable via `--data-dir` or `ENOCHIAN_DATA_DIR`.
+  installed service. Overridable via `--data-dir` or `FACETQL_DATA_DIR`.
   Verified live: `--data-dir /tmp/facetql-test-data start --port 9090`
   correctly isolates its data files and serves on the requested port.
 - **`.github/workflows/release.yml`** — on any `v*` tag push, builds native
@@ -228,7 +228,7 @@ Everything from the v0.3 notes, plus:
 - **No Docker image** — mentioned early in planning ("docker run
   enochiandb") but not built. Given a working release binary now exists,
   a minimal Dockerfile (copy the linux-x86_64 binary, expose 8080, set
-  ENOCHIAN_DATA_DIR to a volume mount) is a small follow-up, not a big one.
+  FACETQL_DATA_DIR to a volume mount) is a small follow-up, not a big one.
 - **The release workflow is genuinely unverified** — see above. Don't
   advertise "download and install" publicly until a real tag has been
   pushed and the resulting release actually has working binaries attached.
@@ -300,12 +300,12 @@ authenticated identity being equal.
   `GET /admin/users` lists owner+role (never tokens or hashes).
   `DELETE /admin/users/:owner` revokes — verified live, including that the
   revoked token immediately stops authenticating.
-- **`ENOCHIAN_TOKENS` now accepts a third field for role**:
+- **`FACETQL_TOKENS` now accepts a third field for role**:
   `token:owner:admin`. This static map remains the bootstrap layer only —
   the same job `POSTGRES_USER`/`POSTGRES_PASSWORD` do for a fresh Postgres
   container, or root's initial password in MySQL. Everything created after
   bootstrap should go through `POST /admin/users`, not grow this env var.
-- If `ENOCHIAN_TOKENS` is unset, the dev fallback token is now Admin
+- If `FACETQL_TOKENS` is unset, the dev fallback token is now Admin
   (previously undefined role) specifically so local dev has a way to call
   `POST /admin/users` and bootstrap a real first admin without hand-editing
   environment variables.
@@ -471,7 +471,7 @@ a CORS preflight)
   addresses and operation logs are readable data too, not just the `data`
   field. A fresh random 12-byte nonce per record; GCM's authentication tag
   means tampering is detected on decrypt, not silently accepted.
-- **`ENOCHIAN_MASTER_KEY`** — a 64-hex-character (32-byte) key. If unset,
+- **`FACETQL_MASTER_KEY`** — a 64-hex-character (32-byte) key. If unset,
   falls back to an obviously-fake all-zero dev key with a loud warning on
   every boot, same pattern as the dev API token. Generate a real one with
   `openssl rand -hex 32`.
@@ -495,7 +495,7 @@ exported and re-imported, not just upgraded in place.
 
 ### Known gaps, stated plainly
 
-- **No key rotation.** Changing `ENOCHIAN_MASTER_KEY` makes every existing
+- **No key rotation.** Changing `FACETQL_MASTER_KEY` makes every existing
   record unreadable — there's no re-encrypt-under-a-new-key utility.
 - **No external KMS integration** — the key is a single env var, not
   pulled from AWS KMS/HashiCorp Vault/etc. Fine for a single-node

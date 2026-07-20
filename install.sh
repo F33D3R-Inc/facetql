@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO="FACETQL-LLC/facetql"
-INSTALL_DIR="${ENOCHIAN_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${FACETQL_INSTALL_DIR:-/usr/local/bin}"
 
 os="$(uname -s)"
 arch="$(uname -m)"
