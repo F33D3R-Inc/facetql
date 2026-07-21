@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use crate::core::node::Node;
 use crate::core::edge::Edge;
 use crate::core::user::UserRecord;
+use crate::core::history::HistoryEntry;
 use crate::storage::binary;
 use crate::storage::index::Index;
 use crate::storage::tombstone;
@@ -38,6 +39,9 @@ pub struct StorageEngine {
     pub edges_in: HashMap<String, Vec<Edge>>,
     /// Persistent users, keyed by token_hash. See core/user.rs.
     pub users: HashMap<String, UserRecord>,
+    /// Archived previous states, keyed by node address, oldest first.
+    /// See core/history.rs.
+    pub history: HashMap<String, Vec<HistoryEntry>>,
 }
 
 impl StorageEngine {
@@ -48,6 +52,7 @@ impl StorageEngine {
             edges_out: HashMap::new(),
             edges_in: HashMap::new(),
             users: HashMap::new(),
+            history: HashMap::new(),
         }
     }
 
@@ -73,6 +78,10 @@ impl StorageEngine {
             engine.users.insert(user.token_hash.clone(), user);
         }
 
+        for (_offset, entry) in binary::read_all_records::<HistoryEntry>(&binary::history_path())? {
+            engine.history.entry(entry.address.clone()).or_default().push(entry);
+        }
+
         // Tombstones are shared between nodes and revoked users, namespaced
         // by a "user:" prefix so a user's token_hash can never collide with
         // a node address. See StorageEngine::revoke_user.
@@ -94,17 +103,30 @@ impl StorageEngine {
         self.nodes.is_empty()
     }
 
-    /// Write-ahead-log the intent, persist the node to disk, index its
-    /// offset, then update the in-memory view. Order matters: WAL
-    /// before the write is what makes recovery possible if the process
-    /// dies mid-write.
+    /// Write-ahead-log the intent, archive whatever this address
+    /// currently holds (if anything — a first-time create has nothing
+    /// to archive), persist the node to disk, index its offset, then
+    /// update the in-memory view.
     ///
-    /// This is also how "update" works: a node is keyed by address in
-    /// the HashMap, so inserting again with the same address and a
-    /// changed `data`/`visibility` overwrites the live value. The old
-    /// record is still in facetql.data (append-only), just no longer
-    /// the one `get()` returns — same pattern as the tombstone log.
+    /// The archiving step is the actual version history feature: if a
+    /// node already exists at this address, its current state is
+    /// captured as a `HistoryEntry` and durably appended to
+    /// `facetql.history` BEFORE the new value is written — so even if
+    /// the process died between those two writes, the old version is
+    /// safely recorded either way; the new value either landed or
+    /// didn't, but the history of what came before it is never lost.
+    /// Every overwrite is archived, unconditionally — no attempt to
+    /// detect "nothing actually changed" and skip it, which keeps the
+    /// behavior simple and predictable rather than silently dropping
+    /// history someone might have expected to see.
     pub fn insert(&mut self, node: Node) -> Result<(), String> {
+        if let Some(previous) = self.nodes.get(&node.address) {
+            let entry = HistoryEntry::now(previous.clone());
+            wal::log(format!("ARCHIVE {} at {}", entry.address, entry.archived_at_unix));
+            binary::append_record(&binary::history_path(), &entry).map_err(|e| e.to_string())?;
+            self.history.entry(node.address.clone()).or_default().push(entry);
+        }
+
         wal::log(format!("INSERT {}", node.address));
 
         let offset = binary::append_node(&node).map_err(|e| e.to_string())?;
@@ -112,6 +134,13 @@ impl StorageEngine {
         self.nodes.insert(node.address.clone(), node);
 
         Ok(())
+    }
+
+    /// Every archived previous state for `address`, oldest first. Does
+    /// NOT include the current live value — that's `get()`. Empty if
+    /// the node has never been overwritten (or has never existed).
+    pub fn history_for(&self, address: &str) -> &[HistoryEntry] {
+        self.history.get(address).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub fn get(&self, address: &str) -> Option<&Node> {

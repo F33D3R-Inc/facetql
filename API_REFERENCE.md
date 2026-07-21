@@ -184,6 +184,25 @@ GET /nodes?kind=Goal&owner=alice&limit=20
 Both `from` and `to` must already exist, or `400`. Owner is your
 authenticated identity, same rule as nodes.
 
+### `GET /node/:address/history` — every archived previous state
+
+Returns every prior value this node has ever had, oldest first, as full
+node snapshots (not just the `data` field — owner, visibility, kind too,
+as they were at that point). Does NOT include the current live value —
+that's the plain `GET /node/:address`. Empty array if the node has never
+been overwritten. Every `PUT` archives the value it's about to replace,
+automatically, no opt-in needed.
+
+```json
+[
+  { "address": "Doc1", "archived_at_unix": 1784602708, "node": { "...": "full node as it was" } },
+  { "address": "Doc1", "archived_at_unix": 1784602710, "node": { "...": "the next state" } }
+]
+```
+
+Read-only — there's no "restore to version N" call yet. To revert,
+fetch the version you want and `PUT` its data yourself.
+
 ### `GET /node/:address/edges/out` / `GET /node/:address/edges/in`
 
 Outgoing and incoming edges for a node. Gated by whether you can read the

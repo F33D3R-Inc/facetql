@@ -1,6 +1,6 @@
 [package]
 name = "facetql"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 
 [dependencies]
@@ -22,8 +22,8 @@ tower-http = { version = "0.5", features = ["cors"] }
 aes-gcm = "0.10"
 native-tls = "0.2"
 tokio-native-tls = "0.3"
-openssl = { version = "0.10.60", features = ["vendored"] }
-openssl-sys = "=0.9.101"
+openssl = "=0.10.60"
+openssl-sys = { version = "0.9.101", features = ["vendored"] }
 indexmap = "=2.2.6"
 tokio-postgres = { version = "=0.7.10", features = ["with-chrono-0_4"] }
 chrono = { version = "0.4", features = ["serde"] }

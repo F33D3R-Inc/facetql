@@ -588,3 +588,44 @@ outside that context too.
   than FacetQL itself to put a message on the live feed. Verified live:
   connected a subscriber, published a custom string via `/publish`,
   confirmed it arrived verbatim.
+
+## v0.13 checkpoint — real version history per node
+
+Built specifically to replace the "3D temporal axis / dimensional
+morphing" idea with something that actually exists: no coordinate
+morphing, no dissonance score — every time a node is overwritten, its
+previous state is durably archived first, automatically, every time.
+
+### Added, verified live
+
+- **Every overwrite is archived.** Updated one node 5 times (v1→v2→...→v6);
+  the live value correctly shows v6, and `GET /node/:address/history`
+  returns exactly v1 through v5, in order — the state right before each
+  overwrite.
+- **A node that's never been updated has empty history** (`[]`), not an
+  error or a missing field.
+- **Survives a restart** — killed and restarted the server, all 5
+  archived entries were still there.
+- Archiving happens unconditionally on every overwrite, no "did it
+  actually change" check — simpler, predictable behavior over a subtler
+  optimization that could silently drop history someone expected to see.
+- The archive write happens BEFORE the new value is written, both
+  durable disk writes — if the process dies between them, the old
+  version is safely recorded either way.
+- Encrypted at rest the same as every other data file (`facetql.history`
+  goes through the same AES-256-GCM path as nodes/edges/users).
+
+### Known gaps, stated plainly
+
+- **No way to restore an old version** — `GET /node/:address/history`
+  is read-only. Reverting means reading an old entry and issuing a
+  normal `PUT` with its data yourself; there's no one-call "roll back to
+  version N" yet.
+- **No pruning/retention policy** — history grows forever, same
+  unbounded-growth caveat as the WAL. A node updated thousands of times
+  accumulates thousands of history entries with no automatic cleanup.
+- **Permission on history is checked against the node's CURRENT
+  owner/visibility**, not what it was at each historical point — if
+  ownership itself could ever change (it can't today, but worth noting
+  for later), this wouldn't retroactively restrict who can see
+  ownership-adjacent history from before the change.

@@ -134,3 +134,8 @@ pub fn edges_path() -> std::path::PathBuf {
 pub fn users_path() -> std::path::PathBuf {
     config::data_file("facetql.users")
 }
+
+/// Archived previous node states — see core/history.rs.
+pub fn history_path() -> std::path::PathBuf {
+    config::data_file("facetql.history")
+}

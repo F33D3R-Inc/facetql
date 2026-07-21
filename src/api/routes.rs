@@ -16,6 +16,7 @@ use crate::core::node::{Node, Visibility};
 use crate::core::edge::Edge;
 use crate::core::coordinate::Coordinate;
 use crate::core::user::{Role, UserRecord};
+use crate::core::history::HistoryEntry;
 use crate::auth::{auth_middleware, hash_token, AuthIdentity};
 use crate::storage::engine::{ClaimError, TxOperation};
 
@@ -106,6 +107,7 @@ pub fn create_router(db: Arc<Database>) -> Router {
     let protected = Router::new()
         .route("/node", post(create_node))
         .route("/node/:address", get(get_node))
+        .route("/node/:address/history", get(get_node_history))
         .route("/node/:address", put(update_node))
         .route("/node/:address", delete(delete_node))
         .route("/node/:address/owned", get(list_owned))
@@ -190,6 +192,30 @@ async fn get_node(
             (StatusCode::OK, Json(node.clone())).into_response()
         }
         Some(_) => (StatusCode::FORBIDDEN, "not authorized to read this node").into_response(),
+        None => (StatusCode::NOT_FOUND, "node not found").into_response(),
+    }
+}
+
+/// `GET /node/:address/history` — every archived previous state of this
+/// node, oldest first. Does not include the current live value (that's
+/// the plain GET). Same visibility rule as reading the node itself:
+/// permission is checked against the node's CURRENT owner/visibility,
+/// since ownership isn't itself versioned in this pass — a node that
+/// changed hands would show its full history to whoever owns it now,
+/// not to whoever owned it at each past point in time. Worth knowing if
+/// that distinction ever matters for a real use case.
+async fn get_node_history(
+    State(db): State<Arc<Database>>,
+    Path(address): Path<String>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> impl IntoResponse {
+    let engine = db.engine.read().expect("storage engine lock poisoned");
+    match engine.get(&address) {
+        Some(node) if identity.is_admin() || node.can_read(&identity.owner) => {
+            let history: Vec<HistoryEntry> = engine.history_for(&address).to_vec();
+            (StatusCode::OK, Json(history)).into_response()
+        }
+        Some(_) => (StatusCode::FORBIDDEN, "not authorized to read this node's history").into_response(),
         None => (StatusCode::NOT_FOUND, "node not found").into_response(),
     }
 }
