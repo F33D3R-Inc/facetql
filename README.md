@@ -2,7 +2,7 @@
 
 **The Semantic Coordinate Database Engine**
 
-FacetQL is a standalone, high-performance database management system designed around entities, symbolic 4D coordinates (`x`, `y`, `z`, `q`), and the relationships between them.
+FacetQL is an append-oriented, in-memory indexed entity store with graph edges, version history, authentication, HTTP API, and a serialized write path.
 
 It is built to serve as the native, hyper-optimized storage backend for the Facet (`.fct`) compiler-first language, but it operates as a completely independent DBMS. Run it the way you'd run PostgreSQL or Redis: install a single binary, start a server, and talk to it over HTTP from any environment (native mobile, web, or backend microservices).
 
