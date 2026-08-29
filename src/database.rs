@@ -1,57 +1,56 @@
+use std::io;
 use std::sync::{Arc, RwLock};
+
 use tokio::sync::broadcast;
+
+use crate::config;
 use crate::storage::engine::StorageEngine;
-use crate::core::generator;
 use crate::storage::recovery;
 
+#[derive(Clone)]
 pub struct Database {
-    pub engine: RwLock<StorageEngine>,
-    /// Live change feed. Every successful write publishes a message here;
-    /// anyone connected to GET /events gets it immediately. 1024-message
-    /// buffer means a slow subscriber can fall behind that far before it
-    /// starts missing messages (tokio::sync::broadcast's designed
-    /// behavior) — fine for "refresh the UI," not fine if a consumer
-    /// needs a guaranteed-delivery log of every change; that's a
-    /// different, not-yet-built feature (see SECURITY_NOTES.md).
+    pub engine: Arc<RwLock<StorageEngine>>,
     pub broadcaster: broadcast::Sender<String>,
 }
 
 impl Database {
-    /// Loads existing state from facetql.data if it exists. On a
-    /// genuinely fresh install (empty/missing data file), seeds the
-    /// 12x13 genesis coordinate grid so there's something to query on
-    /// first boot. Previously generate_genesis() was never called from
-    /// anywhere — the grid existed in code but never actually ran.
-    pub fn new() -> Arc<Self> {
-        let mut engine = StorageEngine::load().unwrap_or_else(|e| {
-            eprintln!("warning: failed to load facetql.data ({e}) — starting with empty storage");
-            StorageEngine::new()
-        });
-        recovery::recover(&mut engine);
+    pub fn new() -> io::Result<Self> {
+        config::ensure_data_dir()?;
 
-        if engine.is_empty() {
-            println!("No existing data found — seeding genesis coordinate grid (156 nodes)");
-            for node in generator::generate_genesis() {
-                if let Err(e) = engine.insert(node) {
-                    eprintln!("warning: failed to seed genesis node: {e}");
-                }
-            }
-        }
+        let mut engine = StorageEngine::load()?;
 
-        let (broadcaster, _rx) = broadcast::channel(1024);
+        /*
+         * WAL recovery is part of opening the database.
+         *
+         * A recovery failure must prevent startup. Continuing after
+         * an authentication, corruption, or format error could cause
+         * the server to expose state that is not known to be durable
+         * or valid.
+         */
+        recovery::recover(&mut engine)?;
 
-        Arc::new(Self {
-            engine: RwLock::new(engine),
+        let (broadcaster, _) =
+            broadcast::channel(1024);
+
+        Ok(Self {
+            engine: Arc::new(RwLock::new(engine)),
             broadcaster,
         })
     }
 
-    /// Publishes one change-feed message. `_ =` on the send result is
-    /// intentional and documented, not an oversight: broadcast::send
-    /// only errors when there are zero subscribers, which is the normal
-    /// case when nobody's listening on /events yet — that's not a
-    /// failure, it just means the message had no one to deliver to.
-    pub fn publish(&self, message: String) {
-        let _ = self.broadcaster.send(message);
+    /// Publish a database event to subscribers.
+    ///
+    /// The database mutation itself is responsible for durability.
+    /// This channel is only the live notification mechanism and must
+    /// never be treated as the source of truth.
+    pub fn publish(&self, event: String) {
+        /*
+         * There may be no subscribers. broadcast::Sender::send()
+         * returns an error in that case, but that does not mean the
+         * database operation failed.
+         *
+         * Events are intentionally best-effort notifications.
+         */
+        let _ = self.broadcaster.send(event);
     }
 }
