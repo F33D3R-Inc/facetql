@@ -4,6 +4,7 @@ use std::io;
 
 use crate::config;
 use crate::crypto;
+use crate::storage::checkpoint;
 use crate::storage::engine::StorageEngine;
 use crate::storage::wal::{
     WalOperation,
@@ -49,6 +50,33 @@ pub fn recover(engine: &mut StorageEngine) -> io::Result<()> {
     let records = read_records(&raw)?;
 
     validate_sequence(&records)?;
+
+    /*
+     * Make sure the in-process sequence counter continues past every
+     * sequence number already durable in this WAL file, so the first
+     * write of the new process doesn't reuse (and thus write
+     * out-of-order) a sequence number a previous process already used.
+     */
+    if let Some(max_sequence) =
+        records.iter().map(|r| r.sequence).max()
+    {
+        crate::storage::engine::advance_wal_sequence(max_sequence);
+    }
+
+    /*
+     * Records already reflected in physical storage (facetql.data,
+     * facetql.edges, facetql.users, facetql.history) don't need to be
+     * replayed again — replaying them would duplicate edges and history
+     * entries on every single restart. Only records past the last
+     * confirmed-durable checkpoint represent operations that might not
+     * have made it to physical storage before a crash.
+     */
+    let checkpoint = checkpoint::read()?;
+
+    let records: Vec<WalRecord> = records
+        .into_iter()
+        .filter(|r| r.sequence > checkpoint)
+        .collect();
 
     /*
      * transaction_id == 0:

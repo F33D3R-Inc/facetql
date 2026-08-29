@@ -1,0 +1,357 @@
+diff --git a/src/facet.rs b/src/facet.rs
+deleted file mode 100644
+index f8390c8..0000000
+--- a/src/facet.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-pub mod store;
+\ No newline at end of file
+diff --git a/src/facet/mod.rs b/src/facet/mod.rs
+index b785647..c26e35f 100644
+--- a/src/facet/mod.rs
++++ b/src/facet/mod.rs
+@@ -3,9 +3,7 @@ use std::sync::Arc;
+ use crate::core::coordinate::Coordinate;
+ use crate::core::node::Node;
+ use crate::database::Database;
+-pub mod store;
+ 
+-pub use store::FacetStore;
+ pub struct FacetStore {
+     db: Arc<Database>,
+ }
+diff --git a/src/storage/checkpoint.rs b/src/storage/checkpoint.rs
+new file mode 100644
+index 0000000..94aa2ac
+--- /dev/null
++++ b/src/storage/checkpoint.rs
+@@ -0,0 +1,79 @@
++use std::fs;
++use std::io::{self, Write};
++
++use crate::config;
++
++/// Tracks the highest WAL sequence number that is already durably
++/// reflected in the physical storage files (facetql.data,
++/// facetql.edges, facetql.users, facetql.history, facetql.tombstones).
++///
++/// Why this exists:
++///
++/// Every mutation writes its WAL record first, then writes the matching
++/// physical record. `StorageEngine::load()` reconstructs state directly
++/// from the physical files, so by the time it runs, every WAL record at
++/// or below the checkpoint has already been applied through the normal
++/// physical-storage path.
++///
++/// Without this checkpoint, `recovery::recover()` would replay the
++/// *entire* WAL on every startup — including operations already present
++/// in physical storage. `Insert`/`Delete`/user operations happen to be
++/// idempotent (replaying them just overwrites/removes the same key), but
++/// `Archive` and `InsertEdge` are not: replaying them again duplicates
++/// history entries and edge adjacency lists on every single restart.
++///
++/// The checkpoint is advanced only after a physical write has completed,
++/// so it always trails (or matches) what's actually durable on disk. If
++/// the process crashes between a WAL append and the matching physical
++/// write, the checkpoint stays behind, and recovery correctly replays
++/// that operation from the WAL.
++pub fn read() -> io::Result<u64> {
++    let path = config::data_file("facetql.checkpoint");
++
++    if !path.exists() {
++        return Ok(0);
++    }
++
++    let raw = fs::read_to_string(&path)?;
++
++    let trimmed = raw.trim();
++
++    if trimmed.is_empty() {
++        return Ok(0);
++    }
++
++    trimmed.parse::<u64>().map_err(|e| {
++        io::Error::new(
++            io::ErrorKind::InvalidData,
++            format!("corrupt checkpoint file: {e}"),
++        )
++    })
++}
++
++/// Advance the checkpoint to `sequence`, if it's newer than what's
++/// already recorded.
++///
++/// Writes are whole-file overwrites (the value is a single small
++/// integer) followed by an explicit `sync_data()`, so a checkpoint
++/// update is itself crash-safe: readers either see the old value or the
++/// new one, never a torn write.
++pub fn advance(sequence: u64) -> io::Result<()> {
++    let current = read()?;
++
++    if sequence <= current {
++        return Ok(());
++    }
++
++    let path = config::data_file("facetql.checkpoint");
++    let tmp_path = config::data_file("facetql.checkpoint.tmp");
++
++    {
++        let mut file = fs::File::create(&tmp_path)?;
++        file.write_all(sequence.to_string().as_bytes())?;
++        file.sync_data()?;
++    }
++
++    fs::rename(&tmp_path, &path)?;
++
++    Ok(())
++}
+diff --git a/src/storage/engine.rs b/src/storage/engine.rs
+index c8ea4b9..218f5c0 100644
+--- a/src/storage/engine.rs
++++ b/src/storage/engine.rs
+@@ -17,6 +17,36 @@ fn next_wal_sequence() -> u64 {
+     NEXT_WAL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+ }
+ 
++/// Advance the in-process WAL sequence counter past `observed_max`.
++///
++/// `NEXT_WAL_SEQUENCE` starts at 1 every time the process starts, but an
++/// existing `facetql.wal` file may already contain records with much
++/// higher sequence numbers from a previous run. Without this call, the
++/// first write after a restart would reuse a low sequence number,
++/// appending an out-of-order record to a file whose sequence numbers
++/// must be strictly increasing (`recovery::validate_sequence` enforces
++/// this) — the *next* restart would then fail to recover at all.
++///
++/// `recovery::recover()` calls this with the highest sequence number it
++/// finds in the WAL before doing anything else, so newly generated
++/// sequence numbers always continue past whatever was already durable.
++pub(crate) fn advance_wal_sequence(observed_max: u64) {
++    let desired = observed_max.saturating_add(1);
++    let mut current = NEXT_WAL_SEQUENCE.load(Ordering::Relaxed);
++
++    while current < desired {
++        match NEXT_WAL_SEQUENCE.compare_exchange(
++            current,
++            desired,
++            Ordering::Relaxed,
++            Ordering::Relaxed,
++        ) {
++            Ok(_) => break,
++            Err(actual) => current = actual,
++        }
++    }
++}
++
+ #[derive(Debug)]
+ pub enum ClaimError {
+     NotFound,
+@@ -73,11 +103,15 @@ impl StorageEngine {
+     ///
+     /// Real multi-operation transaction IDs are introduced by the
+     /// transaction coordinator.
++    ///
++    /// Returns the WAL sequence number assigned to this record so the
++    /// caller can advance the durability checkpoint once the matching
++    /// physical write has also completed. See `storage::checkpoint`.
+     fn append_wal(
+         &self,
+         transaction_id: u64,
+         operation: wal::WalOperation,
+-    ) -> Result<(), String> {
++    ) -> Result<u64, String> {
+         let sequence = next_wal_sequence();
+ 
+         let record = wal::WalRecord::new(
+@@ -87,7 +121,25 @@ impl StorageEngine {
+             operation,
+         );
+ 
+-        wal::append(&record).map_err(|e| e.to_string())
++        wal::append(&record).map_err(|e| e.to_string())?;
++
++        Ok(sequence)
++    }
++
++    /// Advance the durability checkpoint past `sequence`.
++    ///
++    /// Called only after the matching physical record has been written,
++    /// so the checkpoint never claims durability recovery can't back up.
++    /// Best-effort: a failure here doesn't fail the caller's mutation
++    /// (the data is already safely on disk either way) but does mean
++    /// the next startup may redundantly replay a bit more WAL than
++    /// strictly necessary, which is safe, just slightly slower.
++    fn advance_checkpoint(sequence: u64) {
++        if let Err(e) = crate::storage::checkpoint::advance(sequence) {
++            eprintln!(
++                "warning: failed to advance WAL checkpoint to {sequence}: {e}"
++            );
++        }
+     }
+ 
+     // ---------------------------------------------------------------------
+@@ -292,7 +344,7 @@ impl StorageEngine {
+         if let Some(previous) = self.nodes.get(&node.address) {
+             let entry = HistoryEntry::now(previous.clone());
+ 
+-            self.append_wal(
++            let archive_sequence = self.append_wal(
+                 0,
+                 wal::WalOperation::Archive(entry.clone()),
+             )?;
+@@ -303,6 +355,8 @@ impl StorageEngine {
+             )
+                 .map_err(|e| e.to_string())?;
+ 
++            Self::advance_checkpoint(archive_sequence);
++
+             self.history
+                 .entry(node.address.clone())
+                 .or_default()
+@@ -313,7 +367,7 @@ impl StorageEngine {
+         // WAL the new value before making it visible in memory.
+         // -------------------------------------------------------------
+ 
+-        self.append_wal(
++        let insert_sequence = self.append_wal(
+             0,
+             wal::WalOperation::Insert(node.clone()),
+         )?;
+@@ -325,6 +379,8 @@ impl StorageEngine {
+         let offset = binary::append_node(&node)
+             .map_err(|e| e.to_string())?;
+ 
++        Self::advance_checkpoint(insert_sequence);
++
+         // -------------------------------------------------------------
+         // Update indexes and live state.
+         // -------------------------------------------------------------
+@@ -408,7 +464,7 @@ impl StorageEngine {
+         &mut self,
+         address: &str,
+     ) -> Result<(), String> {
+-        self.append_wal(
++        let sequence = self.append_wal(
+             0,
+             wal::WalOperation::Delete(
+                 address.to_string(),
+@@ -418,6 +474,8 @@ impl StorageEngine {
+         tombstone::append_tombstone(address)
+             .map_err(|e| e.to_string())?;
+ 
++        Self::advance_checkpoint(sequence);
++
+         self.nodes.remove(address);
+ 
+         Ok(())
+@@ -448,7 +506,7 @@ impl StorageEngine {
+             ));
+         }
+ 
+-        self.append_wal(
++        let sequence = self.append_wal(
+             0,
+             wal::WalOperation::InsertEdge(
+                 edge.clone(),
+@@ -461,6 +519,8 @@ impl StorageEngine {
+         )
+             .map_err(|e| e.to_string())?;
+ 
++        Self::advance_checkpoint(sequence);
++
+         self.index_edge(edge);
+ 
+         Ok(())
+@@ -614,7 +674,7 @@ impl StorageEngine {
+         &mut self,
+         record: UserRecord,
+     ) -> Result<(), String> {
+-        self.append_wal(
++        let sequence = self.append_wal(
+             0,
+             wal::WalOperation::InsertUser(
+                 record.clone(),
+@@ -627,6 +687,8 @@ impl StorageEngine {
+         )
+             .map_err(|e| e.to_string())?;
+ 
++        Self::advance_checkpoint(sequence);
++
+         self.users.insert(
+             record.token_hash.clone(),
+             record,
+@@ -642,7 +704,7 @@ impl StorageEngine {
+         &mut self,
+         token_hash: &str,
+     ) -> Result<(), String> {
+-        self.append_wal(
++        let sequence = self.append_wal(
+             0,
+             wal::WalOperation::RevokeUser(
+                 token_hash.to_string(),
+@@ -654,6 +716,8 @@ impl StorageEngine {
+         )
+             .map_err(|e| e.to_string())?;
+ 
++        Self::advance_checkpoint(sequence);
++
+         self.users.remove(token_hash);
+ 
+         Ok(())
+diff --git a/src/storage/mod.rs b/src/storage/mod.rs
+index 65f0194..91f1af0 100644
+--- a/src/storage/mod.rs
++++ b/src/storage/mod.rs
+@@ -1,5 +1,6 @@
+ pub mod engine;
+ pub mod binary;
++pub mod checkpoint;
+ pub mod index;
+ pub mod wal;
+ pub mod recovery;
+diff --git a/src/storage/recovery.rs b/src/storage/recovery.rs
+index e507b8f..505ccda 100644
+--- a/src/storage/recovery.rs
++++ b/src/storage/recovery.rs
+@@ -4,6 +4,7 @@ use std::io;
+ 
+ use crate::config;
+ use crate::crypto;
++use crate::storage::checkpoint;
+ use crate::storage::engine::StorageEngine;
+ use crate::storage::wal::{
+     WalOperation,
+@@ -50,6 +51,33 @@ pub fn recover(engine: &mut StorageEngine) -> io::Result<()> {
+ 
+     validate_sequence(&records)?;
+ 
++    /*
++     * Make sure the in-process sequence counter continues past every
++     * sequence number already durable in this WAL file, so the first
++     * write of the new process doesn't reuse (and thus write
++     * out-of-order) a sequence number a previous process already used.
++     */
++    if let Some(max_sequence) =
++        records.iter().map(|r| r.sequence).max()
++    {
++        crate::storage::engine::advance_wal_sequence(max_sequence);
++    }
++
++    /*
++     * Records already reflected in physical storage (facetql.data,
++     * facetql.edges, facetql.users, facetql.history) don't need to be
++     * replayed again — replaying them would duplicate edges and history
++     * entries on every single restart. Only records past the last
++     * confirmed-durable checkpoint represent operations that might not
++     * have made it to physical storage before a crash.
++     */
++    let checkpoint = checkpoint::read()?;
++
++    let records: Vec<WalRecord> = records
++        .into_iter()
++        .filter(|r| r.sequence > checkpoint)
++        .collect();
++
+     /*
+      * transaction_id == 0:
+      *

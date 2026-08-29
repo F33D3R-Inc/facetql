@@ -3,9 +3,7 @@ use std::sync::Arc;
 use crate::core::coordinate::Coordinate;
 use crate::core::node::Node;
 use crate::database::Database;
-pub mod store;
 
-pub use store::FacetStore;
 pub struct FacetStore {
     db: Arc<Database>,
 }

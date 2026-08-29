@@ -17,6 +17,36 @@ fn next_wal_sequence() -> u64 {
     NEXT_WAL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Advance the in-process WAL sequence counter past `observed_max`.
+///
+/// `NEXT_WAL_SEQUENCE` starts at 1 every time the process starts, but an
+/// existing `facetql.wal` file may already contain records with much
+/// higher sequence numbers from a previous run. Without this call, the
+/// first write after a restart would reuse a low sequence number,
+/// appending an out-of-order record to a file whose sequence numbers
+/// must be strictly increasing (`recovery::validate_sequence` enforces
+/// this) — the *next* restart would then fail to recover at all.
+///
+/// `recovery::recover()` calls this with the highest sequence number it
+/// finds in the WAL before doing anything else, so newly generated
+/// sequence numbers always continue past whatever was already durable.
+pub(crate) fn advance_wal_sequence(observed_max: u64) {
+    let desired = observed_max.saturating_add(1);
+    let mut current = NEXT_WAL_SEQUENCE.load(Ordering::Relaxed);
+
+    while current < desired {
+        match NEXT_WAL_SEQUENCE.compare_exchange(
+            current,
+            desired,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ClaimError {
     NotFound,
@@ -73,11 +103,15 @@ impl StorageEngine {
     ///
     /// Real multi-operation transaction IDs are introduced by the
     /// transaction coordinator.
+    ///
+    /// Returns the WAL sequence number assigned to this record so the
+    /// caller can advance the durability checkpoint once the matching
+    /// physical write has also completed. See `storage::checkpoint`.
     fn append_wal(
         &self,
         transaction_id: u64,
         operation: wal::WalOperation,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let sequence = next_wal_sequence();
 
         let record = wal::WalRecord::new(
@@ -87,7 +121,25 @@ impl StorageEngine {
             operation,
         );
 
-        wal::append(&record).map_err(|e| e.to_string())
+        wal::append(&record).map_err(|e| e.to_string())?;
+
+        Ok(sequence)
+    }
+
+    /// Advance the durability checkpoint past `sequence`.
+    ///
+    /// Called only after the matching physical record has been written,
+    /// so the checkpoint never claims durability recovery can't back up.
+    /// Best-effort: a failure here doesn't fail the caller's mutation
+    /// (the data is already safely on disk either way) but does mean
+    /// the next startup may redundantly replay a bit more WAL than
+    /// strictly necessary, which is safe, just slightly slower.
+    fn advance_checkpoint(sequence: u64) {
+        if let Err(e) = crate::storage::checkpoint::advance(sequence) {
+            eprintln!(
+                "warning: failed to advance WAL checkpoint to {sequence}: {e}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -292,7 +344,7 @@ impl StorageEngine {
         if let Some(previous) = self.nodes.get(&node.address) {
             let entry = HistoryEntry::now(previous.clone());
 
-            self.append_wal(
+            let archive_sequence = self.append_wal(
                 0,
                 wal::WalOperation::Archive(entry.clone()),
             )?;
@@ -302,6 +354,8 @@ impl StorageEngine {
                 &entry,
             )
                 .map_err(|e| e.to_string())?;
+
+            Self::advance_checkpoint(archive_sequence);
 
             self.history
                 .entry(node.address.clone())
@@ -313,7 +367,7 @@ impl StorageEngine {
         // WAL the new value before making it visible in memory.
         // -------------------------------------------------------------
 
-        self.append_wal(
+        let insert_sequence = self.append_wal(
             0,
             wal::WalOperation::Insert(node.clone()),
         )?;
@@ -324,6 +378,8 @@ impl StorageEngine {
 
         let offset = binary::append_node(&node)
             .map_err(|e| e.to_string())?;
+
+        Self::advance_checkpoint(insert_sequence);
 
         // -------------------------------------------------------------
         // Update indexes and live state.
@@ -408,7 +464,7 @@ impl StorageEngine {
         &mut self,
         address: &str,
     ) -> Result<(), String> {
-        self.append_wal(
+        let sequence = self.append_wal(
             0,
             wal::WalOperation::Delete(
                 address.to_string(),
@@ -417,6 +473,8 @@ impl StorageEngine {
 
         tombstone::append_tombstone(address)
             .map_err(|e| e.to_string())?;
+
+        Self::advance_checkpoint(sequence);
 
         self.nodes.remove(address);
 
@@ -448,7 +506,7 @@ impl StorageEngine {
             ));
         }
 
-        self.append_wal(
+        let sequence = self.append_wal(
             0,
             wal::WalOperation::InsertEdge(
                 edge.clone(),
@@ -460,6 +518,8 @@ impl StorageEngine {
             &edge,
         )
             .map_err(|e| e.to_string())?;
+
+        Self::advance_checkpoint(sequence);
 
         self.index_edge(edge);
 
@@ -614,7 +674,7 @@ impl StorageEngine {
         &mut self,
         record: UserRecord,
     ) -> Result<(), String> {
-        self.append_wal(
+        let sequence = self.append_wal(
             0,
             wal::WalOperation::InsertUser(
                 record.clone(),
@@ -626,6 +686,8 @@ impl StorageEngine {
             &record,
         )
             .map_err(|e| e.to_string())?;
+
+        Self::advance_checkpoint(sequence);
 
         self.users.insert(
             record.token_hash.clone(),
@@ -642,7 +704,7 @@ impl StorageEngine {
         &mut self,
         token_hash: &str,
     ) -> Result<(), String> {
-        self.append_wal(
+        let sequence = self.append_wal(
             0,
             wal::WalOperation::RevokeUser(
                 token_hash.to_string(),
@@ -653,6 +715,8 @@ impl StorageEngine {
             &format!("user:{token_hash}"),
         )
             .map_err(|e| e.to_string())?;
+
+        Self::advance_checkpoint(sequence);
 
         self.users.remove(token_hash);
 

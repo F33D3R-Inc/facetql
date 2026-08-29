@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod binary;
+pub mod checkpoint;
 pub mod index;
 pub mod wal;
 pub mod recovery;
