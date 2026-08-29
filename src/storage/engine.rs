@@ -122,12 +122,12 @@ impl StorageEngine {
     pub fn insert(&mut self, node: Node) -> Result<(), String> {
         if let Some(previous) = self.nodes.get(&node.address) {
             let entry = HistoryEntry::now(previous.clone());
-            wal::log(format!("ARCHIVE {} at {}", entry.address, entry.archived_at_unix));
+            wal::log(&wal::WalEntry::Archive(entry.clone()));
             binary::append_record(&binary::history_path(), &entry).map_err(|e| e.to_string())?;
             self.history.entry(node.address.clone()).or_default().push(entry);
         }
 
-        wal::log(format!("INSERT {}", node.address));
+        wal::log(&wal::WalEntry::Insert(node.clone()));
 
         let offset = binary::append_node(&node).map_err(|e| e.to_string())?;
         self.index.insert(node.address.clone(), offset);
@@ -179,7 +179,7 @@ impl StorageEngine {
     /// permissions (permissions live on `Node`/`Edge` and are checked at
     /// the API layer, same as the existing `can_read` calls).
     pub fn delete(&mut self, address: &str) -> Result<(), String> {
-        wal::log(format!("DELETE {address}"));
+        wal::log(&wal::WalEntry::Delete(address.to_string()));
         tombstone::append_tombstone(address).map_err(|e| e.to_string())?;
         self.nodes.remove(address);
         Ok(())
@@ -198,7 +198,7 @@ impl StorageEngine {
             return Err(format!("edge 'to' address not found: {}", edge.to));
         }
 
-        wal::log(format!("EDGE {} -{}-> {}", edge.from, edge.kind, edge.to));
+        wal::log(&wal::WalEntry::InsertEdge(edge.clone()));
         binary::append_record(&binary::edges_path(), &edge).map_err(|e| e.to_string())?;
         self.index_edge(edge);
         Ok(())
@@ -299,7 +299,7 @@ impl StorageEngine {
     /// returning the plaintext to whoever asked for the account exactly
     /// once, since it can't be recovered from here afterward.
     pub fn insert_user(&mut self, record: UserRecord) -> Result<(), String> {
-        wal::log(format!("CREATE_USER {} role={:?}", record.owner, record.role));
+        wal::log(&wal::WalEntry::InsertUser(record.clone()));
         binary::append_record(&binary::users_path(), &record).map_err(|e| e.to_string())?;
         self.users.insert(record.token_hash.clone(), record);
         Ok(())
@@ -310,7 +310,7 @@ impl StorageEngine {
     /// with a "user:" prefix so it shares the tombstone file without
     /// colliding with node addresses. See `load()`.
     pub fn revoke_user(&mut self, token_hash: &str) -> Result<(), String> {
-        wal::log(format!("REVOKE_USER {token_hash}"));
+        wal::log(&wal::WalEntry::RevokeUser(token_hash.to_string()));
         tombstone::append_tombstone(&format!("user:{token_hash}")).map_err(|e| e.to_string())?;
         self.users.remove(token_hash);
         Ok(())

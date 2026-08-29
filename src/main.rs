@@ -11,7 +11,6 @@ mod tls_server;
 
 use api::routes::create_router;
 use database::Database;
-use storage::recovery;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -221,7 +220,6 @@ async fn run_import(source: ImportSource) {
 
 async fn run_server(port: u16, tls_identity: Option<PathBuf>, tls_identity_password: Option<String>) {
     config::ensure_data_dir().expect("failed to create data directory");
-    recovery::recover();
 
     let db = Database::new();
     let app = create_router(db);

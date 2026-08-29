@@ -2,6 +2,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 use crate::storage::engine::StorageEngine;
 use crate::core::generator;
+use crate::storage::recovery;
 
 pub struct Database {
     pub engine: RwLock<StorageEngine>,
@@ -26,6 +27,7 @@ impl Database {
             eprintln!("warning: failed to load facetql.data ({e}) — starting with empty storage");
             StorageEngine::new()
         });
+        recovery::recover(&mut engine);
 
         if engine.is_empty() {
             println!("No existing data found — seeding genesis coordinate grid (156 nodes)");
