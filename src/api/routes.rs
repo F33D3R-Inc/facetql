@@ -15,6 +15,7 @@ use crate::database::Database;
 use crate::core::node::{Node, Visibility};
 use crate::core::edge::Edge;
 use crate::core::coordinate::Coordinate;
+use crate::core::predicate::Expr;
 use crate::core::user::{Role, UserRecord};
 use crate::core::history::HistoryEntry;
 use crate::auth::{auth_middleware, hash_token, AuthIdentity};
@@ -70,6 +71,37 @@ pub struct QueryParams {
     pub offset: Option<usize>,
 }
 
+/// Body for `POST /nodes/query` — a pushed-down predicate query.
+///
+/// Field names mirror FCT's `runtime.Query` (`Entity`/`Where`/
+/// `ItemVar`/`Order`/`Desc`/`Limit`/`After` in runtime/sql.go) so a
+/// client can translate its own `Query` value into this body with a
+/// field-for-field rename, not a restructure.
+///
+/// `where_` (JSON key `where`) is optional: omitting it just runs the
+/// same `kind`/`owner`/visibility filter `GET /nodes` does, ordered and
+/// paginated. `item_var` defaults to `"item"` — FCT's compiler always
+/// sets one, but a hand-written request can rely on the default when
+/// there's only one plausible loop variable in the predicate.
+#[derive(Deserialize)]
+pub struct QueryWhereRequest {
+    pub kind: Option<String>,
+    pub owner: Option<String>,
+    #[serde(rename = "where")]
+    pub where_: Option<Expr>,
+    #[serde(default = "default_item_var")]
+    pub item_var: String,
+    pub order: Option<String>,
+    #[serde(default)]
+    pub desc: bool,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+fn default_item_var() -> String {
+    "item".to_string()
+}
+
 #[derive(Serialize)]
 struct CreateNodeResponse {
     address: String,
@@ -113,6 +145,7 @@ pub fn create_router(db: Arc<Database>) -> Router {
         .route("/node/:address/owned", get(list_owned))
         .route("/node/:address/claim", post(claim_node))
         .route("/nodes", get(query_nodes))
+        .route("/nodes/query", post(query_nodes_where))
         .route("/edge", post(create_edge))
         .route("/transaction", post(execute_transaction))
         .route("/node/:address/edges/out", get(get_edges_out))
@@ -337,6 +370,53 @@ async fn query_nodes(
     };
 
     (StatusCode::OK, Json(results)).into_response()
+}
+
+/// `POST /nodes/query` — predicate-pushdown query.
+///
+/// Unlike `query_nodes` (`GET /nodes`), this evaluates a caller-supplied
+/// `where` predicate against each candidate's `data` inside the engine
+/// (`StorageEngine::query_where`) rather than requiring the caller to
+/// pull every row back and filter client-side. See that function's doc
+/// comment for exactly what "pushdown" does and doesn't buy yet (no
+/// secondary index, so still a full scan of the kind/owner-filtered
+/// set — but one evaluator, run once, in the engine).
+async fn query_nodes_where(
+    State(db): State<Arc<Database>>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(payload): Json<QueryWhereRequest>,
+) -> impl IntoResponse {
+    let limit = payload.limit.unwrap_or(50).min(500);
+    let offset = payload.offset.unwrap_or(0);
+
+    let engine = db.engine.read().expect("storage engine lock poisoned");
+
+    // Admins bypass visibility the same way query_nodes/get_node do —
+    // query_where's can_read filter treats "" as "no requester", which
+    // for a Private node only matches its owner. Passing "" here mirrors
+    // the same bypass query_nodes already does for admins.
+    let requester = if identity.is_admin() {
+        ""
+    } else {
+        identity.owner.as_str()
+    };
+
+    let result = engine.query_where(
+        payload.kind.as_deref(),
+        payload.owner.as_deref(),
+        requester,
+        payload.where_.as_ref(),
+        &payload.item_var,
+        payload.order.as_deref(),
+        payload.desc,
+        limit,
+        offset,
+    );
+
+    match result {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
 }
 
 async fn create_edge(

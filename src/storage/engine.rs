@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::core::edge::Edge;
 use crate::core::history::HistoryEntry;
 use crate::core::node::Node;
+use crate::core::predicate::{self, Expr};
 use crate::core::user::UserRecord;
 use crate::storage::binary;
 use crate::storage::index::Index;
@@ -605,6 +606,90 @@ impl StorageEngine {
             .collect()
     }
 
+    /// Predicate-pushdown query: the `kind`/`owner`/visibility filtering
+    /// of `query()`, plus a pushable `Expr` predicate evaluated against
+    /// each candidate node's decoded `data`, plus in-engine ordering.
+    ///
+    /// `item_var` is the loop-variable name the predicate's field
+    /// accesses are written against (mirrors FCT's `Query.ItemVar`).
+    ///
+    /// Still a full scan of the `kind`/`owner`-filtered candidates —
+    /// there's no secondary index on `data` fields yet, so this doesn't
+    /// avoid the O(n) walk `exprSQL`'s indexed WHERE would with a real
+    /// index. What it *does* do is move the filter (and now the sort)
+    /// into the engine instead of pulling every candidate row back to
+    /// the caller to filter client-side, which is the part that
+    /// matters for correctness parity with a single evaluator instead
+    /// of two (this one, and whatever a client would otherwise write).
+    ///
+    /// Ordering: `order` names a field in `data` to sort by, or `None`
+    /// (or `"id"`) to sort by `address`. Malformed or missing values on
+    /// a given node sort as if absent (after present values), so one
+    /// odd row can't silently exclude the rest of the page.
+    ///
+    /// Pagination here is plain offset, not FCT's opaque keyset cursor
+    /// — matching that cursor format exactly is follow-up work once
+    /// this predicate path is proven; offset is correct, just not
+    /// stable under concurrent writes the way a keyset cursor is.
+    pub fn query_where(
+        &self,
+        kind: Option<&str>,
+        owner: Option<&str>,
+        requester: &str,
+        predicate: Option<&Expr>,
+        item_var: &str,
+        order: Option<&str>,
+        desc: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<&Node>, String> {
+        let mut candidates: Vec<&Node> = self
+            .nodes
+            .values()
+            .filter(|n| kind.map_or(true, |k| n.kind == k))
+            .filter(|n| owner.map_or(true, |o| n.owner == o))
+            .filter(|n| n.can_read(requester))
+            .collect();
+
+        if let Some(expr) = predicate {
+            let mut filtered = Vec::with_capacity(candidates.len());
+
+            for node in candidates {
+                let data: serde_json::Value =
+                    serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
+
+                let matched = predicate::eval(expr, item_var, &data)
+                    .map(|v| matches!(v, serde_json::Value::Bool(true)))
+                    .map_err(|e| format!("predicate evaluation failed: {e}"))?;
+
+                if matched {
+                    filtered.push(node);
+                }
+            }
+
+            candidates = filtered;
+        }
+
+        match order.filter(|o| *o != "id") {
+            Some(field) => {
+                candidates.sort_by(|a, b| {
+                    let av = order_key(a, field);
+                    let bv = order_key(b, field);
+                    compare_order_keys(&av, &bv)
+                });
+            }
+            None => {
+                candidates.sort_by(|a, b| a.address.cmp(&b.address));
+            }
+        }
+
+        if desc {
+            candidates.reverse();
+        }
+
+        Ok(candidates.into_iter().skip(offset).take(limit).collect())
+    }
+
     // ---------------------------------------------------------------------
     // Insert with edges
     // ---------------------------------------------------------------------
@@ -893,6 +978,40 @@ impl StorageEngine {
         }
 
         Ok(())
+    }
+}
+
+/// Extract an ordering key from a node for `query_where`'s `order`
+/// field. `None` means "absent or unparsable" — such nodes sort after
+/// everything with a real value, ascending, regardless of `desc` (the
+/// final `if desc { reverse() }` in `query_where` still flips them to
+/// the end either way, matching "missing sorts last" either direction).
+fn order_key(node: &Node, field: &str) -> Option<serde_json::Value> {
+    let data: serde_json::Value = serde_json::from_str(&node.data).ok()?;
+    data.get(field).cloned()
+}
+
+fn compare_order_keys(
+    a: &Option<serde_json::Value>,
+    b: &Option<serde_json::Value>,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    use serde_json::Value;
+
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(av), Some(bv)) => match (av, bv) {
+            (Value::Number(an), Value::Number(bn)) => an
+                .as_f64()
+                .unwrap_or(0.0)
+                .partial_cmp(&bn.as_f64().unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
+            (Value::String(a_s), Value::String(b_s)) => a_s.cmp(b_s),
+            (Value::Bool(a_b), Value::Bool(b_b)) => a_b.cmp(b_b),
+            _ => Ordering::Equal,
+        },
     }
 }
 
