@@ -94,6 +94,13 @@ pub struct QueryWhereRequest {
     pub order: Option<String>,
     #[serde(default)]
     pub desc: bool,
+    /// Opaque keyset cursor from the previous page's `next` field.
+    /// Omitted/empty for the first page. When present it takes
+    /// precedence over `offset` and selects the rows strictly past the
+    /// cursor in the requested `(order, address)` ordering — stable
+    /// under concurrent writes in a way offset is not. Mirrors FCT's
+    /// `Query.After`.
+    pub after: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -409,6 +416,7 @@ async fn query_nodes_where(
         &payload.item_var,
         payload.order.as_deref(),
         payload.desc,
+        payload.after.as_deref(),
         limit,
         offset,
     );
@@ -477,6 +485,15 @@ pub enum TxOpRequest {
     DeleteNode {
         address: String,
     },
+    /// Native bulk clear: remove every node of `kind` the caller may
+    /// write, as one all-or-nothing step in the transaction (WAL +
+    /// tombstones per node, exactly like `delete_node`). Wire tag is
+    /// `clear_kind` (snake_case of the variant). Non-admin clears only
+    /// its own nodes of that kind; admin clears all of that kind —
+    /// authorization is resolved here and enforced in the engine.
+    ClearKind {
+        kind: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -537,6 +554,31 @@ async fn execute_transaction(
                 }
                 touched_addresses.push(address.clone());
                 ops.push(TxOperation::DeleteNode(address));
+            }
+            TxOpRequest::ClearKind { kind } => {
+                // Unlike delete_node, a clear never rejects: it's
+                // defined as "remove what I'm allowed to remove", so
+                // non-writable nodes are skipped, not an error. We
+                // resolve the caller's authorization (owner + admin)
+                // here — under the same write lock the engine will use
+                // — and let the engine enforce it when selecting rows.
+                let is_admin = identity.is_admin();
+                // Record the exact addresses this clear will tombstone
+                // for the committed event, using the same rule the
+                // engine applies. The write lock is held throughout, so
+                // this snapshot matches what execute_transaction removes.
+                for node in engine.nodes.values() {
+                    if node.kind == kind
+                        && (is_admin || node.can_write(&identity.owner))
+                    {
+                        touched_addresses.push(node.address.clone());
+                    }
+                }
+                ops.push(TxOperation::ClearKind {
+                    kind,
+                    owner: identity.owner.clone(),
+                    is_admin,
+                });
             }
         }
     }
