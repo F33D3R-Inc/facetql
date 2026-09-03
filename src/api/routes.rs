@@ -162,6 +162,7 @@ pub fn create_router(db: Arc<Database>) -> Router {
         .route("/admin/users", post(create_user))
         .route("/admin/users", get(list_users))
         .route("/admin/users/:owner", delete(revoke_user))
+        .route("/stats", get(stats))
         .route_layer(middleware::from_fn_with_state(db.clone(), auth_middleware))
         .with_state(db);
 
@@ -696,6 +697,31 @@ async fn subscribe_events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+// ── stats / observability ──────────────────────────────────────────────
+
+/// `GET /stats` — the engine's own storage/operation statistics, the
+/// native observability surface a Fabric telemetry poller differences
+/// over time into `WorkloadMetrics` (and a real health/capacity read for
+/// operators; NOTES EPIC 08). Additive to the §4/§4b wire contract: a new
+/// endpoint under the same `x-api-key` auth, no change to any existing op.
+///
+/// Admin-gated (returns 403 for a non-admin), mirroring `list_users` /
+/// the other `/admin` handlers: it exposes fleet-wide counts, so it's a
+/// superuser read. The response body is `StorageEngine::stats()`'s
+/// [`EngineStats`](crate::storage::engine::EngineStats) serialized
+/// directly — that struct IS the wire shape, so there's one source of
+/// truth for the JSON, not a second response struct to keep in sync.
+async fn stats(
+    State(db): State<Arc<Database>>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> impl IntoResponse {
+    if !identity.is_admin() {
+        return (StatusCode::FORBIDDEN, "admin only").into_response();
+    }
+    let engine = db.engine.read().expect("storage engine lock poisoned");
+    (StatusCode::OK, Json(engine.stats())).into_response()
+}
+
 // ── admin: user management ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -813,4 +839,127 @@ async fn revoke_user(
     drop(engine);
     db.publish(serde_json::json!({"event": "user_revoked", "owner": owner}).to_string());
     (StatusCode::NO_CONTENT, "").into_response()
+}
+
+#[cfg(test)]
+mod stats_route_tests {
+    //! HTTP-level tests for `GET /stats` driven through the real router
+    //! (`create_router` + the `x-api-key` auth middleware) via
+    //! `tower::ServiceExt::oneshot`, so they exercise auth-gating and JSON
+    //! shape end-to-end, not just the handler in isolation.
+    //!
+    //! State is built entirely in memory: nodes and users are placed
+    //! directly into the engine's public maps, so nothing touches the WAL,
+    //! binary files, or tombstones — no data-dir setup needed. Auth uses
+    //! *persistent* user tokens (resolved via `find_user_by_hash`), not the
+    //! env `ENOCHIAN_TOKENS` bootstrap, so the tests don't depend on
+    //! process-wide env state.
+    use super::*;
+    use crate::core::coordinate::Coordinate;
+    use crate::core::user::{Role, UserRecord};
+    use crate::database::Database;
+    use crate::storage::engine::StorageEngine;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::RwLock;
+    use tower::ServiceExt; // for `oneshot`
+
+    const ADMIN_TOKEN: &str = "stats-admin-token";
+    const USER_TOKEN: &str = "stats-user-token";
+
+    /// A router whose engine holds 3 nodes (2 `Post`, 1 `Profile`) plus an
+    /// admin and a non-admin persistent user.
+    fn router() -> axum::Router {
+        let mut engine = StorageEngine::new();
+
+        for (addr, kind) in [("p:1", "Post"), ("p:2", "Post"), ("pr:1", "Profile")] {
+            engine.nodes.insert(
+                addr.to_string(),
+                Node::new(
+                    Coordinate::new(0, 0, 0, 0),
+                    addr.to_string(),
+                    kind.to_string(),
+                    "admin".to_string(),
+                ),
+            );
+        }
+
+        engine.users.insert(
+            hash_token(ADMIN_TOKEN),
+            UserRecord { token_hash: hash_token(ADMIN_TOKEN), owner: "admin".to_string(), role: Role::Admin },
+        );
+        engine.users.insert(
+            hash_token(USER_TOKEN),
+            UserRecord { token_hash: hash_token(USER_TOKEN), owner: "bob".to_string(), role: Role::User },
+        );
+
+        let (broadcaster, _) = tokio::sync::broadcast::channel(16);
+        let db = Arc::new(Database { engine: Arc::new(RwLock::new(engine)), broadcaster });
+        create_router(db)
+    }
+
+    fn stats_request(token: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri("/stats")
+            .header("x-api-key", token)
+            .body(Body::empty())
+            .expect("build request")
+    }
+
+    /// Admin token → 200 with the exact counts and sorted per-kind
+    /// breakdown the wire contract specifies.
+    #[tokio::test]
+    async fn admin_gets_stats_with_expected_counts() {
+        let resp = router()
+            .oneshot(stats_request(ADMIN_TOKEN))
+            .await
+            .expect("router response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+
+        assert_eq!(json["node_count"], 3);
+        assert_eq!(json["edge_count"], 0);
+        assert_eq!(json["user_count"], 2);
+        assert_eq!(json["history_entries"], 0);
+        // Sorted ascending by kind: Post (2) before Profile (1).
+        assert_eq!(json["kinds"][0]["kind"], "Post");
+        assert_eq!(json["kinds"][0]["count"], 2);
+        assert_eq!(json["kinds"][1]["kind"], "Profile");
+        assert_eq!(json["kinds"][1]["count"], 1);
+        // The counters are present; this memory-built engine ran no
+        // counted get/insert, so both are still 0.
+        assert_eq!(json["reads_total"], 0);
+        assert_eq!(json["writes_total"], 0);
+    }
+
+    /// Non-admin token → 403, and no stats body is leaked.
+    #[tokio::test]
+    async fn non_admin_is_forbidden() {
+        let resp = router()
+            .oneshot(stats_request(USER_TOKEN))
+            .await
+            .expect("router response");
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// No credential at all → 401 from the auth middleware (the route is
+    /// on the protected router), never reaching the handler.
+    #[tokio::test]
+    async fn missing_token_is_unauthorized() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/stats")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = router().oneshot(req).await.expect("router response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }

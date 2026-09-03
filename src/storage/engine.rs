@@ -98,6 +98,30 @@ pub struct StorageEngine {
 
     /// Archived previous states, keyed by node address, oldest first.
     pub history: HashMap<String, Vec<HistoryEntry>>,
+
+    /// Process-lifetime operation counters, the rate source behind
+    /// `GET /stats` (and any future health/observability surface — NOTES
+    /// EPIC 08). `reads_total` counts calls to `get`/`query`/`query_where`;
+    /// `writes_total` counts each applied mutation in `insert`/`delete`/
+    /// `insert_edge` — which, because the transaction apply pass routes
+    /// every committed op through exactly those primitives, also makes a
+    /// transaction contribute one increment per node it actually mutates
+    /// (a `ClearKind`/`DeleteWhere` of N nodes counts as N writes, the
+    /// truthful workload signal).
+    ///
+    /// These are deliberately NOT persisted: they start at 0 every time
+    /// the process starts and are never checkpointed or replayed. That is
+    /// correct for a rate source — a Fabric poller (or any consumer)
+    /// derives ops/sec and the read/write split by *differencing two
+    /// samples over time*, and a restart simply resets the baseline. They
+    /// are atomics rather than plain integers because `get`/`query`/
+    /// `query_where` mutate them while holding only a read lock on the
+    /// engine (the route layer takes `db.engine.read()` for reads), so the
+    /// increment must not require `&mut self`. `Ordering::Relaxed` is used
+    /// throughout: these are statistics, not a synchronization signal, so
+    /// no happens-before ordering with other memory is needed.
+    reads_total: AtomicU64,
+    writes_total: AtomicU64,
 }
 
 impl StorageEngine {
@@ -232,6 +256,8 @@ impl StorageEngine {
             edges_in: HashMap::new(),
             users: HashMap::new(),
             history: HashMap::new(),
+            reads_total: AtomicU64::new(0),
+            writes_total: AtomicU64::new(0),
         }
     }
 
@@ -404,6 +430,11 @@ impl StorageEngine {
             node,
         );
 
+        // Count the applied write. See the `writes_total` field doc for
+        // why this lives at the mutation primitive (so a transaction op
+        // is counted once, here, when it actually applies).
+        self.writes_total.fetch_add(1, Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -424,6 +455,7 @@ impl StorageEngine {
         &self,
         address: &str,
     ) -> Option<&Node> {
+        self.reads_total.fetch_add(1, Ordering::Relaxed);
         self.nodes.get(address)
     }
 
@@ -486,6 +518,11 @@ impl StorageEngine {
         Self::advance_checkpoint(sequence);
 
         self.nodes.remove(address);
+
+        // Count the applied write (see `writes_total` field doc). A bulk
+        // ClearKind/DeleteWhere flows through here once per node removed,
+        // so N cleared nodes count as N writes.
+        self.writes_total.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -611,6 +648,9 @@ impl StorageEngine {
 
         self.index_edge(edge);
 
+        // Count the applied write (see `writes_total` field doc).
+        self.writes_total.fetch_add(1, Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -689,6 +729,7 @@ impl StorageEngine {
         limit: usize,
         offset: usize,
     ) -> Vec<&Node> {
+        self.reads_total.fetch_add(1, Ordering::Relaxed);
         self.nodes
             .values()
             .filter(|n| {
@@ -758,6 +799,7 @@ impl StorageEngine {
         limit: usize,
         offset: usize,
     ) -> Result<QueryPage<'_>, String> {
+        self.reads_total.fetch_add(1, Ordering::Relaxed);
         let mut candidates: Vec<&Node> = self
             .nodes
             .values()
@@ -974,6 +1016,47 @@ impl StorageEngine {
     /// are not represented here.
     pub fn list_users(&self) -> Vec<&UserRecord> {
         self.users.values().collect()
+    }
+
+    // ---------------------------------------------------------------------
+    // Stats / observability
+    // ---------------------------------------------------------------------
+
+    /// A snapshot of the engine's own storage and operation statistics —
+    /// the native source behind `GET /stats` (and any future health /
+    /// readiness / capacity surface; NOTES EPIC 08).
+    ///
+    /// Structural counts (`node_count`, `edge_count`, `user_count`,
+    /// `history_entries`, per-`kind` counts) are computed from the live
+    /// in-memory collections at call time. `kinds` is grouped through a
+    /// `BTreeMap`, so the returned `Vec<KindCount>` is sorted by `kind` and
+    /// therefore deterministic and testable. The operation counters
+    /// (`reads_total`/`writes_total`) are the process-lifetime atomics (see
+    /// their field docs): monotonic since process start, not persisted, and
+    /// meant to be *differenced over time* by a consumer to derive rates.
+    ///
+    /// Read-only (`&self`): it only reads collections and loads the
+    /// atomics, so it runs under the engine's read lock like any query.
+    pub fn stats(&self) -> EngineStats {
+        use std::collections::BTreeMap;
+
+        let mut by_kind: BTreeMap<String, u64> = BTreeMap::new();
+        for node in self.nodes.values() {
+            *by_kind.entry(node.kind.clone()).or_default() += 1;
+        }
+
+        EngineStats {
+            node_count: self.nodes.len() as u64,
+            edge_count: self.edges_out.values().map(|v| v.len() as u64).sum(),
+            user_count: self.users.len() as u64,
+            history_entries: self.history.values().map(|v| v.len() as u64).sum(),
+            kinds: by_kind
+                .into_iter()
+                .map(|(kind, count)| KindCount { kind, count })
+                .collect(),
+            reads_total: self.reads_total.load(Ordering::Relaxed),
+            writes_total: self.writes_total.load(Ordering::Relaxed),
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1258,6 +1341,34 @@ fn compare_order_keys(
 pub struct QueryPage<'a> {
     pub nodes: Vec<&'a Node>,
     pub next: String,
+}
+
+/// One entry of the per-`kind` node-count breakdown in [`EngineStats`].
+#[derive(Debug, Serialize)]
+pub struct KindCount {
+    pub kind: String,
+    pub count: u64,
+}
+
+/// A snapshot of the engine's storage/operation statistics, produced by
+/// [`StorageEngine::stats`]. This owns all of its data (no borrows into
+/// the engine), so the `GET /stats` handler can serialize it directly as
+/// the wire response.
+///
+/// The field set and names are exactly the additive `GET /stats` wire
+/// contract (a new endpoint, no change to any existing op — see
+/// AGENT_LOG §4/§4b): this struct is the single source of truth for that
+/// shape, serialized straight to JSON rather than mirrored into a second
+/// response struct that could drift from it.
+#[derive(Debug, Serialize)]
+pub struct EngineStats {
+    pub node_count: u64,
+    pub edge_count: u64,
+    pub user_count: u64,
+    pub history_entries: u64,
+    pub kinds: Vec<KindCount>,
+    pub reads_total: u64,
+    pub writes_total: u64,
 }
 
 /// The decoded contents of an opaque keyset cursor: the last returned
@@ -2008,5 +2119,89 @@ mod delete_where_tests {
             recovered.get("dw_rec:stay").is_some(),
             "non-matching node recovered from durable storage"
         );
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+    use crate::core::coordinate::Coordinate;
+    use crate::core::node::Node;
+    use std::sync::{Mutex, OnceLock};
+
+    // Same durable-path discipline as clear_kind_tests / delete_where_tests:
+    // `insert` exercises the real WAL/binary path, which needs a data dir
+    // resolved through the process-wide `OnceLock`. One lock serializes the
+    // tests that append to the shared files; unique kinds/addresses keep
+    // assertions from crossing between tests.
+    fn disk_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("facetql-statstest-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create temp data dir");
+            crate::config::set_data_dir(dir);
+        });
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn node_owned(address: &str, kind: &str, owner: &str) -> Node {
+        Node::new(
+            Coordinate::new(0, 0, 0, 0),
+            address.to_string(),
+            kind.to_string(),
+            owner.to_string(),
+        )
+    }
+
+    /// Insert N nodes across two kinds and do M gets, then assert the
+    /// snapshot: exact `node_count`, per-kind grouping that is both
+    /// correct and sorted, and operation counters that reflect at least
+    /// the writes/reads we performed (>= because these are process-
+    /// lifetime counters other tests may not have touched — a fresh
+    /// engine starts them at 0, but the assertion is written to hold
+    /// regardless).
+    #[test]
+    fn stats_counts_kinds_and_operations() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+
+        // N = 5 nodes: 3 of "StatAlpha", 2 of "StatBeta".
+        e.insert(node_owned("stat:a1", "StatAlpha", "alice")).unwrap();
+        e.insert(node_owned("stat:a2", "StatAlpha", "alice")).unwrap();
+        e.insert(node_owned("stat:a3", "StatAlpha", "alice")).unwrap();
+        e.insert(node_owned("stat:b1", "StatBeta", "alice")).unwrap();
+        e.insert(node_owned("stat:b2", "StatBeta", "alice")).unwrap();
+        let n: u64 = 5;
+
+        // M = 4 gets (reads).
+        let m: u64 = 4;
+        for addr in ["stat:a1", "stat:a2", "stat:b1", "stat:missing"] {
+            let _ = e.get(addr);
+        }
+
+        let s = e.stats();
+
+        assert_eq!(s.node_count, n, "node_count must equal inserted N");
+
+        // Grouping is exact and sorted (BTreeMap → ascending by kind:
+        // "StatAlpha" before "StatBeta").
+        assert_eq!(s.kinds.len(), 2, "two distinct kinds");
+        assert_eq!(s.kinds[0].kind, "StatAlpha");
+        assert_eq!(s.kinds[0].count, 3);
+        assert_eq!(s.kinds[1].kind, "StatBeta");
+        assert_eq!(s.kinds[1].count, 2);
+
+        // Fresh engine: counters started at 0, so they equal exactly what
+        // we did here — but assert `>=` so the test is robust to the
+        // counting placement (each insert = 1 write, each get = 1 read).
+        assert!(s.writes_total >= n, "writes_total {} >= {n}", s.writes_total);
+        assert!(s.reads_total >= m, "reads_total {} >= {m}", s.reads_total);
+
+        // Structural fields we can pin exactly on a fresh engine.
+        assert_eq!(s.edge_count, 0, "no edges inserted");
+        assert_eq!(s.user_count, 0, "no users inserted");
+        assert_eq!(s.history_entries, 0, "no overwrites, so no history");
     }
 }
