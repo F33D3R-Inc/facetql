@@ -52,16 +52,39 @@ pub fn recover(engine: &mut StorageEngine) -> io::Result<()> {
     validate_sequence(&records)?;
 
     /*
-     * Make sure the in-process sequence counter continues past every
-     * sequence number already durable in this WAL file, so the first
-     * write of the new process doesn't reuse (and thus write
-     * out-of-order) a sequence number a previous process already used.
+     * Make sure the in-process counters continue past every identifier
+     * already durable in this WAL file.
+     *
+     * sequence: the first write of the new process must not reuse (and
+     * thus write out-of-order) a sequence number a previous process
+     * already used — `validate_sequence` requires strictly increasing
+     * sequences, so a reused one makes the *next* restart unrecoverable.
+     *
+     * transaction_id: a restarted process must not reissue a transaction
+     * ID that is still present in the WAL. If it did, the records of a
+     * previous run's frame and a new frame would land in the same
+     * transaction bucket below, and the lifecycle walk would reject the
+     * merged group ("BEGIN after transaction start") — turning a routine
+     * restart into a failed recovery. This matters most for exactly the
+     * case the frame exists to survive: an incomplete `BEGIN … EOF` frame
+     * left behind by a crash.
+     *
+     * operation_id: every record must stay uniquely identifiable.
      */
-    if let Some(max_sequence) =
-        records.iter().map(|r| r.sequence).max()
-    {
-        crate::storage::engine::advance_wal_sequence(max_sequence);
-    }
+    let max_sequence =
+        records.iter().map(|r| r.sequence).max().unwrap_or(0);
+
+    let max_transaction_id =
+        records.iter().map(|r| r.transaction_id).max().unwrap_or(0);
+
+    let max_operation_id =
+        records.iter().map(|r| r.operation_id).max().unwrap_or(0);
+
+    crate::storage::wal::initialize_counters(
+        max_sequence,
+        max_transaction_id,
+        max_operation_id,
+    );
 
     /*
      * Records already reflected in physical storage (facetql.data,

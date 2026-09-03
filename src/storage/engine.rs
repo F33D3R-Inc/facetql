@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,49 +12,14 @@ use crate::core::user::UserRecord;
 use crate::storage::binary;
 use crate::storage::index::Index;
 use crate::storage::tombstone;
+use crate::storage::transaction::{Operation, Transaction};
 use crate::storage::wal;
-
-static NEXT_WAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Loop-variable name a `delete_where` predicate's field accesses are
 /// written against. The `delete_where` wire contract (§4b) carries no
 /// `item_var` — unlike `/nodes/query` — so it uses the same default the
 /// query path does (`default_item_var` in `api::routes`): `"item"`.
 const DELETE_WHERE_ITEM_VAR: &str = "item";
-
-fn next_wal_sequence() -> u64 {
-    NEXT_WAL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Advance the in-process WAL sequence counter past `observed_max`.
-///
-/// `NEXT_WAL_SEQUENCE` starts at 1 every time the process starts, but an
-/// existing `facetql.wal` file may already contain records with much
-/// higher sequence numbers from a previous run. Without this call, the
-/// first write after a restart would reuse a low sequence number,
-/// appending an out-of-order record to a file whose sequence numbers
-/// must be strictly increasing (`recovery::validate_sequence` enforces
-/// this) — the *next* restart would then fail to recover at all.
-///
-/// `recovery::recover()` calls this with the highest sequence number it
-/// finds in the WAL before doing anything else, so newly generated
-/// sequence numbers always continue past whatever was already durable.
-pub(crate) fn advance_wal_sequence(observed_max: u64) {
-    let desired = observed_max.saturating_add(1);
-    let mut current = NEXT_WAL_SEQUENCE.load(Ordering::Relaxed);
-
-    while current < desired {
-        match NEXT_WAL_SEQUENCE.compare_exchange(
-            current,
-            desired,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(actual) => current = actual,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum ClaimError {
@@ -102,12 +67,13 @@ pub struct StorageEngine {
     /// Process-lifetime operation counters, the rate source behind
     /// `GET /stats` (and any future health/observability surface — NOTES
     /// EPIC 08). `reads_total` counts calls to `get`/`query`/`query_where`;
-    /// `writes_total` counts each applied mutation in `insert`/`delete`/
-    /// `insert_edge` — which, because the transaction apply pass routes
-    /// every committed op through exactly those primitives, also makes a
-    /// transaction contribute one increment per node it actually mutates
-    /// (a `ClearKind`/`DeleteWhere` of N nodes counts as N writes, the
-    /// truthful workload signal).
+    /// `writes_total` counts each applied mutation — in `insert`/`delete`/
+    /// `insert_edge` on the standalone path, and in `apply_committed` on
+    /// the transaction path, so a transaction contributes one increment
+    /// per node it actually mutates (a `ClearKind`/`DeleteWhere` of N
+    /// nodes counts as N writes, the truthful workload signal). Counting
+    /// lives at the apply step in both paths, so a batch that fails
+    /// validation and writes nothing counts nothing.
     ///
     /// These are deliberately NOT persisted: they start at 0 every time
     /// the process starts and are never checkpointed or replayed. That is
@@ -140,17 +106,26 @@ impl StorageEngine {
     /// Returns the WAL sequence number assigned to this record so the
     /// caller can advance the durability checkpoint once the matching
     /// physical write has also completed. See `storage::checkpoint`.
+    ///
+    /// Sequence and operation IDs come from `wal`'s counters, which are
+    /// the single source of truth for WAL identifiers. The engine must
+    /// not keep a second counter: staged transactions
+    /// (`storage::commit::StagedCommit`) allocate from `wal` too, and two
+    /// independent counters in one process would hand out duplicate
+    /// sequence numbers, breaking the strictly-increasing invariant
+    /// `recovery::validate_sequence` enforces — which would make the
+    /// *next* startup fail to recover at all.
     fn append_wal(
         &self,
         transaction_id: u64,
         operation: wal::WalOperation,
     ) -> Result<u64, String> {
-        let sequence = next_wal_sequence();
+        let sequence = wal::next_sequence();
 
         let record = wal::WalRecord::new(
             sequence,
             transaction_id,
-            sequence,
+            wal::next_operation_id(),
             operation,
         );
 
@@ -501,10 +476,42 @@ impl StorageEngine {
     ///
     /// Deletion is append-only. The original bytes are not removed from
     /// durable storage.
+    ///
+    /// The value being removed is archived to history first, exactly as
+    /// an overwrite archives the value it replaces. A delete is the last
+    /// thing that ever happens to a node's state, so if it is the one
+    /// transition that doesn't archive, the final state is the one state
+    /// nobody can ever look up again — `GET /node/:address/history`
+    /// would show every version except the one that mattered when
+    /// somebody asks what was deleted. Same WAL ordering as `insert`:
+    /// archive intent → history durable → delete intent → tombstone
+    /// durable → memory.
     pub fn delete(
         &mut self,
         address: &str,
     ) -> Result<(), String> {
+        if let Some(existing) = self.nodes.get(address) {
+            let entry = HistoryEntry::now(existing.clone());
+
+            let archive_sequence = self.append_wal(
+                0,
+                wal::WalOperation::Archive(entry.clone()),
+            )?;
+
+            binary::append_record(
+                &binary::history_path(),
+                &entry,
+            )
+                .map_err(|e| e.to_string())?;
+
+            Self::advance_checkpoint(archive_sequence);
+
+            self.history
+                .entry(address.to_string())
+                .or_default()
+                .push(entry);
+        }
+
         let sequence = self.append_wal(
             0,
             wal::WalOperation::Delete(
@@ -527,49 +534,156 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Live addresses a `ClearKind` would remove: every node whose
-    /// `kind` matches and that the caller may write.
+    /// Does one node fall inside a bulk-delete selection?
     ///
-    /// An admin (`is_admin`) matches all of that kind; a non-admin
-    /// matches only nodes it owns, via the same `can_write` check the
-    /// delete route uses. This is a read-only computation — the caller
-    /// tombstones each returned address through the normal `delete`
-    /// path — so it can run during transaction staging without touching
-    /// WAL, disk, or memory.
-    fn clear_targets(
-        &self,
+    /// This is the single selection rule behind both `clear_kind` and
+    /// `delete_where`: the node's `kind` must match, the caller must be
+    /// allowed to write it (an admin matches all of that kind; a
+    /// non-admin only what it owns, via the same `can_write` check the
+    /// delete route uses), and — when a `where_` predicate is present —
+    /// the predicate must hold against the node's decoded `data`.
+    ///
+    /// `clear_kind` is exactly this rule with `where_ == None`, which is
+    /// why there is one function here and not two: the two wire ops
+    /// differ only in whether a predicate participates.
+    ///
+    /// The predicate is run through the *same* `predicate::eval` the
+    /// `/nodes/query` path uses (see `query_where`), so a predicated
+    /// bulk delete selects byte-for-byte the rows the equivalent query
+    /// would — one evaluator, not two. A predicate `eval` can't push
+    /// down (or otherwise errors) is surfaced as `Err`, which the
+    /// transaction turns into a whole-batch abort — never a wrong or
+    /// partial delete.
+    fn selection_matches(
+        node: &Node,
         kind: &str,
+        where_: Option<&Expr>,
         owner: &str,
         is_admin: bool,
-    ) -> Vec<String> {
-        self.nodes
-            .values()
-            .filter(|n| n.kind == kind)
-            .filter(|n| is_admin || n.can_write(owner))
-            .map(|n| n.address.clone())
-            .collect()
+    ) -> Result<bool, String> {
+        if node.kind != kind {
+            return Ok(false);
+        }
+
+        if !(is_admin || node.can_write(owner)) {
+            return Ok(false);
+        }
+
+        let expr = match where_ {
+            Some(expr) => expr,
+            None => return Ok(true),
+        };
+
+        let data: serde_json::Value =
+            serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
+
+        predicate::eval(expr, DELETE_WHERE_ITEM_VAR, &data)
+            .map(|v| matches!(v, serde_json::Value::Bool(true)))
+            .map_err(|e| format!("predicate evaluation failed: {e}"))
     }
 
-    /// Live addresses a `DeleteWhere` would remove: `clear_targets`'
-    /// selection (every node whose `kind` matches and that the caller
-    /// may write) narrowed further by a `where_` predicate evaluated
-    /// against each candidate's decoded `data`.
+    /// The node a successful `SetIf` produces, or why its condition did
+    /// not hold.
+    ///
+    /// One rule in one place: the transaction path calls this to build
+    /// the mutation, and nothing else evaluates a CAS condition. The
+    /// condition is tested against `node`'s decoded `data`, and on
+    /// success `set`'s entries are *merged* into that same object rather
+    /// than replacing it — so a caller can move one field without having
+    /// to resend, and risk clobbering, the rest of the node it did not
+    /// intend to touch.
+    fn set_if_next(
+        node: &Node,
+        field: &str,
+        expect: &Expectation,
+        set: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Node, TransactionError> {
+        // A node whose data was never written is an empty object, so a
+        // set_if can initialise one (`expect_absent`) rather than
+        // requiring a separate seeding write.
+        let mut data = if node.data.trim().is_empty() {
+            serde_json::Map::new()
+        } else {
+            match serde_json::from_str::<serde_json::Value>(&node.data) {
+                Ok(serde_json::Value::Object(map)) => map,
+                Ok(serde_json::Value::Null) => serde_json::Map::new(),
+                Ok(_) => {
+                    return Err(TransactionError::Invalid(format!(
+                        "set_if target {} does not hold a JSON object in `data`",
+                        node.address
+                    )))
+                }
+                Err(e) => {
+                    return Err(TransactionError::Invalid(format!(
+                        "set_if target {} has undecodable `data`: {e}",
+                        node.address
+                    )))
+                }
+            }
+        };
+
+        let current = data.get(field);
+
+        let holds = match expect {
+            // A non-numeric or missing value is not "less than" anything
+            // — it fails rather than being coerced, because a lease
+            // check that silently treats a malformed deadline as due
+            // would hand the same slot to everyone.
+            Expectation::AtMost(bound) => {
+                match current.and_then(serde_json::Value::as_f64) {
+                    Some(value) => value <= *bound,
+                    None => false,
+                }
+            }
+
+            Expectation::Equals(expected) => current == Some(expected),
+
+            Expectation::Absent => {
+                matches!(current, None | Some(serde_json::Value::Null))
+            }
+        };
+
+        if !holds {
+            return Err(TransactionError::Precondition(format!(
+                "set_if precondition failed on {}.{field}",
+                node.address
+            )));
+        }
+
+        for (key, value) in set {
+            data.insert(key.clone(), value.clone());
+        }
+
+        let mut next = node.clone();
+        next.data = serde_json::Value::Object(data).to_string();
+
+        Ok(next)
+    }
+
+    /// Live addresses a `DeleteWhere` would remove: every node whose
+    /// `kind` matches and that the caller may write, narrowed further by
+    /// a `where_` predicate evaluated against each candidate's decoded
+    /// `data`.
     ///
     /// The predicate is run through the *same* `predicate::eval` the
     /// `/nodes/query` path uses (see `query_where`), so a predicated
     /// bulk delete selects byte-for-byte the rows the equivalent query
     /// would — one evaluator, not two. `where_ == None` degenerates to
-    /// exactly `clear_targets` (all writable nodes of the kind).
+    /// exactly a `clear_kind` (all writable nodes of the kind).
     ///
     /// A predicate `eval` can't push down (or otherwise errors) is
     /// surfaced as `Err`, mirroring how `query_where` surfaces it. The
     /// transaction turns that `Err` into a whole-batch abort — never a
     /// wrong or partial delete.
     ///
-    /// Read-only, like `clear_targets`: it computes addresses without
-    /// touching WAL, disk, or memory, so it is safe to call during
-    /// transaction staging (and from the handler, to record the exact
-    /// addresses the delete will tombstone).
+    /// Read-only: it computes addresses without touching WAL, disk, or
+    /// memory, so the handler can call it to report the exact addresses
+    /// a delete will tombstone. The transaction path resolves its own
+    /// targets through `staged_selection`, which applies the same rule
+    /// to the batch's in-progress view rather than to live state.
+    ///
+    /// Returned addresses are sorted, so the selection is deterministic
+    /// rather than dependent on `HashMap` iteration order.
     pub(crate) fn delete_where_targets(
         &self,
         kind: &str,
@@ -580,28 +694,12 @@ impl StorageEngine {
         let mut targets = Vec::new();
 
         for node in self.nodes.values() {
-            if node.kind != kind {
-                continue;
+            if Self::selection_matches(node, kind, where_, owner, is_admin)? {
+                targets.push(node.address.clone());
             }
-            if !(is_admin || node.can_write(owner)) {
-                continue;
-            }
-
-            if let Some(expr) = where_ {
-                let data: serde_json::Value =
-                    serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
-
-                let matched = predicate::eval(expr, DELETE_WHERE_ITEM_VAR, &data)
-                    .map(|v| matches!(v, serde_json::Value::Bool(true)))
-                    .map_err(|e| format!("predicate evaluation failed: {e}"))?;
-
-                if !matched {
-                    continue;
-                }
-            }
-
-            targets.push(node.address.clone());
         }
+
+        targets.sort();
 
         Ok(targets)
     }
@@ -1063,238 +1161,425 @@ impl StorageEngine {
     // Transactions
     // ---------------------------------------------------------------------
 
-    /// Executes a batch of operations.
+    /// Executes a batch of operations as one crash-atomic transaction.
     ///
-    /// IMPORTANT:
+    /// The batch is *validated and resolved in full* before a single byte
+    /// is written, then staged into a single durable
+    /// `BEGIN … mutations … COMMIT` WAL frame, and only then applied to
+    /// memory and physical storage:
     ///
-    /// This is still validation-atomic, not crash-atomic.
+    /// 1. [`Self::lower_transaction`] walks the ops in order against a
+    ///    staged view of the data, validating each one and lowering it
+    ///    into the concrete mutations it produces (expanding
+    ///    `clear_kind`/`delete_where` into the exact set of deletes they
+    ///    resolve to, and pairing each overwrite with its `Archive`).
+    ///    Any validation failure returns here, with nothing written.
     ///
-    /// Before the transaction coordinator is implemented, this function:
+    /// 2. [`Transaction::commit`] stages every resolved mutation under
+    ///    one transaction ID, writes the durable `COMMIT` marker, applies
+    ///    the batch through [`Self::apply_committed`], and then settles
+    ///    the durability checkpoint past the frame.
     ///
-    /// 1. Builds a staged view.
-    /// 2. Validates every operation.
-    /// 3. Applies operations sequentially.
+    /// Crash behaviour (FQL-003/FQL-004): a crash before the `COMMIT`
+    /// record is durable leaves an incomplete frame, which recovery
+    /// discards in full — the batch never happened. A crash after it
+    /// leaves a complete frame, which recovery replays in full. There is
+    /// no in-between state where part of a batch survives, which is what
+    /// the previous per-operation apply path could not guarantee.
     ///
-    /// If validation fails, nothing is written.
-    ///
-    /// If the process crashes during application, previously-applied
-    /// operations may already exist on disk.
-    ///
-    /// FQL-003 and FQL-004 replace this implementation with:
-    ///
-    /// BEGIN
-    /// OP
-    /// OP
-    /// COMMIT
-    ///
-    /// followed by deterministic recovery.
+    /// Because every failure mode is resolved in step 1 — before the
+    /// frame opens — step 2's apply cannot fail on validation grounds.
+    /// That ordering is the point: nothing may fail *after* the commit
+    /// marker is durable, since at that instant the batch is already
+    /// promised to recovery.
     pub fn execute_transaction(
         &mut self,
         ops: Vec<TxOperation>,
-    ) -> Result<(), String> {
-        // -------------------------------------------------------------
-        // Pass 1:
-        //
-        // Determine which addresses exist after the complete logical
-        // batch.
-        // -------------------------------------------------------------
+    ) -> Result<(), TransactionError> {
+        let transaction = Transaction::from_operations(
+            self.lower_transaction(ops)?,
+        );
 
-        let mut staged_existing: HashSet<&str> =
-            self.nodes
-                .keys()
-                .map(String::as_str)
-                .collect();
+        transaction
+            .commit(|operation| self.apply_committed(operation))
+            .map_err(|e| TransactionError::Storage(e.to_string()))
+    }
 
-        for op in &ops {
-            match op {
-                TxOperation::InsertNode(node) => {
-                    staged_existing.insert(
-                        node.address.as_str(),
-                    );
-                }
+    /// Validate a batch and lower it into the concrete mutations it
+    /// produces, without writing anything.
+    ///
+    /// Validation walks the operations **in order** against a staged view
+    /// — live state overlaid with everything the batch has done so far —
+    /// so each operation is judged against the state it will actually
+    /// meet when applied. That ordering is what makes the apply pass
+    /// infallible, and it has to be: the apply pass runs after the
+    /// `COMMIT` marker is durable, where an error can no longer roll
+    /// anything back.
+    ///
+    /// The staged view also gives the bulk ops their honest selection: a
+    /// `clear_kind` later in the batch removes nodes an earlier
+    /// `insert_node` in the same batch created, and does not remove ones
+    /// an earlier delete already took away.
+    ///
+    /// Returns the resolved mutations in apply order. An `Archive`
+    /// immediately precedes the `Insert` that supersedes it, mirroring
+    /// the WAL ordering the standalone `insert` path writes.
+    fn lower_transaction(
+        &self,
+        ops: Vec<TxOperation>,
+    ) -> Result<Vec<Operation>, TransactionError> {
+        let mut lowered: Vec<Operation> = Vec::new();
 
-                TxOperation::DeleteNode(address) => {
-                    staged_existing.remove(
-                        address.as_str(),
-                    );
-                }
-
-                TxOperation::ClearKind { kind, owner, is_admin } => {
-                    // A clear removes every writable node of this kind,
-                    // so the staged view must reflect all of them gone
-                    // — otherwise a later InsertEdge in the same batch
-                    // could reference an endpoint this clear deletes and
-                    // wrongly validate.
-                    for address in
-                        self.clear_targets(kind, owner, *is_admin)
-                    {
-                        staged_existing.remove(address.as_str());
-                    }
-                }
-
-                TxOperation::DeleteWhere { kind, where_, owner, is_admin } => {
-                    // Same staging rationale as ClearKind — the view
-                    // must reflect every selected node gone so a later
-                    // InsertEdge can't validate against an endpoint this
-                    // delete removes. An unpushable/erroring predicate
-                    // surfaces here via `?`, aborting the batch before
-                    // pass 2/3 write anything — the query path's
-                    // error-not-wrong-answer contract, applied to a
-                    // bulk delete.
-                    for address in self.delete_where_targets(
-                        kind,
-                        where_.as_ref(),
-                        owner,
-                        *is_admin,
-                    )? {
-                        staged_existing.remove(address.as_str());
-                    }
-                }
-
-                TxOperation::InsertEdge(_) => {}
-            }
-        }
-
-        // -------------------------------------------------------------
-        // Pass 2:
-        //
-        // Validate everything before touching WAL, disk, or memory.
-        // -------------------------------------------------------------
-
-        for op in &ops {
-            match op {
-                TxOperation::InsertNode(node) => {
-                    // SECURITY:
-                    //
-                    // Do not silently allow a transaction to overwrite
-                    // another owner's node.
-                    //
-                    // The current normal insert() behavior is replacement
-                    // semantics, so this check intentionally preserves
-                    // existing behavior for now unless an existing node
-                    // belongs to a different owner.
-                    if let Some(existing) =
-                        self.nodes.get(&node.address)
-                    {
-                        if existing.owner != node.owner {
-                            return Err(format!(
-                                "transaction failed, nothing applied: \
-                                 address {} is owned by {}",
-                                node.address,
-                                existing.owner
-                            ));
-                        }
-                    }
-                }
-
-                TxOperation::DeleteNode(address) => {
-                    if !self.nodes.contains_key(address) {
-                        return Err(format!(
-                            "transaction failed, nothing applied: \
-                             delete target not found: {address}"
-                        ));
-                    }
-                }
-
-                TxOperation::ClearKind { .. } => {
-                    // Nothing to validate: clearing a kind with no
-                    // writable nodes (or no nodes at all) is a valid
-                    // no-op, and authorization is already baked into
-                    // which addresses `clear_targets` selects. A clear
-                    // therefore never aborts the batch on its own —
-                    // consistent with delete_node only failing on a
-                    // missing target.
-                }
-
-                TxOperation::DeleteWhere { .. } => {
-                    // Nothing to validate here: the one way a
-                    // delete_where can abort — an unpushable/erroring
-                    // predicate — already surfaced in pass 1 (staging),
-                    // before any write. Matching zero writable nodes is
-                    // a valid no-op, so a delete_where never aborts the
-                    // batch on its own, same as ClearKind.
-                }
-
-                TxOperation::InsertEdge(edge) => {
-                    if !staged_existing
-                        .contains(edge.from.as_str())
-                    {
-                        return Err(format!(
-                            "transaction failed, nothing applied: \
-                             edge 'from' address not found: {}",
-                            edge.from
-                        ));
-                    }
-
-                    if !staged_existing
-                        .contains(edge.to.as_str())
-                    {
-                        return Err(format!(
-                            "transaction failed, nothing applied: \
-                             edge 'to' address not found: {}",
-                            edge.to
-                        ));
-                    }
-                }
-            }
-        }
-
-        // -------------------------------------------------------------
-        // Pass 3:
-        //
-        // Apply the validated operations.
-        //
-        // This remains non-crash-atomic until the transaction coordinator
-        // is implemented.
-        // -------------------------------------------------------------
+        // The batch's in-progress overlay on live state: `Some(node)` is
+        // a value this batch wrote, `None` an address it removed. An
+        // address absent from the overlay is untouched so far and
+        // resolves against `self.nodes`.
+        let mut staged: HashMap<String, Option<Node>> = HashMap::new();
 
         for op in ops {
             match op {
                 TxOperation::InsertNode(node) => {
-                    self.insert(node)?;
+                    if let Some(existing) =
+                        staged_node(&staged, &self.nodes, &node.address)
+                    {
+                        // SECURITY:
+                        //
+                        // Do not silently allow a transaction to
+                        // overwrite another owner's node. Insert is
+                        // otherwise replacement semantics, matching the
+                        // standalone insert path.
+                        if existing.owner != node.owner {
+                            return Err(TransactionError::Invalid(format!(
+                                "transaction failed, nothing applied: \
+                                 address {} is owned by {}",
+                                node.address,
+                                existing.owner
+                            )));
+                        }
+
+                        // An overwrite archives the value being
+                        // replaced — the same history entry the
+                        // standalone `insert` path writes, staged into
+                        // the frame ahead of the insert that supersedes
+                        // it.
+                        lowered.push(Operation::Archive(
+                            HistoryEntry::now(existing.clone()),
+                        ));
+                    }
+
+                    staged.insert(
+                        node.address.clone(),
+                        Some(node.clone()),
+                    );
+
+                    lowered.push(Operation::Insert(node));
                 }
 
                 TxOperation::DeleteNode(address) => {
-                    self.delete(&address)?;
+                    // Already removed earlier in this same batch (by a
+                    // clear_kind/delete_where or an explicit delete):
+                    // the target is gone, so there is nothing left to
+                    // tombstone. Idempotent rather than an error — a
+                    // bulk clear followed by an explicit delete of one
+                    // of the nodes it removed is a valid batch.
+                    if matches!(staged.get(&address), Some(None)) {
+                        continue;
+                    }
+
+                    match staged_node(&staged, &self.nodes, &address) {
+                        // Archive the value being removed, as the
+                        // standalone delete path does — a deleted node's
+                        // final state is exactly the one an operator
+                        // comes looking for.
+                        Some(node) => lowered
+                            .push(Operation::Archive(HistoryEntry::now(node.clone()))),
+                        None => {
+                            return Err(TransactionError::Invalid(format!(
+                                "transaction failed, nothing applied: \
+                                 delete target not found: {address}"
+                            )))
+                        }
+                    }
+
+                    staged.insert(address.clone(), None);
+
+                    lowered.push(Operation::Delete(address));
                 }
 
                 TxOperation::ClearKind { kind, owner, is_admin } => {
-                    // One tombstone per matching node, through the exact
-                    // same WAL + tombstone path as a standalone
-                    // delete_node — so the whole clear is durable and
-                    // survives the existing recovery path.
-                    for address in
-                        self.clear_targets(&kind, &owner, is_admin)
+                    // A clear never aborts the batch on its own:
+                    // clearing a kind with no writable nodes (or no
+                    // nodes at all) is a valid no-op, and authorization
+                    // is already baked into which addresses the
+                    // selection returns.
+                    for address in self
+                        .staged_selection(&staged, &kind, None, &owner, is_admin)
+                        .map_err(TransactionError::Invalid)?
                     {
-                        self.delete(&address)?;
+                        if let Some(node) = staged_node(&staged, &self.nodes, &address) {
+                            lowered.push(Operation::Archive(
+                                HistoryEntry::now(node.clone()),
+                            ));
+                        }
+
+                        staged.insert(address.clone(), None);
+                        lowered.push(Operation::Delete(address));
                     }
                 }
 
                 TxOperation::DeleteWhere { kind, where_, owner, is_admin } => {
-                    // One tombstone per selected node, through the exact
-                    // same WAL + tombstone path as a standalone
-                    // delete_node — so the whole predicated delete is
-                    // durable and survives recovery. Re-selecting here
-                    // (as ClearKind does) can't newly error: pass 1
-                    // already evaluated this same predicate and any
-                    // failure aborted the batch before reaching pass 3.
-                    for address in self.delete_where_targets(
-                        &kind,
-                        where_.as_ref(),
-                        &owner,
-                        is_admin,
-                    )? {
-                        self.delete(&address)?;
+                    // Same as ClearKind, plus the predicate. The one way
+                    // a delete_where can abort the batch — an unpushable
+                    // or erroring predicate — surfaces from the
+                    // selection below, here in the validate/lower pass,
+                    // before anything is written. Matching zero nodes is
+                    // a valid no-op.
+                    for address in self
+                        .staged_selection(&staged, &kind, where_.as_ref(), &owner, is_admin)
+                        .map_err(TransactionError::Invalid)?
+                    {
+                        if let Some(node) = staged_node(&staged, &self.nodes, &address) {
+                            lowered.push(Operation::Archive(
+                                HistoryEntry::now(node.clone()),
+                            ));
+                        }
+
+                        staged.insert(address.clone(), None);
+                        lowered.push(Operation::Delete(address));
                     }
                 }
 
+                TxOperation::SetIf {
+                    address,
+                    field,
+                    expect,
+                    set,
+                    owner,
+                    is_admin,
+                } => {
+                    // The target must exist. A missing node is reported
+                    // as a failed precondition rather than an invalid
+                    // batch: to a worker racing for a slot, "the node
+                    // isn't there" and "someone else already took it"
+                    // are the same answer — you did not win — and both
+                    // want the same handling.
+                    let node = match staged_node(&staged, &self.nodes, &address) {
+                        Some(node) => node,
+                        None => {
+                            return Err(TransactionError::Precondition(format!(
+                                "set_if target not found: {address}"
+                            )))
+                        }
+                    };
+
+                    if !(is_admin || node.can_write(&owner)) {
+                        return Err(TransactionError::Invalid(format!(
+                            "transaction failed, nothing applied: \
+                             not authorized to set_if {address}"
+                        )));
+                    }
+
+                    let next = Self::set_if_next(node, &field, &expect, &set)?;
+
+                    // A CAS is an upsert that had to earn the right to
+                    // run, so it lowers to the same pair as any other
+                    // overwrite: archive what was there, then insert.
+                    lowered.push(Operation::Archive(HistoryEntry::now(node.clone())));
+
+                    staged.insert(address, Some(next.clone()));
+
+                    lowered.push(Operation::Insert(next));
+                }
+
                 TxOperation::InsertEdge(edge) => {
-                    self.insert_edge(edge)?;
+                    // Endpoints are checked against the staged view, so
+                    // an edge may reference a node this batch inserted
+                    // earlier, but not one it already deleted — and not
+                    // one inserted *later*, because by then the edge has
+                    // already been applied.
+                    if staged_node(&staged, &self.nodes, &edge.from).is_none() {
+                        return Err(TransactionError::Invalid(format!(
+                            "transaction failed, nothing applied: \
+                             edge 'from' address not found: {}",
+                            edge.from
+                        )));
+                    }
+
+                    if staged_node(&staged, &self.nodes, &edge.to).is_none() {
+                        return Err(TransactionError::Invalid(format!(
+                            "transaction failed, nothing applied: \
+                             edge 'to' address not found: {}",
+                            edge.to
+                        )));
+                    }
+
+                    lowered.push(Operation::InsertEdge(edge));
                 }
             }
         }
 
+        Ok(lowered)
+    }
+
+    /// The addresses a bulk delete selects **within a batch**: the same
+    /// rule as [`Self::delete_where_targets`], applied to the staged view
+    /// instead of to live state.
+    ///
+    /// Candidates are every live address plus every address the batch has
+    /// touched, each resolved through the overlay — so a node the batch
+    /// inserted is eligible and a node it already removed is not. The
+    /// candidate set is walked through a `BTreeSet`, making the returned
+    /// order sorted and deterministic rather than dependent on `HashMap`
+    /// iteration order; these addresses become WAL records, and a WAL
+    /// should not vary run to run for identical input.
+    fn staged_selection(
+        &self,
+        staged: &HashMap<String, Option<Node>>,
+        kind: &str,
+        where_: Option<&Expr>,
+        owner: &str,
+        is_admin: bool,
+    ) -> Result<Vec<String>, String> {
+        let mut candidates: std::collections::BTreeSet<&str> =
+            self.nodes.keys().map(String::as_str).collect();
+
+        candidates.extend(staged.keys().map(String::as_str));
+
+        let mut targets = Vec::new();
+
+        for address in candidates {
+            let node = match staged_node(staged, &self.nodes, address) {
+                Some(node) => node,
+                None => continue,
+            };
+
+            if Self::selection_matches(node, kind, where_, owner, is_admin)? {
+                targets.push(address.to_string());
+            }
+        }
+
+        Ok(targets)
+    }
+
+    /// Apply one already-committed mutation to memory and physical
+    /// storage.
+    ///
+    /// This is the apply half of the crash-safe path, and it is
+    /// deliberately narrower than the standalone mutation primitives:
+    ///
+    /// * It writes **no WAL record**. The frame already logged this
+    ///   operation's intent under its transaction ID; writing again here
+    ///   would double-log it and (worse) log it a second time as a
+    ///   standalone record that recovery would replay outside the frame.
+    ///
+    /// * It **does not advance the checkpoint**. The checkpoint may only
+    ///   move once the whole frame is in physical storage; the frame
+    ///   itself settles it. Advancing per-operation would let a crash
+    ///   mid-apply leave a checkpoint that claims durability for part of
+    ///   a batch, which is exactly the hole the frame closes.
+    ///
+    /// It is the counterpart to the `replay_*` methods, which apply to
+    /// memory only. Those are correct for recovery, which is replaying a
+    /// WAL whose records may already be in the binary files; this one is
+    /// for the live path, where physical storage must actually be
+    /// written.
+    pub(crate) fn apply_committed(
+        &mut self,
+        operation: &Operation,
+    ) -> Result<(), String> {
+        match operation {
+            Operation::Archive(entry) => {
+                binary::append_record(
+                    &binary::history_path(),
+                    entry,
+                )
+                    .map_err(|e| e.to_string())?;
+
+                self.history
+                    .entry(entry.address.clone())
+                    .or_default()
+                    .push(entry.clone());
+            }
+
+            Operation::Insert(node) => {
+                let offset = binary::append_node(node)
+                    .map_err(|e| e.to_string())?;
+
+                self.index.insert(
+                    node.address.clone(),
+                    offset,
+                );
+
+                self.nodes.insert(
+                    node.address.clone(),
+                    node.clone(),
+                );
+
+                self.writes_total.fetch_add(1, Ordering::Relaxed);
+            }
+
+            Operation::Delete(address) => {
+                tombstone::append_tombstone(address)
+                    .map_err(|e| e.to_string())?;
+
+                self.nodes.remove(address);
+
+                self.writes_total.fetch_add(1, Ordering::Relaxed);
+            }
+
+            Operation::InsertEdge(edge) => {
+                binary::append_record(
+                    &binary::edges_path(),
+                    edge,
+                )
+                    .map_err(|e| e.to_string())?;
+
+                self.index_edge(edge.clone());
+
+                self.writes_total.fetch_add(1, Ordering::Relaxed);
+            }
+
+            Operation::InsertUser(record) => {
+                binary::append_record(
+                    &binary::users_path(),
+                    record,
+                )
+                    .map_err(|e| e.to_string())?;
+
+                self.users.insert(
+                    record.token_hash.clone(),
+                    record.clone(),
+                );
+            }
+
+            Operation::RevokeUser(token_hash) => {
+                tombstone::append_tombstone(
+                    &format!("user:{token_hash}"),
+                )
+                    .map_err(|e| e.to_string())?;
+
+                self.users.remove(token_hash);
+            }
+        }
+
         Ok(())
+    }
+}
+
+/// Resolve an address against a transaction's staged overlay, falling
+/// back to live state.
+///
+/// `Some(node)` in the overlay is a value the batch has written,
+/// `Some(None)` an address it has removed, and an absent key means the
+/// batch has not touched the address at all.
+fn staged_node<'a>(
+    staged: &'a HashMap<String, Option<Node>>,
+    live: &'a HashMap<String, Node>,
+    address: &str,
+) -> Option<&'a Node> {
+    match staged.get(address) {
+        Some(slot) => slot.as_ref(),
+        None => live.get(address),
     }
 }
 
@@ -1536,6 +1821,110 @@ pub enum TxOperation {
         owner: String,
         is_admin: bool,
     },
+
+    /// Native compare-and-set on one node — the atomic conditional
+    /// update behind "take this slot only if nobody else already has".
+    ///
+    /// `field` names a key inside the node's decoded `data` object,
+    /// `expect` is the condition that key must satisfy, and `set` is the
+    /// map of fields merged into `data` when it does. Check and write
+    /// happen inside the same batch under the same engine write lock, so
+    /// no other writer can slip between them — that indivisibility is
+    /// the whole point, and is why this is an engine primitive instead
+    /// of a read-then-write in a caller. A caller that "emulates" it
+    /// with a get followed by a put has a race, always.
+    ///
+    /// When the condition does not hold, the *whole transaction* is
+    /// rejected with `TransactionError::Precondition` and nothing is
+    /// applied. That is how a caller learns it lost: a batch carrying a
+    /// `SetIf` either commits (I won) or comes back precondition-failed
+    /// (someone else won). Two outcomes, no third, and no separate
+    /// result channel that could disagree with what was committed.
+    ///
+    /// A successful `SetIf` lowers to exactly the `Archive` + `Insert`
+    /// pair an upsert produces, so it archives history, stages inside
+    /// the crash-atomic frame, and replays through recovery like any
+    /// other write.
+    ///
+    /// Authorization is carried on the op, as with the bulk ops: a
+    /// non-admin may only compare-and-set a node it owns.
+    SetIf {
+        address: String,
+        field: String,
+        expect: Expectation,
+        set: serde_json::Map<String, serde_json::Value>,
+        owner: String,
+        is_admin: bool,
+    },
+}
+
+/// The condition a [`TxOperation::SetIf`] tests against one field of a
+/// node's `data`.
+///
+/// Deliberately small. These are the comparisons a compare-and-set
+/// actually needs, not a second predicate language — anything richer
+/// belongs in `core::predicate`, the `where` grammar the query and
+/// `delete_where` paths already share. A CAS condition has to stay
+/// trivially decidable, because a caller's correctness depends on
+/// knowing exactly when it wins.
+#[derive(Debug, Clone)]
+pub enum Expectation {
+    /// The field exists, is a number, and is less than or equal to this
+    /// value.
+    ///
+    /// The deadline form: "reserve this tick only if its `next_run` is
+    /// already due". A worker passes `now`; whichever worker's
+    /// transaction commits first moves `next_run` into the future, and
+    /// every other worker's batch is rejected.
+    AtMost(f64),
+
+    /// The field exists and equals this JSON value exactly.
+    ///
+    /// The version form: "write this only if the version is still the
+    /// one I read". The caller bumps the version inside `set`, so two
+    /// concurrent writers cannot both succeed.
+    Equals(serde_json::Value),
+
+    /// The field is absent, or present as JSON `null`.
+    ///
+    /// The create-once form: "set this only if nobody has set it". Null
+    /// counts as absent so that clearing a field genuinely releases it.
+    Absent,
+}
+
+/// Why a transaction was rejected.
+///
+/// These are kept apart because they mean genuinely different things to
+/// a caller: an invalid batch is the caller's to fix, a failed
+/// precondition means it lost a race and should re-read (or simply
+/// stop — the right answer for a scheduler that didn't win the tick),
+/// and a storage failure is neither, since nothing about the request was
+/// wrong. Flattening them into one string would force every caller to
+/// pattern-match on error prose to tell "you're wrong" from "you lost"
+/// from "the disk is full".
+#[derive(Debug)]
+pub enum TransactionError {
+    /// The batch is invalid: a missing delete target, an edge with no
+    /// endpoint, an owner conflict, an unpushable predicate.
+    Invalid(String),
+
+    /// A conditional operation's precondition did not hold. The batch is
+    /// rejected and nothing is applied — "you lost the race", not "your
+    /// request was malformed".
+    Precondition(String),
+
+    /// The batch was valid, but could not be made durable.
+    Storage(String),
+}
+
+impl std::fmt::Display for TransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactionError::Invalid(e)
+            | TransactionError::Precondition(e)
+            | TransactionError::Storage(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2203,5 +2592,415 @@ mod stats_tests {
         assert_eq!(s.edge_count, 0, "no edges inserted");
         assert_eq!(s.user_count, 0, "no users inserted");
         assert_eq!(s.history_entries, 0, "no overwrites, so no history");
+    }
+}
+/// `set_if` — the native compare-and-set primitive.
+///
+/// These tests are about one property: **two callers racing for the same
+/// slot cannot both win.** That is the entire reason this op exists in
+/// the engine rather than as a get-then-put in a caller, so it is the
+/// thing worth pinning down.
+#[cfg(test)]
+mod set_if_tests {
+    use super::*;
+    use crate::core::coordinate::Coordinate;
+    use crate::core::node::Node;
+    use std::sync::{Mutex, OnceLock};
+
+    // Same durable-path setup as the other transaction test modules: one
+    // process-wide temp data dir, one lock serializing tests that append
+    // to the shared WAL/binary/tombstone files. Addresses are unique per
+    // test so the shared dir never crosses assertions.
+    fn disk_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("facetql-setiftest-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create temp data dir");
+            crate::config::set_data_dir(dir);
+        });
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn node_with(address: &str, owner: &str, data: &str) -> Node {
+        let mut n = Node::new(
+            Coordinate::new(0, 0, 0, 0),
+            address.to_string(),
+            "SetIfEntity".to_string(),
+            owner.to_string(),
+        );
+        n.data = data.to_string();
+        n
+    }
+
+    fn set(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    fn field(engine: &StorageEngine, address: &str, field: &str) -> serde_json::Value {
+        let node = engine.get(address).expect("node exists");
+        let data: serde_json::Value =
+            serde_json::from_str(&node.data).expect("data is JSON");
+        data.get(field).cloned().unwrap_or(serde_json::Value::Null)
+    }
+
+    /// The durable-scheduler case (`ReserveCron`): several workers wake
+    /// at the same tick and all try to reserve it. Exactly one may win,
+    /// and the losers must be told they lost rather than quietly also
+    /// running the job.
+    #[test]
+    fn only_one_worker_reserves_a_due_tick() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("si_cron:nightly", "alice", r#"{"next_run":100}"#))
+            .unwrap();
+
+        let reserve = |worker: &str, at: f64| TxOperation::SetIf {
+            address: "si_cron:nightly".to_string(),
+            field: "next_run".to_string(),
+            expect: Expectation::AtMost(at),
+            set: set(&[
+                ("next_run", serde_json::json!(at + 3600.0)),
+                ("held_by", serde_json::json!(worker)),
+            ]),
+            owner: "alice".to_string(),
+            is_admin: false,
+        };
+
+        // now = 150, so next_run (100) is due: the first worker wins.
+        e.execute_transaction(vec![reserve("worker-a", 150.0)])
+            .expect("first worker reserves the due tick");
+
+        // The tick is no longer due, so every later worker loses — and
+        // loses with Precondition, not a generic failure.
+        let second = e.execute_transaction(vec![reserve("worker-b", 150.0)]);
+        assert!(
+            matches!(second, Err(TransactionError::Precondition(_))),
+            "second worker must lose the race, got {second:?}"
+        );
+
+        assert_eq!(field(&e, "si_cron:nightly", "held_by"), serde_json::json!("worker-a"));
+        assert_eq!(field(&e, "si_cron:nightly", "next_run"), serde_json::json!(3750.0));
+    }
+
+    /// The version case (compare-and-swap on a revision counter): a
+    /// writer holding a stale version is rejected, and the node keeps
+    /// the winner's value.
+    #[test]
+    fn stale_version_cannot_overwrite() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("si_ver:doc", "alice", r#"{"version":7,"body":"first"}"#))
+            .unwrap();
+
+        let write = |expect_version: serde_json::Value, body: &str, next: i64| {
+            TxOperation::SetIf {
+                address: "si_ver:doc".to_string(),
+                field: "version".to_string(),
+                expect: Expectation::Equals(expect_version),
+                set: set(&[
+                    ("version", serde_json::json!(next)),
+                    ("body", serde_json::json!(body)),
+                ]),
+                owner: "alice".to_string(),
+                is_admin: false,
+            }
+        };
+
+        e.execute_transaction(vec![write(serde_json::json!(7), "second", 8)])
+            .expect("writer holding the current version wins");
+
+        let stale = e.execute_transaction(vec![write(serde_json::json!(7), "third", 8)]);
+        assert!(
+            matches!(stale, Err(TransactionError::Precondition(_))),
+            "a stale version must be rejected, got {stale:?}"
+        );
+
+        assert_eq!(field(&e, "si_ver:doc", "body"), serde_json::json!("second"));
+        assert_eq!(field(&e, "si_ver:doc", "version"), serde_json::json!(8));
+    }
+
+    /// `expect_absent` is create-once: the first setter takes the field,
+    /// everyone after is refused. A field explicitly set back to `null`
+    /// counts as released, so clearing it genuinely frees the slot.
+    #[test]
+    fn absent_claims_once_and_null_releases() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("si_once:slot", "alice", r#"{}"#)).unwrap();
+
+        let claim = |worker: &str| TxOperation::SetIf {
+            address: "si_once:slot".to_string(),
+            field: "owner_worker".to_string(),
+            expect: Expectation::Absent,
+            set: set(&[("owner_worker", serde_json::json!(worker))]),
+            owner: "alice".to_string(),
+            is_admin: false,
+        };
+
+        e.execute_transaction(vec![claim("worker-a")]).expect("first claim wins");
+
+        let second = e.execute_transaction(vec![claim("worker-b")]);
+        assert!(
+            matches!(second, Err(TransactionError::Precondition(_))),
+            "an already-claimed slot must refuse a second claim, got {second:?}"
+        );
+        assert_eq!(
+            field(&e, "si_once:slot", "owner_worker"),
+            serde_json::json!("worker-a")
+        );
+
+        // Releasing by writing null makes the slot claimable again.
+        e.execute_transaction(vec![TxOperation::SetIf {
+            address: "si_once:slot".to_string(),
+            field: "owner_worker".to_string(),
+            expect: Expectation::Equals(serde_json::json!("worker-a")),
+            set: set(&[("owner_worker", serde_json::Value::Null)]),
+            owner: "alice".to_string(),
+            is_admin: false,
+        }])
+        .expect("holder releases the slot");
+
+        e.execute_transaction(vec![claim("worker-b")])
+            .expect("a released slot is claimable again");
+        assert_eq!(
+            field(&e, "si_once:slot", "owner_worker"),
+            serde_json::json!("worker-b")
+        );
+    }
+
+    /// `set` merges into `data` rather than replacing it — a CAS that
+    /// moves one field must not silently drop every field the caller
+    /// didn't mention.
+    #[test]
+    fn set_merges_and_leaves_other_fields_intact() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with(
+            "si_merge:row",
+            "alice",
+            r#"{"version":1,"title":"keep me","tags":["a"]}"#,
+        ))
+        .unwrap();
+
+        e.execute_transaction(vec![TxOperation::SetIf {
+            address: "si_merge:row".to_string(),
+            field: "version".to_string(),
+            expect: Expectation::Equals(serde_json::json!(1)),
+            set: set(&[("version", serde_json::json!(2))]),
+            owner: "alice".to_string(),
+            is_admin: false,
+        }])
+        .expect("cas applies");
+
+        assert_eq!(field(&e, "si_merge:row", "version"), serde_json::json!(2));
+        assert_eq!(field(&e, "si_merge:row", "title"), serde_json::json!("keep me"));
+        assert_eq!(field(&e, "si_merge:row", "tags"), serde_json::json!(["a"]));
+    }
+
+    /// A lost CAS rejects the *whole* batch. This is what makes "did my
+    /// transaction commit?" a truthful answer to "did I win?" — a losing
+    /// worker must not have its other operations applied anyway.
+    #[test]
+    fn a_lost_cas_rolls_back_the_whole_batch() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("si_atom:lease", "alice", r#"{"next_run":900}"#))
+            .unwrap();
+
+        let result = e.execute_transaction(vec![
+            TxOperation::InsertNode(node_with("si_atom:sideeffect", "alice", r#"{}"#)),
+            TxOperation::SetIf {
+                address: "si_atom:lease".to_string(),
+                field: "next_run".to_string(),
+                // 900 > 100, so the lease is not yet due: this loses.
+                expect: Expectation::AtMost(100.0),
+                set: set(&[("next_run", serde_json::json!(1000))]),
+                owner: "alice".to_string(),
+                is_admin: false,
+            },
+        ]);
+
+        assert!(
+            matches!(result, Err(TransactionError::Precondition(_))),
+            "an undue lease must fail the batch, got {result:?}"
+        );
+        assert!(
+            e.get("si_atom:sideeffect").is_none(),
+            "the batch's other write must roll back with the lost CAS"
+        );
+        assert_eq!(field(&e, "si_atom:lease", "next_run"), serde_json::json!(900));
+    }
+
+    /// A CAS is a write, so it obeys the same ownership rule every other
+    /// write does: a non-owner cannot use it to reach into someone
+    /// else's node, and being refused for that reason is an invalid
+    /// batch — not a lost race.
+    #[test]
+    fn non_owner_cannot_compare_and_set() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("si_auth:row", "alice", r#"{"version":1}"#))
+            .unwrap();
+
+        let result = e.execute_transaction(vec![TxOperation::SetIf {
+            address: "si_auth:row".to_string(),
+            field: "version".to_string(),
+            expect: Expectation::Equals(serde_json::json!(1)),
+            set: set(&[("version", serde_json::json!(99))]),
+            owner: "mallory".to_string(),
+            is_admin: false,
+        }]);
+
+        assert!(
+            matches!(result, Err(TransactionError::Invalid(_))),
+            "a non-owner CAS must be refused as invalid, got {result:?}"
+        );
+        assert_eq!(field(&e, "si_auth:row", "version"), serde_json::json!(1));
+    }
+
+    /// A won CAS archives the value it replaced, like any other
+    /// overwrite — the reservation history of a slot is exactly the
+    /// audit trail an operator needs when two workers disagree about who
+    /// ran a job.
+    #[test]
+    fn a_won_cas_archives_the_previous_value() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("si_hist:slot", "alice", r#"{"next_run":10}"#))
+            .unwrap();
+
+        e.execute_transaction(vec![TxOperation::SetIf {
+            address: "si_hist:slot".to_string(),
+            field: "next_run".to_string(),
+            expect: Expectation::AtMost(50.0),
+            set: set(&[("next_run", serde_json::json!(60))]),
+            owner: "alice".to_string(),
+            is_admin: false,
+        }])
+        .expect("cas applies");
+
+        let history = e.history_for("si_hist:slot");
+        assert_eq!(history.len(), 1, "the replaced value was archived");
+        assert!(
+            history[0].node.data.contains("\"next_run\":10"),
+            "history holds the pre-CAS value, got {}",
+            history[0].node.data
+        );
+    }
+}
+
+/// History on the delete path.
+///
+/// An overwrite has always archived the value it replaced. A delete is
+/// the *last* transition a node ever makes, so if it doesn't archive,
+/// the final state — the one an operator asks about after somebody
+/// deletes something — is the single state that was never recorded.
+#[cfg(test)]
+mod delete_history_tests {
+    use super::*;
+    use crate::core::coordinate::Coordinate;
+    use crate::core::node::Node;
+    use std::sync::{Mutex, OnceLock};
+
+    fn disk_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("facetql-delhisttest-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create temp data dir");
+            crate::config::set_data_dir(dir);
+        });
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn node_with(address: &str, kind: &str, owner: &str, data: &str) -> Node {
+        let mut n = Node::new(
+            Coordinate::new(0, 0, 0, 0),
+            address.to_string(),
+            kind.to_string(),
+            owner.to_string(),
+        );
+        n.data = data.to_string();
+        n
+    }
+
+    /// A standalone delete archives the state it removed.
+    #[test]
+    fn delete_archives_the_removed_state() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dh_one:a", "DhEntity", "alice", r#"{"v":1}"#)).unwrap();
+
+        e.delete("dh_one:a").unwrap();
+
+        let history = e.history_for("dh_one:a");
+        assert_eq!(history.len(), 1, "the deleted state was archived");
+        assert!(history[0].node.data.contains("\"v\":1"));
+        assert!(e.get("dh_one:a").is_none(), "the node is still gone");
+    }
+
+    /// The full lifecycle: create → overwrite → delete leaves both the
+    /// replaced value and the deleted value in history, in order.
+    #[test]
+    fn overwrite_then_delete_records_both_states() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dh_two:a", "DhEntity", "alice", r#"{"v":1}"#)).unwrap();
+        e.insert(node_with("dh_two:a", "DhEntity", "alice", r#"{"v":2}"#)).unwrap();
+        e.delete("dh_two:a").unwrap();
+
+        let history = e.history_for("dh_two:a");
+        assert_eq!(history.len(), 2, "one entry per state that stopped being current");
+        assert!(history[0].node.data.contains("\"v\":1"), "oldest first");
+        assert!(history[1].node.data.contains("\"v\":2"), "then the deleted state");
+    }
+
+    /// A bulk delete archives every node it removes — the audit trail
+    /// for a mass deletion is exactly when you need one most.
+    #[test]
+    fn bulk_delete_archives_every_removed_node() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dh_bulk:a", "DhBulkEntity", "alice", r#"{"v":"a"}"#)).unwrap();
+        e.insert(node_with("dh_bulk:b", "DhBulkEntity", "alice", r#"{"v":"b"}"#)).unwrap();
+
+        e.execute_transaction(vec![TxOperation::ClearKind {
+            kind: "DhBulkEntity".to_string(),
+            owner: "alice".to_string(),
+            is_admin: false,
+        }])
+        .expect("clear commits");
+
+        for (address, value) in [("dh_bulk:a", "a"), ("dh_bulk:b", "b")] {
+            assert!(e.get(address).is_none(), "{address} was cleared");
+            let history = e.history_for(address);
+            assert_eq!(history.len(), 1, "{address} archived its removed state");
+            assert!(history[0].node.data.contains(value));
+        }
+    }
+
+    /// A transactional delete archives too, and the archive is part of
+    /// the same crash-atomic frame: it survives a fresh recovery from
+    /// the durable files rather than living only in memory.
+    #[test]
+    fn transactional_delete_archive_survives_recovery() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dh_rec:a", "DhRecEntity", "alice", r#"{"v":"final"}"#)).unwrap();
+
+        e.execute_transaction(vec![TxOperation::DeleteNode("dh_rec:a".to_string())])
+            .expect("delete commits");
+
+        let recovered = StorageEngine::load().expect("recovery load");
+        assert!(recovered.get("dh_rec:a").is_none(), "still deleted");
+        let history = recovered.history_for("dh_rec:a");
+        assert_eq!(history.len(), 1, "the archive is durable, not just in memory");
+        assert!(history[0].node.data.contains("final"));
     }
 }

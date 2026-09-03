@@ -11,7 +11,7 @@ use std::convert::Infallible;
 use serde::{Deserialize, Serialize};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::database::Database;
+use crate::database::{Audience, Database};
 use crate::core::node::{Node, Visibility};
 use crate::core::edge::Edge;
 use crate::core::coordinate::Coordinate;
@@ -19,7 +19,7 @@ use crate::core::predicate::Expr;
 use crate::core::user::{Role, UserRecord};
 use crate::core::history::HistoryEntry;
 use crate::auth::{auth_middleware, hash_token, AuthIdentity};
-use crate::storage::engine::{ClaimError, TxOperation};
+use crate::storage::engine::{ClaimError, Expectation, TransactionError, TxOperation};
 
 #[derive(Deserialize)]
 pub struct EdgeSpec {
@@ -187,6 +187,9 @@ async fn create_node(
 
     let address = node.address.clone();
     let kind = payload.kind;
+    // Taken before the node moves into the engine: a private node's
+    // creation is announced only to its owner.
+    let audience = Audience::for_node(&node);
     let edge_targets: Vec<(String, String)> =
         payload.edges.into_iter().map(|e| (e.to, e.kind)).collect();
 
@@ -204,6 +207,7 @@ async fn create_node(
         Ok(edges_created) => {
             drop(engine);
             db.publish(
+                audience,
                 serde_json::json!({"event": "node_created", "address": address, "kind": kind}).to_string(),
             );
             (
@@ -284,10 +288,15 @@ async fn update_node(
         updated.visibility = if public { Visibility::Public } else { Visibility::Private };
     }
 
+    let audience = Audience::for_node(&updated);
+
     match engine.insert(updated) {
         Ok(()) => {
             drop(engine);
-            db.publish(serde_json::json!({"event": "node_updated", "address": address}).to_string());
+            db.publish(
+                audience,
+                serde_json::json!({"event": "node_updated", "address": address}).to_string(),
+            );
             (StatusCode::OK, "Node updated").into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -310,10 +319,15 @@ async fn delete_node(
         return (StatusCode::FORBIDDEN, "not authorized to delete this node").into_response();
     }
 
+    let audience = Audience::for_node(&existing);
+
     match engine.delete(&address) {
         Ok(()) => {
             drop(engine);
-            db.publish(serde_json::json!({"event": "node_deleted", "address": address}).to_string());
+            db.publish(
+                audience,
+                serde_json::json!({"event": "node_deleted", "address": address}).to_string(),
+            );
             (StatusCode::NO_CONTENT, "").into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -326,10 +340,19 @@ async fn claim_node(
     Extension(identity): Extension<AuthIdentity>,
 ) -> impl IntoResponse {
     let mut engine = db.engine.write().expect("storage engine lock poisoned");
+
+    // Resolved under the same lock as the claim itself, so the audience
+    // matches the node the claim actually applied to.
+    let audience = engine
+        .get(&address)
+        .map(Audience::for_node)
+        .unwrap_or_else(|| Audience::Owner(identity.owner.clone()));
+
     match engine.claim(&address, &identity.owner) {
         Ok(()) => {
             drop(engine);
             db.publish(
+                audience,
                 serde_json::json!({"event": "node_claimed", "address": address, "worker": identity.owner}).to_string(),
             );
             (StatusCode::OK, "claimed").into_response()
@@ -432,13 +455,31 @@ async fn create_edge(
     Extension(identity): Extension<AuthIdentity>,
     Json(payload): Json<CreateEdgeRequest>,
 ) -> impl IntoResponse {
+    let owner = identity.owner.clone();
     let edge = Edge::new(payload.from.clone(), payload.to.clone(), payload.kind.clone(), identity.owner);
 
     let mut engine = db.engine.write().expect("storage engine lock poisoned");
+
+    // An edge is only as public as the pair it connects: announcing
+    // "a → b" to everyone reveals that both nodes exist and are related,
+    // so a single private endpoint keeps the whole event owner-scoped.
+    let endpoints_public = [&payload.from, &payload.to].iter().all(|address| {
+        engine
+            .get(address)
+            .is_some_and(|node| matches!(node.visibility, Visibility::Public))
+    });
+
+    let audience = if endpoints_public {
+        Audience::Everyone
+    } else {
+        Audience::Owner(owner.clone())
+    };
+
     match engine.insert_edge(edge) {
         Ok(()) => {
             drop(engine);
             db.publish(
+                audience,
                 serde_json::json!({"event": "edge_created", "from": payload.from, "to": payload.to, "kind": payload.kind}).to_string(),
             );
             (StatusCode::CREATED, "Edge created").into_response()
@@ -511,6 +552,36 @@ pub enum TxOpRequest {
         kind: String,
         #[serde(rename = "where")]
         where_: Option<Expr>,
+    },
+    /// Native compare-and-set: rewrite `address` only if `field` inside
+    /// its `data` still satisfies the stated expectation, as one
+    /// all-or-nothing step in the transaction. Wire tag is `set_if`.
+    ///
+    /// Exactly one expectation must be given:
+    ///
+    /// * `expect_le: <number>` — the field is a number and is at most
+    ///   this. The lease/deadline form (`"next_run" <= now`).
+    /// * `expect_eq: <value>` — the field equals this exactly. The
+    ///   version form (compare-and-swap on a revision counter).
+    /// * `expect_absent: true` — the field is unset or null. The
+    ///   create-once form.
+    ///
+    /// `set` is merged into the node's `data` (not a replacement), so an
+    /// unrelated field is never clobbered. The caller learns the outcome
+    /// from the status: **200** means the condition held and the batch
+    /// committed — you won; **412 Precondition Failed** means it did not
+    /// and *nothing* in the batch was applied — someone else won. This
+    /// is the primitive behind a durable scheduler's "reserve this tick"
+    /// and any conditional update; emulating it with a read followed by
+    /// a write is a race, which is exactly why it lives in the engine.
+    SetIf {
+        address: String,
+        field: String,
+        expect_le: Option<f64>,
+        expect_eq: Option<serde_json::Value>,
+        expect_absent: Option<bool>,
+        #[serde(default)]
+        set: serde_json::Map<String, serde_json::Value>,
     },
 }
 
@@ -632,18 +703,79 @@ async fn execute_transaction(
                     is_admin,
                 });
             }
+            TxOpRequest::SetIf {
+                address,
+                field,
+                expect_le,
+                expect_eq,
+                expect_absent,
+                set,
+            } => {
+                // Exactly one expectation, resolved here so a malformed
+                // condition is a plain 400 rather than something the
+                // engine has to guess at. `expect_absent: false` counts
+                // as "not given" — it states no condition.
+                let mut stated = [
+                    expect_le.map(Expectation::AtMost),
+                    expect_eq.map(Expectation::Equals),
+                    expect_absent.filter(|set| *set).map(|_| Expectation::Absent),
+                ]
+                .into_iter()
+                .flatten();
+
+                let expect = match (stated.next(), stated.next()) {
+                    (Some(expect), None) => expect,
+                    _ => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "set_if requires exactly one of expect_le, expect_eq, \
+                             expect_absent",
+                        )
+                            .into_response();
+                    }
+                };
+
+                touched_addresses.push(address.clone());
+
+                ops.push(TxOperation::SetIf {
+                    address,
+                    field,
+                    expect,
+                    set,
+                    owner: identity.owner.clone(),
+                    is_admin: identity.is_admin(),
+                });
+            }
         }
     }
 
     match engine.execute_transaction(ops) {
         Ok(()) => {
             drop(engine);
+            // A batch is one identity's writes, and its address list can
+            // name private nodes, so it is announced to that identity
+            // (and admins) rather than broadcast. Public fan-out is what
+            // POST /publish is for — an explicit choice, not a side
+            // effect of writing.
             db.publish(
+                Audience::Owner(identity.owner.clone()),
                 serde_json::json!({"event": "transaction_committed", "addresses": touched_addresses}).to_string(),
             );
             (StatusCode::OK, "transaction committed").into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        // A failed precondition is not a malformed request: the batch
+        // was well-formed, the caller simply lost the race. 412 keeps
+        // that distinguishable from a 400 without parsing error prose.
+        Err(TransactionError::Precondition(e)) => {
+            (StatusCode::PRECONDITION_FAILED, e).into_response()
+        }
+        // The batch was fine; the disk was not. Telling a caller its
+        // request was bad would send it off to fix something that isn't
+        // broken.
+        Err(TransactionError::Storage(e)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
+        Err(TransactionError::Invalid(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
 }
 
@@ -680,18 +812,44 @@ async fn publish_event(
     Extension(_identity): Extension<AuthIdentity>,
     Json(payload): Json<PublishRequest>,
 ) -> impl IntoResponse {
-    db.publish(payload.payload);
+    // An explicit application broadcast — the caller asked for this
+    // payload to go out, and chose its contents, so it reaches every
+    // subscriber. Nothing here is read out of the database, so there is
+    // no stored visibility to honour; what the caller must not do is put
+    // private data in it. This is the `Notify` replacement for
+    // LISTEN/NOTIFY.
+    db.publish(Audience::Everyone, payload.payload);
     (StatusCode::OK, "published").into_response()
 }
 
+/// `GET /events` (SSE) — the live notification stream, filtered to what
+/// this subscriber is allowed to see.
+///
+/// Every event carries the audience the writing handler stamped on it
+/// (see [`Audience`]), and a subscriber receives only the ones that
+/// admit it. Without this filter the stream is a read path with no
+/// authorization at all: any valid token would learn the address, kind
+/// and timing of every private node in the database — data the same
+/// token would be refused on `GET /node/:address`.
+///
+/// The identity is resolved once, when the stream is opened, and the
+/// filter closure owns it for the life of the connection.
 async fn subscribe_events(
     State(db): State<Arc<Database>>,
-    Extension(_identity): Extension<AuthIdentity>,
+    Extension(identity): Extension<AuthIdentity>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = db.broadcaster.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
-        Ok(msg) => Some(Ok(Event::default().data(msg))),
-        Err(_) => None,
+
+    let owner = identity.owner.clone();
+    let is_admin = identity.is_admin();
+
+    let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
+        Ok(event) if event.audience.admits(&owner, is_admin) => {
+            Some(Ok(Event::default().data(event.payload)))
+        }
+        // Either the event is not for this subscriber, or the receiver
+        // lagged and dropped messages. Neither ends the stream.
+        _ => None,
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -780,7 +938,11 @@ async fn create_user(
     match engine.insert_user(record) {
         Ok(()) => {
             drop(engine);
+            // Account lifecycle is admin business: only an admin can
+            // reach this route, and the event names a new identity, so
+            // it stays inside the admin audience.
             db.publish(
+                Audience::Owner(identity.owner.clone()),
                 serde_json::json!({"event": "user_created", "owner": payload.owner, "created_by": identity.owner}).to_string(),
             );
             (StatusCode::CREATED, Json(CreateUserResponse { owner: payload.owner, role, token })).into_response()
@@ -837,7 +999,12 @@ async fn revoke_user(
         }
     }
     drop(engine);
-    db.publish(serde_json::json!({"event": "user_revoked", "owner": owner}).to_string());
+    // Account lifecycle is admin business; only admins created or
+    // revoked it, and only admins should hear about it.
+    db.publish(
+        Audience::Owner(identity.owner.clone()),
+        serde_json::json!({"event": "user_revoked", "owner": owner}).to_string(),
+    );
     (StatusCode::NO_CONTENT, "").into_response()
 }
 

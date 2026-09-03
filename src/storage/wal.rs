@@ -22,6 +22,230 @@ pub const WAL_FORMAT_VERSION: u16 = 2;
 /// represent one complete mutation.
 pub const STANDALONE_TRANSACTION_ID: u64 = 0;
 
+/// Magic bytes that begin every on-disk WAL frame.
+///
+/// The magic lets recovery recognise the start of a well-formed frame and
+/// distinguish a structurally-present frame from a torn trailing write.
+pub const WAL_FRAME_MAGIC: [u8; 4] = *b"FQW1";
+
+/// On-disk frame envelope version.
+///
+/// This is intentionally separate from `WAL_FORMAT_VERSION`: the record
+/// layout (the bincode payload) and the outer frame envelope evolve
+/// independently. Bump this only when the frame header layout changes.
+pub const WAL_FRAME_VERSION: u16 = 1;
+
+/// Size of the fixed frame header, in bytes:
+///
+///     magic(4) + frame_version(2) + payload_len(4) + payload_crc(4)
+const WAL_FRAME_HEADER_LEN: usize = 14;
+
+/// Durability classification of a single on-disk WAL frame.
+///
+/// These are the explicit, code-level durability states recovery reasons
+/// about. Every non-empty WAL line decodes into exactly one of them.
+#[derive(Debug)]
+pub enum FrameOutcome {
+    /// The frame is fully present, its checksum verified, and its record
+    /// authentic. This operation is durable and may be replayed.
+    Durable(WalRecord),
+
+    /// The frame is structurally incomplete — bad hex, a short header, or
+    /// fewer payload bytes than the header declares. This is the exact
+    /// signature of a crash that tore the final append. It is only ever
+    /// safe to discard as the *trailing* frame (the crash point).
+    Torn(String),
+
+    /// The frame is structurally complete (full declared length present)
+    /// but failed integrity — checksum mismatch, failed authentication,
+    /// or an undecodable record. Consistent with bit-rot or tampering
+    /// rather than a clean crash tail.
+    Corrupt(String),
+}
+
+/// CRC-32 (IEEE 802.3, reflected, polynomial 0xEDB88320).
+///
+/// Implemented inline to keep the WAL frame self-checksumming without
+/// pulling in an external crate — the same "one less dependency" stance
+/// the crypto module's hand-written hex codec takes.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+
+    for &byte in data {
+        crc ^= byte as u32;
+
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+
+    !crc
+}
+
+/// Serialize, authenticate, checksum, and frame one WAL record into the
+/// single hex-encoded line that is appended to the WAL file.
+///
+/// On-disk frame layout (before hex-encoding the whole line):
+///
+///     offset  size  field
+///     ------  ----  ---------------------------------------------
+///     0       4     MAGIC = b"FQW1"
+///     4       2     FRAME_VERSION (u16, little-endian)
+///     6       4     PAYLOAD_LEN   (u32, little-endian)
+///     10      4     PAYLOAD_CRC32 (u32, little-endian, over PAYLOAD)
+///     14      N     PAYLOAD = AES-256-GCM(bincode(WalRecord))
+///
+/// The explicit length + CRC let recovery detect a torn trailing frame
+/// structurally, before ever trusting its contents.
+pub fn encode_frame(
+    record: &WalRecord,
+) -> io::Result<String> {
+    let bytes = bincode::serialize(record)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                e,
+            )
+        })?;
+
+    let payload = crypto::encrypt(&bytes);
+
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL payload exceeds u32 length",
+            )
+        })?;
+
+    let crc = crc32(&payload);
+
+    let mut frame =
+        Vec::with_capacity(WAL_FRAME_HEADER_LEN + payload.len());
+
+    frame.extend_from_slice(&WAL_FRAME_MAGIC);
+    frame.extend_from_slice(&WAL_FRAME_VERSION.to_le_bytes());
+    frame.extend_from_slice(&payload_len.to_le_bytes());
+    frame.extend_from_slice(&crc.to_le_bytes());
+    frame.extend_from_slice(&payload);
+
+    Ok(crypto::encode_hex(&frame))
+}
+
+/// Decode one WAL line into its explicit durability state.
+///
+/// This never returns an error: an unreadable line is *data*, and the
+/// caller (recovery) decides whether a defect is an acceptable torn tail
+/// or unacceptable mid-WAL corruption. The order of checks is deliberate
+/// so that truncation is classified `Torn` before integrity is judged.
+pub fn decode_frame(
+    line: &str,
+) -> FrameOutcome {
+    let raw = match crypto::decode_hex(line) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return FrameOutcome::Torn(format!(
+                "frame is not valid hex: {e}"
+            ));
+        }
+    };
+
+    if raw.len() < WAL_FRAME_HEADER_LEN {
+        return FrameOutcome::Torn(format!(
+            "frame header truncated: {} of {} header bytes present",
+            raw.len(),
+            WAL_FRAME_HEADER_LEN,
+        ));
+    }
+
+    if raw[0..4] != WAL_FRAME_MAGIC {
+        return FrameOutcome::Corrupt(
+            "frame magic mismatch".to_string(),
+        );
+    }
+
+    let frame_version =
+        u16::from_le_bytes([raw[4], raw[5]]);
+
+    if frame_version != WAL_FRAME_VERSION {
+        return FrameOutcome::Corrupt(format!(
+            "unsupported WAL frame version {frame_version}"
+        ));
+    }
+
+    let payload_len = u32::from_le_bytes([
+        raw[6], raw[7], raw[8], raw[9],
+    ]) as usize;
+
+    let declared_crc = u32::from_le_bytes([
+        raw[10], raw[11], raw[12], raw[13],
+    ]);
+
+    let available = raw.len() - WAL_FRAME_HEADER_LEN;
+
+    if available < payload_len {
+        return FrameOutcome::Torn(format!(
+            "frame payload truncated: {available} of {payload_len} bytes present"
+        ));
+    }
+
+    if available > payload_len {
+        return FrameOutcome::Corrupt(format!(
+            "frame has {} trailing byte(s) beyond declared payload length",
+            available - payload_len,
+        ));
+    }
+
+    let payload = &raw[WAL_FRAME_HEADER_LEN..];
+
+    if crc32(payload) != declared_crc {
+        return FrameOutcome::Corrupt(
+            "frame checksum mismatch".to_string(),
+        );
+    }
+
+    let plaintext = match crypto::decrypt(payload) {
+        Ok(plaintext) => plaintext,
+        Err(e) => {
+            return FrameOutcome::Corrupt(format!(
+                "frame failed authentication/decryption: {e}"
+            ));
+        }
+    };
+
+    let record: WalRecord =
+        match bincode::deserialize(&plaintext) {
+            Ok(record) => record,
+            Err(e) => {
+                return FrameOutcome::Corrupt(format!(
+                    "frame contains an invalid record: {e}"
+                ));
+            }
+        };
+
+    if record.format_version != WAL_FORMAT_VERSION {
+        return FrameOutcome::Corrupt(format!(
+            "unsupported WAL record format version {}",
+            record.format_version,
+        ));
+    }
+
+    if record.sequence == 0 {
+        return FrameOutcome::Corrupt(
+            "record has invalid sequence 0".to_string(),
+        );
+    }
+
+    if record.operation_id == 0 {
+        return FrameOutcome::Corrupt(
+            "record has invalid operation ID 0".to_string(),
+        );
+    }
+
+    FrameOutcome::Durable(record)
+}
+
 /// Generates process-local transaction IDs.
 ///
 /// The final durable transaction coordinator will recover the next ID
