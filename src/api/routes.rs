@@ -360,21 +360,20 @@ async fn query_nodes(
 
     let engine = db.engine.read().expect("storage engine lock poisoned");
     // Admins see everything matching the filter, ignoring visibility —
-    // same bypass rationale as get_node. Everyone else gets the normal
-    // can_read-filtered view.
-    let results: Vec<Node> = if identity.is_admin() {
-        engine
-            .query(params.kind.as_deref(), params.owner.as_deref(), "", limit, offset)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>()
+    // same bypass rationale as get_node. `None` is the engine's
+    // superuser bypass (skip the per-node can_read filter entirely).
+    // Everyone else passes `Some(owner)` for the normal can_read view.
+    let requester = if identity.is_admin() {
+        None
     } else {
-        engine
-            .query(params.kind.as_deref(), params.owner.as_deref(), &identity.owner, limit, offset)
-            .into_iter()
-            .cloned()
-            .collect()
+        Some(identity.owner.as_str())
     };
+
+    let results: Vec<Node> = engine
+        .query(params.kind.as_deref(), params.owner.as_deref(), requester, limit, offset)
+        .into_iter()
+        .cloned()
+        .collect();
 
     (StatusCode::OK, Json(results)).into_response()
 }
@@ -399,13 +398,13 @@ async fn query_nodes_where(
     let engine = db.engine.read().expect("storage engine lock poisoned");
 
     // Admins bypass visibility the same way query_nodes/get_node do —
-    // query_where's can_read filter treats "" as "no requester", which
-    // for a Private node only matches its owner. Passing "" here mirrors
-    // the same bypass query_nodes already does for admins.
+    // `None` is query_where's superuser bypass (skip the per-node
+    // can_read filter entirely), so an admin lists Private nodes it does
+    // not own. Everyone else passes `Some(owner)` for the can_read view.
     let requester = if identity.is_admin() {
-        ""
+        None
     } else {
-        identity.owner.as_str()
+        Some(identity.owner.as_str())
     };
 
     let result = engine.query_where(
@@ -494,6 +493,24 @@ pub enum TxOpRequest {
     ClearKind {
         kind: String,
     },
+    /// Native predicated bulk delete — `clear_kind`'s superset. Removes
+    /// every node of `kind` the caller may write AND (when `where` is
+    /// present) whose `data` satisfies the predicate, as one
+    /// all-or-nothing step (WAL + tombstones per node, exactly like
+    /// `delete_node`). Wire tag is `delete_where` (snake_case of the
+    /// variant); the predicate field is JSON key `where` (`Expr`, the
+    /// same type `POST /nodes/query` takes) and is optional — omitting
+    /// it makes this behave exactly like `clear_kind`. Non-admin deletes
+    /// only its own nodes of that kind; admin deletes all matching —
+    /// authorization is resolved here and enforced in the engine, and
+    /// the predicate is evaluated by the same `predicate::eval` the
+    /// query path uses. An unpushable/erroring predicate aborts the
+    /// whole transaction (never a wrong or partial delete).
+    DeleteWhere {
+        kind: String,
+        #[serde(rename = "where")]
+        where_: Option<Expr>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -576,6 +593,40 @@ async fn execute_transaction(
                 }
                 ops.push(TxOperation::ClearKind {
                     kind,
+                    owner: identity.owner.clone(),
+                    is_admin,
+                });
+            }
+            TxOpRequest::DeleteWhere { kind, where_ } => {
+                // Predicated superset of clear_kind: same "remove what
+                // I'm allowed to remove" rule, additionally filtered by
+                // the same `where` predicate the /nodes/query path
+                // evaluates. Like a clear, a delete_where never rejects
+                // on authorization — non-writable nodes are simply not
+                // selected. Authorization (owner + admin) is resolved
+                // here, under the same write lock the engine uses, and
+                // enforced in the engine when it selects rows.
+                let is_admin = identity.is_admin();
+                // Record the exact addresses this delete_where will
+                // tombstone for the committed event, using the same
+                // selection (kind + auth + predicate) the engine
+                // applies. This reuses the engine's single
+                // `predicate::eval`-backed selector, so an
+                // unpushable/erroring predicate surfaces here exactly as
+                // the query path surfaces it — a BAD_REQUEST that aborts
+                // before anything is written.
+                match engine.delete_where_targets(
+                    &kind,
+                    where_.as_ref(),
+                    &identity.owner,
+                    is_admin,
+                ) {
+                    Ok(addresses) => touched_addresses.extend(addresses),
+                    Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+                }
+                ops.push(TxOperation::DeleteWhere {
+                    kind,
+                    where_,
                     owner: identity.owner.clone(),
                     is_admin,
                 });

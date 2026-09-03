@@ -9,6 +9,7 @@ mod importer;
 mod crypto;
 mod tls_server;
 mod facet;
+mod cli;
 
 use api::routes::create_router;
 use database::Database;
@@ -16,7 +17,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 /// FacetQL — a standalone, coordinate-native database server.
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "facetql", version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -28,7 +29,7 @@ struct Cli {
     data_dir: Option<PathBuf>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Create the data directory and exit.
     Init,
@@ -79,9 +80,31 @@ enum Command {
         #[command(subcommand)]
         source: ImportSource,
     },
+
+    /// Manage identities (admin only). Talks to a *running* server over
+    /// its API — start the server first.
+    User {
+        #[command(subcommand)]
+        action: cli::UserAction,
+    },
+
+    /// Fetch a single node by address.
+    Get(cli::GetArgs),
+
+    /// Write a node at a client-supplied address.
+    Put(cli::PutArgs),
+
+    /// Delete a node by address. Destructive — asks to confirm.
+    Delete(cli::DeleteArgs),
+
+    /// Query nodes of a kind (native predicate query — no SQL).
+    Query(cli::QueryArgs),
+
+    /// Show node counts per kind, for the supplied token's view.
+    Stats(cli::StatsArgs),
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum ImportSource {
     /// `facetql import postgres --pg-url postgres://... --table clients --kind Client --token <admin-or-user-token>`
     Postgres {
@@ -159,6 +182,45 @@ async fn main() {
 
         Some(Command::Import { source }) => {
             run_import(source).await
+        }
+
+        // Client commands: each maps onto an existing API route and, on
+        // error, prints a structured message and exits non-zero via
+        // `cli::report_error` — see src/cli/mod.rs.
+        Some(Command::User { action }) => {
+            if let Err(e) = cli::run_user(action).await {
+                cli::report_error(e);
+            }
+        }
+
+        Some(Command::Get(args)) => {
+            if let Err(e) = cli::run_get(args).await {
+                cli::report_error(e);
+            }
+        }
+
+        Some(Command::Put(args)) => {
+            if let Err(e) = cli::run_put(args).await {
+                cli::report_error(e);
+            }
+        }
+
+        Some(Command::Delete(args)) => {
+            if let Err(e) = cli::run_delete(args).await {
+                cli::report_error(e);
+            }
+        }
+
+        Some(Command::Query(args)) => {
+            if let Err(e) = cli::run_query(args).await {
+                cli::report_error(e);
+            }
+        }
+
+        Some(Command::Stats(args)) => {
+            if let Err(e) = cli::run_stats(args).await {
+                cli::report_error(e);
+            }
         }
     }
 }
@@ -435,5 +497,146 @@ async fn run_server(
                     )
                 });
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    //! Deterministic CLI tests: argument parsing, subcommand dispatch,
+    //! flag defaults, and clap's built-in `--help`/`--version` handling.
+    //! None of these require a running server — they only exercise the
+    //! parse tree and pure helpers.
+    use super::*;
+    use clap::error::ErrorKind;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("should parse")
+    }
+
+    #[test]
+    fn get_parses_address_and_token() {
+        let cli = parse(&["facetql", "get", "addr1", "--token", "T"]);
+        match cli.command {
+            Some(Command::Get(a)) => {
+                assert_eq!(a.address, "addr1");
+                assert_eq!(a.common.token.as_deref(), Some("T"));
+                // URL default applies when unset.
+                assert_eq!(a.common.url, "http://localhost:8080");
+                assert!(!a.common.json);
+            }
+            other => panic!("expected Get, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_flag_sets_output_mode() {
+        let cli = parse(&["facetql", "get", "addr1", "--json"]);
+        match cli.command {
+            Some(Command::Get(a)) => assert!(a.common.json),
+            other => panic!("expected Get, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_create_admin_flag() {
+        let cli = parse(&["facetql", "user", "create", "alice", "--admin", "--token", "T"]);
+        match cli.command {
+            Some(Command::User { action: cli::UserAction::Create { owner, admin, .. } }) => {
+                assert_eq!(owner, "alice");
+                assert!(admin);
+            }
+            other => panic!("expected user create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_create_defaults_to_non_admin() {
+        let cli = parse(&["facetql", "user", "create", "bob", "--token", "T"]);
+        match cli.command {
+            Some(Command::User { action: cli::UserAction::Create { admin, .. } }) => {
+                assert!(!admin);
+            }
+            other => panic!("expected user create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_delete_requires_yes_flag_to_be_explicit() {
+        let cli = parse(&["facetql", "user", "delete", "bob"]);
+        match cli.command {
+            Some(Command::User { action: cli::UserAction::Delete { owner, yes, .. } }) => {
+                assert_eq!(owner, "bob");
+                assert!(!yes, "yes must default false so deletes prompt");
+            }
+            other => panic!("expected user delete, got {other:?}"),
+        }
+        let cli = parse(&["facetql", "user", "delete", "bob", "--yes"]);
+        match cli.command {
+            Some(Command::User { action: cli::UserAction::Delete { yes, .. } }) => assert!(yes),
+            other => panic!("expected user delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_parses_kind_data_public() {
+        let cli = parse(&[
+            "facetql", "put", "n1", "--kind", "Client", "--data", "{\"a\":1}", "--public",
+            "--token", "T",
+        ]);
+        match cli.command {
+            Some(Command::Put(a)) => {
+                assert_eq!(a.address, "n1");
+                assert_eq!(a.kind, "Client");
+                assert_eq!(a.data, "{\"a\":1}");
+                assert!(a.public);
+            }
+            other => panic!("expected Put, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_defaults_to_prompting() {
+        let cli = parse(&["facetql", "delete", "n1"]);
+        match cli.command {
+            Some(Command::Delete(a)) => assert!(!a.yes),
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_parses_kind_limit_order_desc() {
+        let cli = parse(&[
+            "facetql", "query", "--kind", "Client", "--limit", "5", "--order", "score", "--desc",
+        ]);
+        match cli.command {
+            Some(Command::Query(a)) => {
+                assert_eq!(a.kind, "Client");
+                assert_eq!(a.limit, Some(5));
+                assert_eq!(a.order.as_deref(), Some("score"));
+                assert!(a.desc);
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_requires_kind() {
+        // --kind is mandatory; omitting it is a parse (usage) error.
+        let err = Cli::try_parse_from(["facetql", "query"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn version_and_help_are_handled_by_clap() {
+        let v = Cli::try_parse_from(["facetql", "--version"]).unwrap_err();
+        assert_eq!(v.kind(), ErrorKind::DisplayVersion);
+        let h = Cli::try_parse_from(["facetql", "--help"]).unwrap_err();
+        assert_eq!(h.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn no_subcommand_still_parses_for_server_start() {
+        let cli = parse(&["facetql"]);
+        assert!(cli.command.is_none());
     }
 }

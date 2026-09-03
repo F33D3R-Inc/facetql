@@ -16,6 +16,12 @@ use crate::storage::wal;
 
 static NEXT_WAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// Loop-variable name a `delete_where` predicate's field accesses are
+/// written against. The `delete_where` wire contract (§4b) carries no
+/// `item_var` — unlike `/nodes/query` — so it uses the same default the
+/// query path does (`default_item_var` in `api::routes`): `"item"`.
+const DELETE_WHERE_ITEM_VAR: &str = "item";
+
 fn next_wal_sequence() -> u64 {
     NEXT_WAL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
 }
@@ -507,6 +513,62 @@ impl StorageEngine {
             .collect()
     }
 
+    /// Live addresses a `DeleteWhere` would remove: `clear_targets`'
+    /// selection (every node whose `kind` matches and that the caller
+    /// may write) narrowed further by a `where_` predicate evaluated
+    /// against each candidate's decoded `data`.
+    ///
+    /// The predicate is run through the *same* `predicate::eval` the
+    /// `/nodes/query` path uses (see `query_where`), so a predicated
+    /// bulk delete selects byte-for-byte the rows the equivalent query
+    /// would — one evaluator, not two. `where_ == None` degenerates to
+    /// exactly `clear_targets` (all writable nodes of the kind).
+    ///
+    /// A predicate `eval` can't push down (or otherwise errors) is
+    /// surfaced as `Err`, mirroring how `query_where` surfaces it. The
+    /// transaction turns that `Err` into a whole-batch abort — never a
+    /// wrong or partial delete.
+    ///
+    /// Read-only, like `clear_targets`: it computes addresses without
+    /// touching WAL, disk, or memory, so it is safe to call during
+    /// transaction staging (and from the handler, to record the exact
+    /// addresses the delete will tombstone).
+    pub(crate) fn delete_where_targets(
+        &self,
+        kind: &str,
+        where_: Option<&Expr>,
+        owner: &str,
+        is_admin: bool,
+    ) -> Result<Vec<String>, String> {
+        let mut targets = Vec::new();
+
+        for node in self.nodes.values() {
+            if node.kind != kind {
+                continue;
+            }
+            if !(is_admin || node.can_write(owner)) {
+                continue;
+            }
+
+            if let Some(expr) = where_ {
+                let data: serde_json::Value =
+                    serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
+
+                let matched = predicate::eval(expr, DELETE_WHERE_ITEM_VAR, &data)
+                    .map(|v| matches!(v, serde_json::Value::Bool(true)))
+                    .map_err(|e| format!("predicate evaluation failed: {e}"))?;
+
+                if !matched {
+                    continue;
+                }
+            }
+
+            targets.push(node.address.clone());
+        }
+
+        Ok(targets)
+    }
+
     // ---------------------------------------------------------------------
     // Edges
     // ---------------------------------------------------------------------
@@ -609,11 +671,21 @@ impl StorageEngine {
     ///
     /// Current implementation is a linear scan. Secondary indexes and
     /// cursor pagination are later work in the query-engine epic.
+    ///
+    /// `requester` controls the per-node visibility filter, the same way a
+    /// real DBMS distinguishes a normal role from a superuser:
+    ///
+    /// * `Some(r)` — apply `n.can_read(r)`: the caller sees public nodes
+    ///   plus the private nodes it owns.
+    /// * `None` — admin/superuser bypass: skip the visibility filter
+    ///   entirely and return every node matching `kind`/`owner`. This is
+    ///   what lets an admin list Private nodes it does not own, mirroring
+    ///   `get_node`'s admin bypass. A normal role must never pass `None`.
     pub fn query(
         &self,
         kind: Option<&str>,
         owner: Option<&str>,
-        requester: &str,
+        requester: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Vec<&Node> {
@@ -625,7 +697,7 @@ impl StorageEngine {
             .filter(|n| {
                 owner.map_or(true, |o| n.owner == o)
             })
-            .filter(|n| n.can_read(requester))
+            .filter(|n| requester.map_or(true, |r| n.can_read(r)))
             .skip(offset)
             .take(limit)
             .collect()
@@ -668,11 +740,16 @@ impl StorageEngine {
     /// last page. `offset` is retained as a fallback and only applies
     /// when no `after` cursor is supplied; a `next` cursor is always
     /// produced so a caller can switch to keyset paging after page one.
+    ///
+    /// `requester` carries the same admin/superuser semantics as
+    /// [`query`]: `Some(r)` applies the `n.can_read(r)` visibility filter,
+    /// while `None` is the admin bypass that skips it entirely and lets an
+    /// admin page over Private nodes it does not own.
     pub fn query_where(
         &self,
         kind: Option<&str>,
         owner: Option<&str>,
-        requester: &str,
+        requester: Option<&str>,
         predicate: Option<&Expr>,
         item_var: &str,
         order: Option<&str>,
@@ -686,7 +763,7 @@ impl StorageEngine {
             .values()
             .filter(|n| kind.map_or(true, |k| n.kind == k))
             .filter(|n| owner.map_or(true, |o| n.owner == o))
-            .filter(|n| n.can_read(requester))
+            .filter(|n| requester.map_or(true, |r| n.can_read(r)))
             .collect();
 
         if let Some(expr) = predicate {
@@ -972,6 +1049,25 @@ impl StorageEngine {
                     }
                 }
 
+                TxOperation::DeleteWhere { kind, where_, owner, is_admin } => {
+                    // Same staging rationale as ClearKind — the view
+                    // must reflect every selected node gone so a later
+                    // InsertEdge can't validate against an endpoint this
+                    // delete removes. An unpushable/erroring predicate
+                    // surfaces here via `?`, aborting the batch before
+                    // pass 2/3 write anything — the query path's
+                    // error-not-wrong-answer contract, applied to a
+                    // bulk delete.
+                    for address in self.delete_where_targets(
+                        kind,
+                        where_.as_ref(),
+                        owner,
+                        *is_admin,
+                    )? {
+                        staged_existing.remove(address.as_str());
+                    }
+                }
+
                 TxOperation::InsertEdge(_) => {}
             }
         }
@@ -1027,6 +1123,15 @@ impl StorageEngine {
                     // missing target.
                 }
 
+                TxOperation::DeleteWhere { .. } => {
+                    // Nothing to validate here: the one way a
+                    // delete_where can abort — an unpushable/erroring
+                    // predicate — already surfaced in pass 1 (staging),
+                    // before any write. Matching zero writable nodes is
+                    // a valid no-op, so a delete_where never aborts the
+                    // batch on its own, same as ClearKind.
+                }
+
                 TxOperation::InsertEdge(edge) => {
                     if !staged_existing
                         .contains(edge.from.as_str())
@@ -1078,6 +1183,24 @@ impl StorageEngine {
                     for address in
                         self.clear_targets(&kind, &owner, is_admin)
                     {
+                        self.delete(&address)?;
+                    }
+                }
+
+                TxOperation::DeleteWhere { kind, where_, owner, is_admin } => {
+                    // One tombstone per selected node, through the exact
+                    // same WAL + tombstone path as a standalone
+                    // delete_node — so the whole predicated delete is
+                    // durable and survives recovery. Re-selecting here
+                    // (as ClearKind does) can't newly error: pass 1
+                    // already evaluated this same predicate and any
+                    // failure aborted the batch before reaching pass 3.
+                    for address in self.delete_where_targets(
+                        &kind,
+                        where_.as_ref(),
+                        &owner,
+                        is_admin,
+                    )? {
                         self.delete(&address)?;
                     }
                 }
@@ -1277,6 +1400,31 @@ pub enum TxOperation {
         owner: String,
         is_admin: bool,
     },
+
+    /// Predicated bulk delete — `ClearKind`'s superset. Removes every
+    /// live node of `kind` the caller may write AND, when `where_` is
+    /// `Some`, whose decoded `data` satisfies the predicate. Each
+    /// removal takes the same WAL + tombstone path as a single
+    /// `DeleteNode`, so a `DeleteWhere` is exactly "N deletes" that
+    /// commit or roll back together with the rest of the batch.
+    ///
+    /// The predicate is evaluated by the same `predicate::eval` the
+    /// `/nodes/query` path uses (via `delete_where_targets`), so a bulk
+    /// delete and a query select identically. An unpushable/erroring
+    /// predicate aborts the whole transaction before anything is written
+    /// — never a wrong or partial delete. `where_ == None` behaves
+    /// exactly like `ClearKind`.
+    ///
+    /// Authorization is carried on the op (resolved by the handler under
+    /// the write lock), identical to `ClearKind`: a non-admin deletes
+    /// only nodes it owns; an admin (`is_admin == true`) deletes every
+    /// matching node regardless of owner.
+    DeleteWhere {
+        kind: String,
+        where_: Option<Expr>,
+        owner: String,
+        is_admin: bool,
+    },
 }
 
 #[cfg(test)]
@@ -1312,7 +1460,7 @@ mod cursor_tests {
                 .query_where(
                     Some("thing"),
                     None,
-                    "",
+                    None,
                     None,
                     "item",
                     order,
@@ -1383,7 +1531,7 @@ mod cursor_tests {
         // First page ascending, limit 2 => a, b ; cursor sits at b(20).
         let (p1_addrs, p1_next) = {
             let page1 = e
-                .query_where(Some("thing"), None, "", None, "item", Some("score"), false, None, 2, 0)
+                .query_where(Some("thing"), None, None, None, "item", Some("score"), false, None, 2, 0)
                 .unwrap();
             (
                 page1.nodes.iter().map(|n| n.address.clone()).collect::<Vec<_>>(),
@@ -1398,7 +1546,7 @@ mod cursor_tests {
         e.nodes.remove("a");
         let page2 = e
             .query_where(
-                Some("thing"), None, "", None, "item", Some("score"), false,
+                Some("thing"), None, None, None, "item", Some("score"), false,
                 Some(&p1_next), 2, 0,
             )
             .unwrap();
@@ -1425,7 +1573,7 @@ mod cursor_tests {
         e.nodes.insert("a".to_string(), make_node("a", 1));
         let err = e
             .query_where(
-                Some("thing"), None, "", None, "item", Some("score"), false,
+                Some("thing"), None, None, None, "item", Some("score"), false,
                 Some("not-valid-base64!!"), 10, 0,
             )
             .unwrap_err();
@@ -1443,9 +1591,50 @@ mod cursor_tests {
         }))
         .unwrap();
         let res = e.query_where(
-            Some("thing"), None, "", Some(&expr), "item", None, false, None, 10, 0,
+            Some("thing"), None, None, Some(&expr), "item", None, false, None, 10, 0,
         );
         assert!(res.is_err(), "unpushable predicate must error");
+    }
+
+    /// Regression: an admin (`requester = None`) must list a Private node
+    /// it does not own, while a non-admin (`requester = Some("bob")`) must
+    /// not. This is the exact case that was broken: the route passed `""`
+    /// as a fake "see everything" requester, but `can_read("")` only
+    /// matches Public nodes or the owner `""`, so an admin listed nothing.
+    #[test]
+    fn admin_bypass_lists_private_nodes_others_cannot() {
+        let mut e = StorageEngine::new();
+
+        // A Private node owned by alice (Node::new defaults to Private).
+        let mut node = Node::new(
+            Coordinate::new(0, 0, 0, 0),
+            "priv:1".to_string(),
+            "secret".to_string(),
+            "alice".to_string(),
+        );
+        node.data = "{}".to_string();
+        assert_eq!(node.visibility, Visibility::Private, "precondition: private");
+        e.nodes.insert(node.address.clone(), node);
+
+        // query(): admin bypass (None) sees it; a non-owner does not.
+        let admin = e.query(Some("secret"), None, None, 50, 0);
+        assert_eq!(admin.len(), 1, "admin (None) must list the private node");
+        assert_eq!(admin[0].address, "priv:1");
+
+        let bob = e.query(Some("secret"), None, Some("bob"), 50, 0);
+        assert!(bob.is_empty(), "non-admin bob must not see alice's private node");
+
+        // query_where(): same bypass semantics.
+        let admin_page = e
+            .query_where(Some("secret"), None, None, None, "item", None, false, None, 50, 0)
+            .expect("query_where ok");
+        assert_eq!(admin_page.nodes.len(), 1, "admin (None) must list via query_where");
+        assert_eq!(admin_page.nodes[0].address, "priv:1");
+
+        let bob_page = e
+            .query_where(Some("secret"), None, Some("bob"), None, "item", None, false, None, 50, 0)
+            .expect("query_where ok");
+        assert!(bob_page.nodes.is_empty(), "non-admin bob must not see it via query_where");
     }
 }
 
@@ -1583,6 +1772,241 @@ mod clear_kind_tests {
         assert!(
             recovered.get("ck_rec:stay").is_some(),
             "non-cleared node recovered from durable storage"
+        );
+    }
+}
+
+#[cfg(test)]
+mod delete_where_tests {
+    use super::*;
+    use crate::core::coordinate::Coordinate;
+    use crate::core::node::Node;
+    use crate::core::predicate::Expr;
+    use std::sync::{Mutex, OnceLock};
+
+    // Same durable-path setup as clear_kind_tests: a process-wide temp
+    // data dir set once, and one lock serializing the tests that append
+    // to the shared WAL/binary/tombstone files. Every test uses unique
+    // addresses/kinds so the shared dir never crosses assertions.
+    fn disk_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("facetql-dwtest-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create temp data dir");
+            crate::config::set_data_dir(dir);
+        });
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn node_with(address: &str, kind: &str, owner: &str, data: &str) -> Node {
+        let mut n = Node::new(
+            Coordinate::new(0, 0, 0, 0),
+            address.to_string(),
+            kind.to_string(),
+            owner.to_string(),
+        );
+        n.data = data.to_string();
+        n
+    }
+
+    /// The predicate `item.status == status` — the same `Expr` shape a
+    /// FCT-compiled `/nodes/query` predicate arrives as, evaluated by the
+    /// same `predicate::eval`. Field access is written against the
+    /// default loop variable `"item"` (delete_where carries no item_var).
+    fn status_eq(status: &str) -> Expr {
+        serde_json::from_value(serde_json::json!({
+            "kind": "bin",
+            "op": "==",
+            "l": {
+                "kind": "get",
+                "field": "status",
+                "obj": { "kind": "ref", "name": "item" }
+            },
+            "r": { "kind": "lit", "val": status, "vtype": "string" }
+        }))
+        .expect("valid predicate")
+    }
+
+    /// The predicate filters the kind down to only the matching rows;
+    /// same-kind non-matching rows and other kinds are untouched.
+    #[test]
+    fn predicate_selects_only_matching_nodes() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dw_sel:a", "DwSelEntity", "alice", r#"{"status":"expired"}"#)).unwrap();
+        e.insert(node_with("dw_sel:b", "DwSelEntity", "alice", r#"{"status":"active"}"#)).unwrap();
+        e.insert(node_with("dw_sel:c", "DwSelEntity", "alice", r#"{"status":"expired"}"#)).unwrap();
+        e.insert(node_with("dw_sel:keep", "DwSelOther", "alice", r#"{"status":"expired"}"#)).unwrap();
+
+        e.execute_transaction(vec![TxOperation::DeleteWhere {
+            kind: "DwSelEntity".to_string(),
+            where_: Some(status_eq("expired")),
+            owner: "alice".to_string(),
+            is_admin: false,
+        }])
+        .expect("delete_where commits");
+
+        assert!(e.get("dw_sel:a").is_none(), "matching node deleted");
+        assert!(e.get("dw_sel:c").is_none(), "matching node deleted");
+        assert!(e.get("dw_sel:b").is_some(), "non-matching node of the kind survives");
+        assert!(e.get("dw_sel:keep").is_some(), "other kind untouched");
+    }
+
+    /// A non-admin deletes only its own matching nodes; another owner's
+    /// matching node of the same kind stays intact.
+    #[test]
+    fn non_admin_deletes_only_own_matching() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dw_own:mine", "DwOwnEntity", "alice", r#"{"status":"expired"}"#)).unwrap();
+        e.insert(node_with("dw_own:mine_ok", "DwOwnEntity", "alice", r#"{"status":"active"}"#)).unwrap();
+        e.insert(node_with("dw_own:theirs", "DwOwnEntity", "bob", r#"{"status":"expired"}"#)).unwrap();
+
+        e.execute_transaction(vec![TxOperation::DeleteWhere {
+            kind: "DwOwnEntity".to_string(),
+            where_: Some(status_eq("expired")),
+            owner: "alice".to_string(),
+            is_admin: false,
+        }])
+        .expect("non-admin delete_where commits");
+
+        assert!(e.get("dw_own:mine").is_none(), "own matching node deleted");
+        assert!(e.get("dw_own:mine_ok").is_some(), "own non-matching node survives");
+        assert!(
+            e.get("dw_own:theirs").is_some(),
+            "another owner's matching node is left intact for a non-admin"
+        );
+    }
+
+    /// An admin deletes every matching node of the kind regardless of
+    /// owner (same admin bypass as clear_kind / the delete route).
+    #[test]
+    fn admin_deletes_all_matching() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dw_adm:a", "DwAdmEntity", "alice", r#"{"status":"expired"}"#)).unwrap();
+        e.insert(node_with("dw_adm:b", "DwAdmEntity", "bob", r#"{"status":"expired"}"#)).unwrap();
+        e.insert(node_with("dw_adm:c", "DwAdmEntity", "carol", r#"{"status":"active"}"#)).unwrap();
+
+        e.execute_transaction(vec![TxOperation::DeleteWhere {
+            kind: "DwAdmEntity".to_string(),
+            where_: Some(status_eq("expired")),
+            owner: "root".to_string(),
+            is_admin: true,
+        }])
+        .expect("admin delete_where commits");
+
+        assert!(e.get("dw_adm:a").is_none(), "admin deleted alice's matching node");
+        assert!(e.get("dw_adm:b").is_none(), "admin deleted bob's matching node");
+        assert!(e.get("dw_adm:c").is_some(), "non-matching node survives even for admin");
+    }
+
+    /// Omitted `where` (`None`) degenerates to clear_kind: every
+    /// writable node of the kind is deleted regardless of `data`.
+    #[test]
+    fn omitted_where_behaves_like_clear_kind() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dw_all:a", "DwAllEntity", "alice", r#"{"status":"active"}"#)).unwrap();
+        e.insert(node_with("dw_all:b", "DwAllEntity", "alice", r#"{"status":"expired"}"#)).unwrap();
+
+        e.execute_transaction(vec![TxOperation::DeleteWhere {
+            kind: "DwAllEntity".to_string(),
+            where_: None,
+            owner: "alice".to_string(),
+            is_admin: false,
+        }])
+        .expect("omitted-where delete_where commits");
+
+        assert!(e.get("dw_all:a").is_none(), "omitted where deletes all writable of the kind");
+        assert!(e.get("dw_all:b").is_none(), "omitted where deletes all writable of the kind");
+    }
+
+    /// An unpushable predicate aborts the whole transaction and nothing
+    /// is deleted — the query path's error-not-wrong-answer contract.
+    #[test]
+    fn unpushable_predicate_aborts_nothing_deleted() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dw_bad:a", "DwBadEntity", "alice", r#"{"status":"expired"}"#)).unwrap();
+        e.insert(node_with("dw_bad:b", "DwBadEntity", "alice", r#"{"status":"expired"}"#)).unwrap();
+
+        // A bare `ref` node is not something `predicate::eval` can push
+        // down — the exact shape query_where rejects.
+        let expr: Expr = serde_json::from_value(serde_json::json!({
+            "kind": "ref", "name": "somethingElse"
+        }))
+        .unwrap();
+
+        let result = e.execute_transaction(vec![TxOperation::DeleteWhere {
+            kind: "DwBadEntity".to_string(),
+            where_: Some(expr),
+            owner: "alice".to_string(),
+            is_admin: false,
+        }]);
+
+        assert!(result.is_err(), "unpushable predicate must abort the transaction");
+        assert!(e.get("dw_bad:a").is_some(), "nothing deleted on predicate error");
+        assert!(e.get("dw_bad:b").is_some(), "nothing deleted on predicate error");
+    }
+
+    /// A delete_where is atomic with the rest of the batch: a later op
+    /// that fails validation rolls the whole transaction back, including
+    /// the delete_where — nothing is applied.
+    #[test]
+    fn rolls_back_when_a_sibling_op_fails() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dw_atom:1", "DwAtomEntity", "alice", r#"{"status":"expired"}"#)).unwrap();
+        e.insert(node_with("dw_atom:2", "DwAtomEntity", "alice", r#"{"status":"expired"}"#)).unwrap();
+
+        // delete_where, then delete a node that doesn't exist. The
+        // missing delete fails validation (pass 2), so pass 3 never runs
+        // and the delete_where is never applied.
+        let result = e.execute_transaction(vec![
+            TxOperation::DeleteWhere {
+                kind: "DwAtomEntity".to_string(),
+                where_: Some(status_eq("expired")),
+                owner: "alice".to_string(),
+                is_admin: false,
+            },
+            TxOperation::DeleteNode("dw_atom:missing".to_string()),
+        ]);
+
+        assert!(result.is_err(), "batch must fail on the missing delete target");
+        assert!(e.get("dw_atom:1").is_some(), "delete_where rolled back with the batch");
+        assert!(e.get("dw_atom:2").is_some(), "delete_where rolled back with the batch");
+    }
+
+    /// Each deleted node is tombstoned + WAL-logged like a standalone
+    /// delete, so a fresh recovery from durable storage no longer sees
+    /// it — while a non-matching node of the kind recovers normally.
+    #[test]
+    fn deleted_nodes_do_not_survive_recovery() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::new();
+        e.insert(node_with("dw_rec:gone", "DwRecEntity", "alice", r#"{"status":"expired"}"#)).unwrap();
+        e.insert(node_with("dw_rec:stay", "DwRecEntity", "alice", r#"{"status":"active"}"#)).unwrap();
+
+        e.execute_transaction(vec![TxOperation::DeleteWhere {
+            kind: "DwRecEntity".to_string(),
+            where_: Some(status_eq("expired")),
+            owner: "alice".to_string(),
+            is_admin: false,
+        }])
+        .expect("delete_where commits");
+
+        // Rebuild purely from durable storage (data files + tombstones).
+        let recovered = StorageEngine::load().expect("recovery load");
+        assert!(
+            recovered.get("dw_rec:gone").is_none(),
+            "delete_where's tombstone survived recovery"
+        );
+        assert!(
+            recovered.get("dw_rec:stay").is_some(),
+            "non-matching node recovered from durable storage"
         );
     }
 }
