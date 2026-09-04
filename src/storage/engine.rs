@@ -48,6 +48,161 @@ const COMPACTION_RATIO: f64 = 0.5;
 /// checkpoint keeps a large reclaim from becoming a long stall.
 const SEGMENTS_PER_COMPACTION: usize = 1;
 
+/// Rows one request may accumulate in memory before the engine refuses
+/// to continue.
+///
+/// # Which reads this exists for
+///
+/// Most access paths here are already bounded by the caller's `limit`:
+/// an index range scan stops as soon as the page is full, so the work
+/// and the memory are proportional to the answer. A handful are not,
+/// and they are not for a structural reason rather than an oversight —
+/// they have to hold the whole result before they can produce any of
+/// it:
+///
+/// ```text
+///   order by a `data` field   no index on `data`, so every candidate
+///                             is materialized and then sorted
+///   a node's history          the full version list
+///   a node's edges            the full adjacency list
+///   an owner's nodes          every node that owner holds
+///   delete_where targets      every address the batch will remove
+/// ```
+///
+/// For those, the size of the answer is chosen by the *data*, not by the
+/// request, so one ordinary-looking query over a large kind is a
+/// heap allocation the size of that kind. That is the difference between
+/// slow and fatal, and it is reachable without any hostile intent at all.
+///
+/// # Why it errors rather than truncating
+///
+/// Silently returning the first N rows would make a query answer a
+/// question nobody asked, and — for `delete_where` — would delete a
+/// subset of what the caller named. A refusal is recoverable: the
+/// caller narrows the query, or an operator raises the bound. A wrong
+/// answer is not.
+///
+/// 100_000 nodes is far past any interactive page and still a bounded,
+/// modest allocation.
+const DEFAULT_MAX_SCAN_ROWS: usize = 100_000;
+
+const MAX_SCAN_ROWS_ENV: &str = "FACETQL_MAX_SCAN_ROWS";
+
+/// Resolved mutations one transaction may carry.
+///
+/// A batch is staged into a single `BEGIN … COMMIT` frame, which means
+/// every one of its records is fsync'd to the WAL before any of them is
+/// applied and none of them may be checkpointed away until the frame
+/// settles. So a batch is not merely a lot of work — it is work that
+/// pins the checkpoint boundary and holds its whole resolved form in
+/// memory while it runs.
+///
+/// The wire limit is not the same number, and cannot be: one wire
+/// operation can lower into many. `clear_kind` and `delete_where` expand
+/// to one `Delete` per matching node (each with an `Archive` in front of
+/// it), so a three-operation request can resolve into a batch bounded
+/// only by the size of a kind. That is why the bound is checked here, on
+/// the *lowered* list, rather than on the request: this is the only
+/// place that knows how large the batch actually became.
+///
+/// 50_000 mutations is far past any application batch and still a frame
+/// that stages and applies in bounded time.
+const DEFAULT_MAX_TRANSACTION_OPS: usize = 50_000;
+
+const MAX_TRANSACTION_OPS_ENV: &str = "FACETQL_MAX_TRANSACTION_OPS";
+
+/// Rows a query may skip before its first result.
+///
+/// Offset paging is the one query parameter whose cost is set by a
+/// number the caller picks with no relation to the answer it wants.
+/// Reaching row `offset` means walking the access path and *discarding*
+/// every row before it — and a row here is not cheap: this tree has no
+/// leaf links, so each step is a fresh root-to-leaf descent, and each
+/// candidate is a heap read and a record decode before the filter can
+/// reject it. Page 200_000 therefore costs ten million reads to return
+/// fifty rows, from a request that is forty bytes long.
+///
+/// The keyset cursor (`after`) exists precisely because of that: it
+/// resumes at the row itself, so page 200_000 costs what page 1 costs.
+/// It is already the wire contract for `POST /nodes/query`. Bounding
+/// offset is what makes the cheap path the one that scales, rather than
+/// leaving a trap that only shows up under a client that pages deeply.
+///
+/// 10_000 is past any offset a UI produces and cheap to serve.
+const DEFAULT_MAX_QUERY_OFFSET: usize = 10_000;
+
+const MAX_QUERY_OFFSET_ENV: &str = "FACETQL_MAX_QUERY_OFFSET";
+
+fn max_query_offset() -> usize {
+    static OFFSET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    *OFFSET.get_or_init(|| {
+        std::env::var(MAX_QUERY_OFFSET_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_QUERY_OFFSET)
+    })
+}
+
+fn offset_too_large(offset: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "offset {offset} is above the maximum of {}. Deep offset \
+             paging re-reads and discards every row before the page, so \
+             its cost grows with the page number; use the keyset cursor \
+             (`after`, from a previous page's `next`) on POST /nodes/query, \
+             which costs the same at any depth. Raise \
+             {MAX_QUERY_OFFSET_ENV} to override.",
+            max_query_offset()
+        ),
+    )
+}
+
+fn max_transaction_ops() -> usize {
+    static OPS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    *OPS.get_or_init(|| {
+        std::env::var(MAX_TRANSACTION_OPS_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|ops| *ops > 0)
+            .unwrap_or(DEFAULT_MAX_TRANSACTION_OPS)
+    })
+}
+
+fn max_scan_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    *ROWS.get_or_init(|| {
+        std::env::var(MAX_SCAN_ROWS_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|rows| *rows > 0)
+            .unwrap_or(DEFAULT_MAX_SCAN_ROWS)
+    })
+}
+
+/// The refusal a scan raises when it would have to hold more than
+/// [`max_scan_rows`] rows.
+///
+/// `InvalidInput` rather than a generic failure: nothing is broken, the
+/// request asked for more than this engine will materialize, and the
+/// API layer turns that into a 4xx so a caller can tell "narrow your
+/// query" from "the database is unwell".
+fn scan_limit_exceeded(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{what} would materialize more than {} rows, the maximum one \
+             request may hold in memory. Narrow the query (a smaller \
+             `kind`/`owner` range, or a predicate), page through it, or \
+             raise {MAX_SCAN_ROWS_ENV}.",
+            max_scan_rows()
+        ),
+    )
+}
+
 #[derive(Debug)]
 pub enum ClaimError {
     NotFound,
@@ -267,6 +422,13 @@ impl StorageEngine {
             1 => {
                 let operation = &operations[0];
 
+                // Before the WAL, never after it. An operation whose
+                // keys the indexes would refuse cannot be allowed to
+                // become durable: recovery would replay it into the
+                // same refusal on every subsequent start. See
+                // `Operation::validate`.
+                operation.validate()?;
+
                 let sequence = self.append_wal(0, operation.to_wal())?;
 
                 self.apply_committed(operation)?;
@@ -352,6 +514,8 @@ impl StorageEngine {
 
         self.pending_mutations = 0;
 
+        self.rotate_wal()?;
+
         // Only now: the index entries that used to point into these
         // segments are committed elsewhere, so the bytes are genuinely
         // unreferenced. A crash before this leaves a segment full of
@@ -359,6 +523,43 @@ impl StorageEngine {
         for segment in drained {
             self.store.drop_segment(segment)?;
         }
+
+        Ok(())
+    }
+
+    /// Reclaim the part of the WAL a future recovery would skip, once
+    /// the log has grown past the rotation threshold.
+    ///
+    /// Called from [`Self::checkpoint`], immediately after the
+    /// checkpoint boundary has moved and never before it: the records
+    /// this drops are exactly the ones at or below the boundary, so
+    /// dropping them before the boundary was durable would discard
+    /// operations recovery still needs.
+    ///
+    /// Rotation is the counterpart of compaction. Compaction bounds the
+    /// heap against a workload that rewrites the same rows forever;
+    /// this bounds the WAL against a workload that simply keeps running.
+    /// Without it the log is the one structure whose size tracks the
+    /// database's *lifetime* rather than its contents, and since startup
+    /// reads the whole log, an old database eventually cannot be opened
+    /// at all.
+    ///
+    /// Safe to run here and only here: every mutation path holds `&mut
+    /// self`, so no append can be in flight, and no transaction frame
+    /// can be open — the staged-commit driver holds the same exclusive
+    /// borrow for the whole of its frame.
+    fn rotate_wal(&mut self) -> io::Result<()> {
+        if wal::size()? < wal::rotate_threshold() {
+            return Ok(());
+        }
+
+        // Re-read rather than reuse `applied_sequence`: `advance` clamps
+        // to the lowest open transaction fence, so the value that
+        // actually reached disk may be lower than the one requested, and
+        // it is the durable value that defines what recovery will skip.
+        let durable = crate::storage::checkpoint::read()?;
+
+        wal::rotate(durable)?;
 
         Ok(())
     }
@@ -508,6 +709,13 @@ impl StorageEngine {
     /// is the property this whole layer exists for: a database with a
     /// billion nodes opens as fast as one with ten.
     pub fn open() -> io::Result<Self> {
+        // Before a single file is touched. Everything below this line —
+        // the page allocator, the index meta slots, the WAL counters —
+        // is process-local state describing shared files, so a second
+        // process opening the same directory does not race, it corrupts.
+        // See `storage::lock`.
+        crate::storage::lock::acquire()?;
+
         let catalog = Arc::new(Catalog::open()?);
         let store = RecordStore::open(Arc::clone(&catalog));
         let indexes = Indexes::open()?;
@@ -686,11 +894,17 @@ impl StorageEngine {
     pub fn history_for(&self, address: &str) -> io::Result<Vec<HistoryEntry>> {
         let mut entries = Vec::new();
 
+        let cap = max_scan_rows();
+
         self.indexes.history.for_each_range(
             &keys::history_prefix(address),
             None,
             false,
             |_key, value| {
+                if entries.len() >= cap {
+                    return Err(scan_limit_exceeded("this node's history"));
+                }
+
                 entries.push(self.history_at(RecordLocation::decode(value)?)?);
                 Ok(true)
             },
@@ -923,6 +1137,7 @@ impl StorageEngine {
     ) -> Result<Vec<String>, String> {
         let mut targets = Vec::new();
         let mut failure: Option<String> = None;
+        let cap = max_scan_rows();
 
         let prefix = keys::kind_prefix(kind);
 
@@ -941,7 +1156,18 @@ impl StorageEngine {
                 };
 
                 match Self::selection_matches(&node, kind, where_, owner, is_admin) {
-                    Ok(true) => targets.push(address),
+                    Ok(true) => {
+                        // A bulk delete resolves to a concrete address
+                        // list before anything is logged, so the list is
+                        // held whole. Refusing is the only safe answer:
+                        // truncating it would delete a subset of what the
+                        // caller named.
+                        if targets.len() >= cap {
+                            return Err(scan_limit_exceeded("this bulk delete"));
+                        }
+
+                        targets.push(address)
+                    }
                     Ok(false) => {}
                     Err(e) => {
                         failure = Some(e);
@@ -1057,8 +1283,13 @@ impl StorageEngine {
         prefix: &[u8],
     ) -> io::Result<Vec<Edge>> {
         let mut edges = Vec::new();
+        let cap = max_scan_rows();
 
         index.for_each_range(prefix, None, false, |_key, value| {
+            if edges.len() >= cap {
+                return Err(scan_limit_exceeded("this node's edge list"));
+            }
+
             edges.push(self.edge_at(RecordLocation::decode(value)?)?);
             Ok(true)
         })?;
@@ -1074,10 +1305,15 @@ impl StorageEngine {
     pub fn nodes_by_owner(&self, owner: &str) -> io::Result<Vec<Node>> {
         let mut nodes = Vec::new();
         let prefix = keys::owner_prefix(owner);
+        let cap = max_scan_rows();
 
         self.indexes
             .owner
             .for_each_range(&prefix, None, false, |key, _value| {
+                if nodes.len() >= cap {
+                    return Err(scan_limit_exceeded("this owner's node list"));
+                }
+
                 let address = address_from_key(key, &prefix);
 
                 if let Some(node) = self.read_node(&address)? {
@@ -1125,6 +1361,10 @@ impl StorageEngine {
         // would be pushed before the condition could be tested.
         if limit == 0 {
             return Ok(Vec::new());
+        }
+
+        if offset > max_query_offset() {
+            return Err(offset_too_large(offset));
         }
 
         let mut nodes = Vec::new();
@@ -1270,6 +1510,13 @@ impl StorageEngine {
         offset: usize,
     ) -> Result<QueryPage, String> {
         self.reads_total.fetch_add(1, Ordering::Relaxed);
+
+        // The cursor supersedes offset, so only an offset that will
+        // actually be walked has to be bounded.
+        if after.filter(|c| !c.is_empty()).is_none() && offset > max_query_offset()
+        {
+            return Err(offset_too_large(offset).to_string());
+        }
 
         // Normalize the order field: `None` or `"id"` both mean "order
         // by address alone" (the tiebreak becomes the whole key).
@@ -1421,10 +1668,22 @@ impl StorageEngine {
     {
         let mut candidates: Vec<Node> = Vec::new();
         let mut failure: Option<String> = None;
+        let cap = max_scan_rows();
 
         self.scan_candidates(kind, owner, None, false, |node| {
             match matches(&node) {
-                Ok(true) => candidates.push(node),
+                Ok(true) => {
+                    // Ordering by an unindexed `data` field is the one
+                    // query shape whose working set is the whole result
+                    // rather than the page — see `max_scan_rows`.
+                    if candidates.len() >= cap {
+                        return Err(scan_limit_exceeded(
+                            "ordering by an unindexed field",
+                        ));
+                    }
+
+                    candidates.push(node);
+                }
                 Ok(false) => {}
                 Err(e) => {
                     failure = Some(e);
@@ -1693,7 +1952,21 @@ impl StorageEngine {
         &mut self,
         ops: Vec<TxOperation>,
     ) -> Result<(), TransactionError> {
-        let transaction = Transaction::from_operations(self.lower_transaction(ops)?);
+        let lowered = self.lower_transaction(ops)?;
+
+        // Checked after lowering, because lowering is where a batch's
+        // real size becomes known — see `max_transaction_ops`. Checked
+        // before `commit`, because past that point the first record is
+        // durable and the batch can no longer be refused.
+        if lowered.len() > max_transaction_ops() {
+            return Err(TransactionError::Invalid(format!(
+                "transaction failed, nothing applied: it resolves to {}                  mutations, over the {} this engine will stage in one                  frame. Split the batch, or raise {MAX_TRANSACTION_OPS_ENV}.",
+                lowered.len(),
+                max_transaction_ops()
+            )));
+        }
+
+        let transaction = Transaction::from_operations(lowered);
 
         let sequence = transaction
             .commit(|operation| self.apply_committed(operation))
@@ -2441,6 +2714,14 @@ pub struct EngineStats {
     pub storage: StorageStats,
 }
 
+/// Longest `after` cursor this server will look at.
+///
+/// A cursor holds an address (bounded by the index key limit) and one
+/// JSON order value, base64url'd — comfortably under a kilobyte in
+/// practice. Four is generous headroom for a large order value and still
+/// rejects a hostile cursor before anything is allocated from it.
+const MAX_CURSOR_LEN: usize = 4 * 1024;
+
 /// The decoded contents of an opaque keyset cursor: the last returned
 /// row's order value (absent when ordering by `address` alone) and its
 /// `address` tiebreak. Serialized to compact JSON and base64url-encoded
@@ -2468,6 +2749,19 @@ impl Cursor {
     }
 
     fn decode(s: &str) -> Result<Cursor, String> {
+        // A cursor this engine issued is a base64url'd `{o, a}` pair, so
+        // it is bounded by the address plus one order value. Checking the
+        // length before decoding keeps a caller from handing back a
+        // megabyte of base64 — which the body limit permits — and making
+        // the server decode and JSON-parse it just to reject it.
+        if s.len() > MAX_CURSOR_LEN {
+            return Err(format!(
+                "invalid cursor: {} bytes, over the {MAX_CURSOR_LEN}-byte \
+                 maximum — this is not a cursor this server issued",
+                s.len()
+            ));
+        }
+
         let bytes = base64url_decode(s).map_err(|_| "invalid cursor: not valid base64url".to_string())?;
         serde_json::from_slice(&bytes).map_err(|_| "invalid cursor: malformed payload".to_string())
     }

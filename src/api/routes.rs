@@ -32,6 +32,16 @@ use crate::storage::engine::{ClaimError, Expectation, TransactionError, TxOperat
 /// difference between "delete your local copy" and "retry, and page
 /// somebody".
 fn storage_failure(error: std::io::Error) -> Response {
+    // `InvalidInput` from the storage layer means the request asked for
+    // something this engine will not do — today, a read whose result set
+    // exceeds the per-request row bound (see `max_scan_rows`). That is
+    // the caller's to fix by narrowing or paging, so it must not be
+    // reported as a server fault: a 500 tells an operator to go looking
+    // for a broken database that is working exactly as designed.
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        return (StatusCode::BAD_REQUEST, format!("{error}")).into_response();
+    }
+
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         format!("storage error: {error}"),
@@ -195,6 +205,34 @@ struct CreateNodeError {
 
 use tower_http::cors::CorsLayer;
 
+/// Largest request body any endpoint will buffer, in bytes.
+///
+/// Axum applies a 2 MiB default of its own, which is a fine number and a
+/// bad place to leave it: it is invisible at the call site, it is not
+/// something an operator can raise for a legitimately large batch, and a
+/// future extractor added without `DefaultBodyLimit` in mind would
+/// silently inherit whatever the framework's default happens to be that
+/// version. Stating it here makes the bound part of this router's
+/// contract rather than a property of a dependency.
+///
+/// It is the first bound a request meets, and it is the cheapest: it
+/// rejects on the length header or as the body streams, before any
+/// deserialization, so an oversized `POST /transaction` never becomes
+/// allocated JSON. The bounds behind it — transaction size, scan rows,
+/// record and key limits — are the ones that matter for what a
+/// well-formed request can *ask for*; this one only stops the bytes.
+const DEFAULT_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+const MAX_BODY_BYTES_ENV: &str = "FACETQL_MAX_BODY_BYTES";
+
+fn max_body_bytes() -> usize {
+    std::env::var(MAX_BODY_BYTES_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_MAX_BODY_BYTES)
+}
+
 /// Permissive by design for this checkpoint: any origin, any header,
 /// any of the methods this API actually uses. That's fine for local
 /// development against a browser page on a different origin/port — it
@@ -274,7 +312,11 @@ pub fn create_router(db: Arc<Database>) -> Router {
         .route_layer(middleware::from_fn_with_state(db.clone(), auth_middleware))
         .with_state(db);
 
-    Router::new().route("/", get(home)).merge(protected).layer(cors_layer())
+    Router::new()
+        .route("/", get(home))
+        .merge(protected)
+        .layer(cors_layer())
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes()))
 }
 
 async fn home() -> String {
@@ -301,7 +343,7 @@ async fn create_node(
     let edge_targets: Vec<(String, String)> =
         payload.edges.into_iter().map(|e| (e.to, e.kind)).collect();
 
-    let mut engine = db.engine.write().expect("storage engine lock poisoned");
+    let mut engine = db.engine_mut();
 
     let existing = match engine.get(&address) {
         Ok(existing) => existing,
@@ -342,7 +384,7 @@ async fn get_node(
     Path(address): Path<String>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> impl IntoResponse {
-    let engine = db.engine.read().expect("storage engine lock poisoned");
+    let engine = db.engine();
     match engine.get(&address) {
         // Admin bypasses can_read the same way a Postgres superuser
         // bypasses row-level security — deliberate, not a bug.
@@ -368,7 +410,7 @@ async fn get_node_history(
     Path(address): Path<String>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> impl IntoResponse {
-    let engine = db.engine.read().expect("storage engine lock poisoned");
+    let engine = db.engine();
     match engine.get(&address) {
         Ok(Some(node)) if identity.is_admin() || node.can_read(&identity.owner) => {
             match engine.history_for(&address) {
@@ -391,7 +433,7 @@ async fn update_node(
     Extension(identity): Extension<AuthIdentity>,
     Json(payload): Json<UpdateNodeRequest>,
 ) -> impl IntoResponse {
-    let mut engine = db.engine.write().expect("storage engine lock poisoned");
+    let mut engine = db.engine_mut();
 
     let existing = match engine.get(&address) {
         Ok(Some(n)) => n,
@@ -429,7 +471,7 @@ async fn delete_node(
     Path(address): Path<String>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> impl IntoResponse {
-    let mut engine = db.engine.write().expect("storage engine lock poisoned");
+    let mut engine = db.engine_mut();
 
     let existing = match engine.get(&address) {
         Ok(Some(n)) => n,
@@ -461,7 +503,7 @@ async fn claim_node(
     Path(address): Path<String>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> impl IntoResponse {
-    let mut engine = db.engine.write().expect("storage engine lock poisoned");
+    let mut engine = db.engine_mut();
 
     // Resolved under the same lock as the claim itself, so the audience
     // matches the node the claim actually applied to.
@@ -492,7 +534,7 @@ async fn list_owned(
     State(db): State<Arc<Database>>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> impl IntoResponse {
-    let engine = db.engine.read().expect("storage engine lock poisoned");
+    let engine = db.engine();
     match engine.nodes_by_owner(&identity.owner) {
         Ok(owned) => {
             let owned: Vec<Node> = owned;
@@ -510,7 +552,7 @@ async fn query_nodes(
     let limit = params.limit.unwrap_or(50).min(500);
     let offset = params.offset.unwrap_or(0);
 
-    let engine = db.engine.read().expect("storage engine lock poisoned");
+    let engine = db.engine();
     // Admins see everything matching the filter, ignoring visibility —
     // same bypass rationale as get_node. `None` is the engine's
     // superuser bypass (skip the per-node can_read filter entirely).
@@ -553,7 +595,7 @@ async fn query_nodes_where(
     let limit = payload.limit.unwrap_or(50).min(500);
     let offset = payload.offset.unwrap_or(0);
 
-    let engine = db.engine.read().expect("storage engine lock poisoned");
+    let engine = db.engine();
 
     // Admins bypass visibility the same way query_nodes/get_node do —
     // `None` is query_where's superuser bypass (skip the per-node
@@ -592,7 +634,7 @@ async fn create_edge(
     let owner = identity.owner.clone();
     let edge = Edge::new(payload.from.clone(), payload.to.clone(), payload.kind.clone(), identity.owner);
 
-    let mut engine = db.engine.write().expect("storage engine lock poisoned");
+    let mut engine = db.engine_mut();
 
     // An edge is only as public as the pair it connects: announcing
     // "a → b" to everyone reveals that both nodes exist and are related,
@@ -658,7 +700,7 @@ async fn delete_edge(
 ) -> impl IntoResponse {
     let id = EdgeId::new(payload.from.clone(), payload.to.clone(), payload.kind.clone());
 
-    let mut engine = db.engine.write().expect("storage engine lock poisoned");
+    let mut engine = db.engine_mut();
 
     let existing = match engine.find_edge(&id) {
         Ok(Some(edge)) => edge,
@@ -713,7 +755,7 @@ async fn get_edges_out(
     Path(address): Path<String>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> impl IntoResponse {
-    let engine = db.engine.read().expect("storage engine lock poisoned");
+    let engine = db.engine();
     match engine.get(&address) {
         Ok(Some(node)) if identity.is_admin() || node.can_read(&identity.owner) => {
             match engine.edges_from(&address) {
@@ -854,7 +896,7 @@ async fn execute_transaction(
     Extension(identity): Extension<AuthIdentity>,
     Json(payload): Json<TransactionRequest>,
 ) -> impl IntoResponse {
-    let mut engine = db.engine.write().expect("storage engine lock poisoned");
+    let mut engine = db.engine_mut();
 
     let mut ops = Vec::with_capacity(payload.operations.len());
     let mut touched_addresses = Vec::new();
@@ -1090,7 +1132,7 @@ async fn get_edges_in(
     Path(address): Path<String>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> impl IntoResponse {
-    let engine = db.engine.read().expect("storage engine lock poisoned");
+    let engine = db.engine();
     match engine.get(&address) {
         Ok(Some(node)) if identity.is_admin() || node.can_read(&identity.owner) => {
             match engine.edges_to(&address) {
@@ -1211,7 +1253,7 @@ async fn stats(
     if !identity.is_admin() {
         return (StatusCode::FORBIDDEN, "admin only").into_response();
     }
-    let engine = db.engine.read().expect("storage engine lock poisoned");
+    let engine = db.engine();
     match engine.stats() {
         Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
         Err(e) => storage_failure(e),
@@ -1272,7 +1314,7 @@ async fn create_user(
     let token = generate_token();
     let record = UserRecord { token_hash: hash_token(&token), owner: payload.owner.clone(), role };
 
-    let mut engine = db.engine.write().expect("storage engine lock poisoned");
+    let mut engine = db.engine_mut();
     match engine.insert_user(record) {
         Ok(()) => {
             drop(engine);
@@ -1296,7 +1338,7 @@ async fn list_users(
     if !identity.is_admin() {
         return (StatusCode::FORBIDDEN, "admin only").into_response();
     }
-    let engine = db.engine.read().expect("storage engine lock poisoned");
+    let engine = db.engine();
     let users: Vec<UserSummary> = engine
         .list_users()
         .into_iter()
@@ -1319,7 +1361,7 @@ async fn revoke_user(
         return (StatusCode::FORBIDDEN, "admin only").into_response();
     }
 
-    let mut engine = db.engine.write().expect("storage engine lock poisoned");
+    let mut engine = db.engine_mut();
     let hashes: Vec<String> = engine
         .list_users()
         .into_iter()

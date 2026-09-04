@@ -86,18 +86,165 @@ pub enum HeapRecord {
     History(HistoryEntry),
 }
 
+/// Segment files this store keeps open at once.
+///
+/// # Why there has to be a limit
+///
+/// A segment caps at 64 MiB, so segment count grows without bound as the
+/// database does: a terabyte of records is roughly sixteen thousand of
+/// them. Every segment reached by a point read used to be opened and
+/// then kept open forever — nothing but `drop_segment` ever removed one
+/// — so two resources scaled with the number of segments a workload
+/// *touches* rather than with anything the operator chose:
+///
+/// ```text
+///   open file descriptors   one per segment, against the process rlimit
+///   buffer pool             Pager::capacity pages per open segment
+/// ```
+///
+/// At the pager's default of 256 pages that is 4 MiB per segment, so a
+/// scan across ten thousand segments asks for ten thousand descriptors
+/// and forty gigabytes of cache. Both fail, and the descriptor one fails
+/// as `EMFILE` on some unrelated later open — a failure that names
+/// nothing about its cause.
+///
+/// 64 open segments is far more than a point-read workload needs (reads
+/// concentrate in recent segments) and bounds the pool at a predictable
+/// 256 MiB worst case.
+const DEFAULT_OPEN_SEGMENTS: usize = 64;
+
+const OPEN_SEGMENTS_ENV: &str = "FACETQL_OPEN_SEGMENTS";
+
+fn open_segment_capacity() -> usize {
+    static CAPACITY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    *CAPACITY.get_or_init(|| {
+        std::env::var(OPEN_SEGMENTS_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|segments| *segments > 0)
+            .unwrap_or(DEFAULT_OPEN_SEGMENTS)
+    })
+}
+
+/// The open-segment table: the pagers, plus the use order that decides
+/// which one closes when the table is full.
+struct OpenSegments {
+    pagers: BTreeMap<u32, (Arc<Pager>, u64)>,
+    /// Use order, oldest first: `tick → segment id`.
+    order: BTreeMap<u64, u32>,
+    tick: u64,
+}
+
 pub struct RecordStore {
     catalog: Arc<Catalog>,
-    /// Open segment files. Populated on demand — a database with many
-    /// segments does not open them all to answer one point read.
-    segments: Mutex<BTreeMap<u32, Arc<Pager>>>,
+    /// Open segment files. Populated on demand and bounded — a database
+    /// with many segments neither opens them all to answer one point
+    /// read nor keeps every one it has ever touched.
+    segments: Mutex<OpenSegments>,
+}
+
+impl OpenSegments {
+    /// Mark a segment as most recently used.
+    fn touch(&mut self, id: u32, previous: u64) {
+        self.order.remove(&previous);
+
+        self.tick += 1;
+        let tick = self.tick;
+
+        self.order.insert(tick, id);
+
+        if let Some(entry) = self.pagers.get_mut(&id) {
+            entry.1 = tick;
+        }
+    }
+
+    /// Put a freshly opened pager in the table as most recently used.
+    fn admit(&mut self, id: u32, pager: Arc<Pager>) {
+        self.tick += 1;
+        let tick = self.tick;
+
+        self.pagers.insert(id, (pager, tick));
+        self.order.insert(tick, id);
+    }
+
+    /// Close least-recently-used segments until the table fits in
+    /// `capacity`.
+    ///
+    /// Two segments are never closed, and both exclusions are about
+    /// correctness rather than efficiency:
+    ///
+    /// * **The active segment.** It is the one being appended to, and an
+    ///   append in progress reads its last page, mutates it and writes
+    ///   it back. Closing it mid-append would drop the buffered page
+    ///   between those steps.
+    ///
+    /// * **Any pager somebody still holds.** `pager()` hands out an
+    ///   `Arc`, and a caller may keep it across further calls that
+    ///   themselves open segments — `scan_segment` holds one for the
+    ///   whole walk. A strong count above the table's own reference
+    ///   means exactly that, so it is the precise test for "in use", not
+    ///   an approximation of one.
+    ///
+    /// A closed segment is flushed first. Its pages are copy-on-write or
+    /// append-only and its records are in the WAL either way, but
+    /// dropping dirty pages would silently undo work the caller already
+    /// believes is in the buffer pool, and the next `sync` would have
+    /// nothing to write.
+    fn evict_down_to(&mut self, capacity: usize, active: u32) -> Result<()> {
+        while self.pagers.len() > capacity {
+            let victim = self
+                .order
+                .iter()
+                .map(|(tick, id)| (*tick, *id))
+                .find(|(_, id)| {
+                    *id != active
+                        && self
+                            .pagers
+                            .get(id)
+                            .is_some_and(|(pager, _)| Arc::strong_count(pager) == 1)
+                });
+
+            // Everything resident is pinned or active. The table is over
+            // capacity for as long as that lasts, which is bounded by the
+            // call in progress; forcing an eviction here would break the
+            // caller holding the pager.
+            let Some((tick, id)) = victim else {
+                break;
+            };
+
+            self.order.remove(&tick);
+
+            if let Some((pager, _)) = self.pagers.remove(&id) {
+                pager.flush()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Forget a segment entirely — it is being retired.
+    fn forget(&mut self, id: u32) {
+        if let Some((_, tick)) = self.pagers.remove(&id) {
+            self.order.remove(&tick);
+        }
+    }
+
+    /// Every resident pager, for a flush of the whole store.
+    fn resident(&self) -> Vec<Arc<Pager>> {
+        self.pagers.values().map(|(pager, _)| Arc::clone(pager)).collect()
+    }
 }
 
 impl RecordStore {
     pub fn open(catalog: Arc<Catalog>) -> RecordStore {
         RecordStore {
             catalog,
-            segments: Mutex::new(BTreeMap::new()),
+            segments: Mutex::new(OpenSegments {
+                pagers: BTreeMap::new(),
+                order: BTreeMap::new(),
+                tick: 0,
+            }),
         }
     }
 
@@ -106,12 +253,18 @@ impl RecordStore {
     }
 
     /// The pager for a segment, opening the file if this is its first
-    /// use.
+    /// use and closing the least recently used one if that puts the
+    /// table over capacity.
     fn pager(&self, id: u32) -> Result<Arc<Pager>> {
         let mut open = self.lock();
 
-        if let Some(pager) = open.get(&id) {
-            return Ok(Arc::clone(pager));
+        if let Some((pager, previous)) = open.pagers.get(&id) {
+            let pager = Arc::clone(pager);
+            let previous = *previous;
+
+            open.touch(id, previous);
+
+            return Ok(pager);
         }
 
         let known = self
@@ -137,12 +290,20 @@ impl RecordStore {
         // reclaimed.
         pager.set_page_count(pages);
 
-        open.insert(id, Arc::clone(&pager));
+        open.admit(id, Arc::clone(&pager));
+
+        // Evicting after admitting, not before: the caller is about to
+        // use this pager and still holds a reference to it, so the
+        // strong-count test below excludes it from selection. Evicting
+        // first would leave the table one over capacity instead.
+        let active = self.catalog.with(|data| data.active_segment);
+
+        open.evict_down_to(open_segment_capacity(), active)?;
 
         Ok(pager)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, Arc<Pager>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, OpenSegments> {
         self.segments
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -393,9 +554,52 @@ impl RecordStore {
         let total = u32::from_le_bytes(cell[4..8].try_into().expect("4 bytes")) as usize;
         let mut next = u32::from_le_bytes(cell[8..12].try_into().expect("4 bytes"));
 
+        // The declared total is the one number here that has not been
+        // verified by anything: it comes off a page as a bare u32 and it
+        // is what sizes the reassembly buffer. Bound it against the
+        // largest frame the writer will ever produce *before* allocating,
+        // so a damaged stub is an integrity error rather than a 4 GiB
+        // reservation.
+        if total > binary::MAX_RECORD_FRAME_LEN {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "overflow stub at segment {} page {} slot {} declares a \
+                     {total}-byte record, over the \
+                     {}-byte maximum — the stub is corrupt",
+                    location.segment,
+                    location.page,
+                    location.slot,
+                    binary::MAX_RECORD_FRAME_LEN
+                ),
+            ));
+        }
+
+        // A chunk is at most MAX_CELL_LEN bytes, so a well-formed chain
+        // for `total` bytes is at most this many links. Anything longer
+        // is a cycle or a stub pointing into unrelated pages; either way
+        // the walk stops instead of running until the machine gives up.
+        let max_links = total.div_ceil(MAX_CELL_LEN).max(1);
+        let mut links = 0usize;
+
         let mut frame = Vec::with_capacity(total);
 
         while frame.len() < total {
+            links += 1;
+
+            if links > max_links {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "overflow chain for segment {} page {} slot {} \
+                         visited more than {max_links} pages without \
+                         yielding {total} bytes — the chain is cyclic or \
+                         corrupt",
+                        location.segment, location.page, location.slot
+                    ),
+                ));
+            }
+
             let chain = pager.read(next)?;
 
             if chain.kind() != PageKind::Overflow {
@@ -414,11 +618,15 @@ impl RecordStore {
             })?;
 
             frame.extend_from_slice(chunk);
-            next = chain.extra();
 
-            if next == 0 {
-                break;
-            }
+            // `total` — not a sentinel page id — is what ends the walk.
+            // The chain is written back to front, so its *last* link
+            // carries a successor field of 0, and page 0 of a segment is
+            // a perfectly ordinary page that the first overflow record
+            // written to a fresh segment actually occupies. Treating 0 as
+            // "end of chain" therefore stopped one link early for exactly
+            // that record and made it permanently unreadable.
+            next = chain.extra();
         }
 
         if frame.len() != total {
@@ -489,10 +697,53 @@ impl RecordStore {
         for page_id in 0..pages {
             let page = match pager.read(page_id) {
                 Ok(page) => page,
-                // A page that has never been written (a hole left by an
-                // overflow chain that was interrupted) is not a record
-                // and not a reason to abandon the scan.
-                Err(_) => continue,
+
+                // A page that has never been written — a hole left by an
+                // overflow chain an interrupted append never finished —
+                // is not a record and not a reason to abandon the scan.
+                // It shows up as the read running past the end of the
+                // file, or past the page count the catalog vouches for.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::UnexpectedEof
+                            | ErrorKind::NotFound
+                            | ErrorKind::InvalidInput
+                    ) =>
+                {
+                    continue
+                }
+
+                // Anything else is a page that exists and did not
+                // verify: a failed CRC, a failed AEAD tag, an impossible
+                // slot directory. That must NOT be skipped.
+                //
+                // The only caller of this scan is compaction, and
+                // compaction's contract is "everything live in this
+                // segment has been copied elsewhere, so the segment may
+                // now be deleted". Skipping an unreadable page silently
+                // breaks that contract in the worst available direction:
+                // the records in it are never migrated, the segment file
+                // is removed anyway, and indexes are left pointing at
+                // bytes that no longer exist. One damaged page becomes
+                // permanent, unannounced loss of every record it held.
+                //
+                // Failing here instead aborts the compaction and the
+                // checkpoint around it. Nothing is deleted, nothing is
+                // lost, the WAL keeps the boundary where it was, and an
+                // operator gets an error naming the page — which is a
+                // recoverable position to be in.
+                Err(e) => {
+                    return Err(Error::new(
+                        e.kind(),
+                        format!(
+                            "heap segment {segment} page {page_id} did not \
+                             verify: {e}. Refusing to compact a segment that \
+                             cannot be read in full — retiring it would \
+                             discard whatever live records this page holds."
+                        ),
+                    ));
+                }
             };
 
             if page.kind() != PageKind::Heap {
@@ -540,7 +791,7 @@ impl RecordStore {
 
         self.catalog.save()?;
 
-        self.lock().remove(&segment);
+        self.lock().forget(segment);
 
         match std::fs::remove_file(RecordStore::segment_path(segment)) {
             Ok(()) => Ok(()),
@@ -556,7 +807,7 @@ impl RecordStore {
     /// naming pages that are still only in memory would, after a crash,
     /// describe a segment longer than the records it actually holds.
     pub fn sync(&self) -> Result<()> {
-        let pagers: Vec<Arc<Pager>> = self.lock().values().map(Arc::clone).collect();
+        let pagers: Vec<Arc<Pager>> = self.lock().resident();
 
         for pager in pagers {
             pager.flush()?;

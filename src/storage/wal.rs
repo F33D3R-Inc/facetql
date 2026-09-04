@@ -1078,3 +1078,162 @@ pub fn abort(
 
     Ok(record)
 }
+// ---------------------------------------------------------------------
+// BOUNDING THE LOG
+// ---------------------------------------------------------------------
+
+/// Default size at which a checkpoint will rewrite the WAL, in bytes.
+///
+/// The WAL is append-only and, until this existed, was never shortened:
+/// a long-lived database grew one indefinitely, and since `read_all`
+/// reads the whole file into memory before replaying it, startup cost —
+/// in both time and RAM — grew with the *lifetime* of the database
+/// rather than with its size. That is the one resource in this engine an
+/// ordinary, entirely legitimate workload exhausts on its own.
+///
+/// 64 MiB is well above the volume a single checkpoint interval
+/// produces, so rotation is a rare event rather than something every
+/// checkpoint pays for, and it is small enough to read back at startup
+/// without thinking about it.
+const DEFAULT_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
+
+const ROTATE_BYTES_ENV: &str = "FACETQL_WAL_ROTATE_BYTES";
+
+/// The configured rotation threshold.
+pub fn rotate_threshold() -> u64 {
+    std::env::var(ROTATE_BYTES_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_ROTATE_BYTES)
+}
+
+/// Current size of the WAL on disk, or 0 when it does not exist.
+pub fn size() -> io::Result<u64> {
+    match fs::metadata(wal_path()) {
+        Ok(meta) => Ok(meta.len()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+/// Rewrite the WAL so it holds only the records a future recovery would
+/// still replay — those with `sequence > durable_checkpoint`.
+///
+/// # Why this is safe to drop records
+///
+/// Recovery replays exactly `sequence > checkpoint`, and the checkpoint
+/// only advances once the heap, the catalog and every index are fsync'd
+/// (`StorageEngine::checkpoint`). A record at or below it is therefore
+/// already reflected in physical storage by definition; keeping it costs
+/// disk and startup time and buys nothing. This is the standard
+/// checkpoint-then-truncate cycle, done as a whole-file rewrite because
+/// a POSIX file cannot have a prefix removed in place.
+///
+/// # Why it is a rewrite and not a `set_len(0)`
+///
+/// Emptying the file would also discard the records *above* the
+/// checkpoint — the ones a crash still needs — and would discard an open
+/// transaction frame's staged records, which the checkpoint fence
+/// deliberately keeps the boundary below. Those are carried over
+/// verbatim (re-framed, since a frame is written as one hex line), in
+/// their original order and with their original sequence numbers, so the
+/// log a later recovery reads is byte-for-byte equivalent in meaning to
+/// the tail it replaces.
+///
+/// # Crash safety
+///
+/// Temp file → `sync_all` → `rename` → `sync_all` the directory: the
+/// same protocol the catalog and the checkpoint use. A crash at any
+/// point leaves either the full old log or the rewritten one, never a
+/// partial file — and either one recovers to the same state, because the
+/// records the rewrite dropped are the ones recovery would have skipped.
+///
+/// # Refusals
+///
+/// A torn tail is left alone. Recovery repairs a tear at startup, before
+/// anything else, so seeing one here means the file changed underneath a
+/// running process; rewriting it would be guessing about bytes we have
+/// no explanation for. Returns the number of records carried over.
+pub fn rotate(durable_checkpoint: u64) -> io::Result<usize> {
+    let path = wal_path();
+
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let (records, tail) = read_all()?;
+
+    if let WalTail::Torn { detail, .. } = tail {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing to rotate the WAL: its tail is torn ({detail}). \
+                 A tear is repaired during startup recovery, so one here \
+                 means the log changed underneath a running process."
+            ),
+        ));
+    }
+
+    let kept: Vec<&WalRecord> = records
+        .iter()
+        .filter(|record| record.sequence > durable_checkpoint)
+        .collect();
+
+    // Nothing to reclaim: every record is still live. Leaving the file
+    // untouched is not just an optimization — rewriting it would burn a
+    // full read/write cycle to produce an identical log.
+    if kept.len() == records.len() {
+        return Ok(kept.len());
+    }
+
+    let mut body = Vec::new();
+
+    for record in &kept {
+        body.extend_from_slice(encode_frame(record)?.as_bytes());
+        body.push(b'\n');
+    }
+
+    let tmp = config::data_file(&format!(
+        "facetql.wal.{}.{}.tmp",
+        std::process::id(),
+        NEXT_ROTATION_ID.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(&body)?;
+        // sync_all, not sync_data: the rename below publishes this inode
+        // and its length has to be durable with it, or a crash leaves
+        // the WAL name pointing at a file whose size never landed.
+        file.sync_all()?;
+    }
+
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    sync_parent_dir(&path)?;
+
+    Ok(kept.len())
+}
+
+static NEXT_ROTATION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// `fsync` the directory holding `path`, making the rename above
+/// durable. Without it the directory entry can survive a crash still
+/// naming the pre-rotation inode — which is harmless here (the old log
+/// recovers to the same state) but would silently make the rotation a
+/// no-op forever on a filesystem that always replays that way.
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &std::path::Path) -> io::Result<()> {
+    Ok(())
+}

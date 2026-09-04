@@ -50,6 +50,33 @@ use crate::storage::wal::{
 pub fn recover(engine: &mut StorageEngine) -> io::Result<()> {
     let path = wal::wal_path();
 
+    /*
+     * The durable checkpoint is a FLOOR on the identifier space, and it
+     * has to be applied before anything else — including before the
+     * early return below, which is the case that made this necessary.
+     *
+     * Recovery replays exactly the records with `sequence > checkpoint`.
+     * That filter is only sound while every sequence this process hands
+     * out is above the checkpoint. Derive the counters from the WAL's
+     * contents alone and that stops being true the moment the WAL is
+     * shorter than the checkpoint implies — which is not a hypothetical:
+     * a checkpointed WAL removed by an operator is documented as a
+     * legitimate state, and `read_all` treats a missing file as one.
+     * Restart there and the counters begin at 1 while the checkpoint
+     * still reads (say) 5000, so every subsequent write is stamped with
+     * a sequence the next recovery filters out. Those writes are durable
+     * in the WAL, acknowledged to the client, and silently skipped on
+     * replay: data loss with no error anywhere.
+     *
+     * Seeding both counters from the checkpoint closes that. It is also
+     * what makes a history `version` safe across the same event, since
+     * versions are drawn from the operation-id counter and must never
+     * revisit a `(address, version)` key an earlier run already wrote.
+     */
+    let floor = checkpoint::read()?;
+
+    wal::initialize_counters(floor, 0, floor);
+
     if !path.exists() {
         return Ok(());
     }

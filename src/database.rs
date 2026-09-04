@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tokio::sync::broadcast;
 
@@ -199,6 +199,33 @@ fn integrity_failure(detail: &str) -> Option<bool> {
     None
 }
 
+/// Exit code for "a mutation panicked; in-memory state is untrustworthy".
+///
+/// Continues the numbering in [`DatabaseError::exit_code`] (1 storage,
+/// 4 integrity, 5 WAL) and in `cli::error` (2 usage, 3 declined). Unlike
+/// 4 and 5 this one is *expected* to be retried: the WAL holds every
+/// acknowledged write and startup recovery replays it.
+pub const EXIT_ENGINE_POISONED: i32 = 6;
+
+/// End the process because the engine lock is poisoned.
+///
+/// Never returns. Writes to stderr rather than returning an error
+/// because there is no caller left that could act on one — the state
+/// this would have to be reported through is the state that is broken.
+fn poisoned() -> ! {
+    eprintln!(
+        "facetql: FATAL — a request panicked while holding the storage \
+         engine lock, so the in-memory index and cache state is no longer \
+         consistent with the disk. Exiting so this process is restarted: \
+         every acknowledged write is durable in the write-ahead log, and \
+         startup recovery replays it. Nothing is lost by restarting; \
+         continuing to serve from inconsistent state would lose \
+         correctness silently."
+    );
+
+    std::process::exit(EXIT_ENGINE_POISONED)
+}
+
 impl fmt::Display for DatabaseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -333,6 +360,47 @@ impl Database {
             engine: Arc::new(RwLock::new(engine)),
             broadcaster,
         })
+    }
+
+    /// The engine, for a read.
+    ///
+    /// See [`Database::engine_mut`] for why this is a method rather than
+    /// twenty copies of `.expect("storage engine lock poisoned")`.
+    pub fn engine(&self) -> RwLockReadGuard<'_, StorageEngine> {
+        self.engine.read().unwrap_or_else(|_| poisoned())
+    }
+
+    /// The engine, for a mutation.
+    ///
+    /// # Why a poisoned lock ends the process
+    ///
+    /// The lock is poisoned only if a thread panicked while holding it,
+    /// which means it panicked partway through a mutation: some indexes
+    /// updated, others not, the record cache possibly naming a version
+    /// that was never indexed. The in-memory picture is no longer
+    /// trustworthy.
+    ///
+    /// The durable picture still is. Every mutation writes its WAL
+    /// record before it touches any of that state, so the operation is
+    /// on disk and `recovery::recover` reapplies it — idempotently —
+    /// at the next start. **Restarting is the repair**, and it is a
+    /// complete one.
+    ///
+    /// Which makes the previous behaviour the worst of the three
+    /// options. `.expect()` panics the *handler task*, and a panicked
+    /// task in Tokio kills one connection and leaves the process
+    /// running. So the server stayed up, never restarted, never
+    /// recovered, and answered every subsequent request — forever — by
+    /// panicking again. A permanent outage that looks, to a supervisor,
+    /// like a healthy process.
+    ///
+    /// Exiting hands the repair to the thing that can perform it. The
+    /// code is distinct from the startup failures in
+    /// [`DatabaseError::exit_code`] so a supervisor can tell "crashed
+    /// while serving, restart me" from "cannot open the data directory,
+    /// stop trying".
+    pub fn engine_mut(&self) -> RwLockWriteGuard<'_, StorageEngine> {
+        self.engine.write().unwrap_or_else(|_| poisoned())
     }
 
     /// Publish a database event to the subscribers `audience` admits.

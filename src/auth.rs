@@ -53,6 +53,29 @@ pub fn hash_token(token: &str) -> String {
 /// Everything created after bootstrap should go through
 /// `POST /admin/users` (persistent, admin-manageable, hashed at rest)
 /// instead of growing this env var forever.
+///
+/// # Keyed by hash, not by the token
+///
+/// The map is keyed by `hash_token(token)` and looked up with the hash
+/// of what the request presented, so the bootstrap path never compares a
+/// caller-supplied string against a secret. That matters for two
+/// reasons, and neither is theoretical enough to skip:
+///
+/// * **Comparison time.** `String` equality short-circuits at the first
+///   differing byte, and a `HashMap` probe compares the key it lands on.
+///   Comparing digests instead makes the work independent of how much of
+///   the real token a guess got right — an attacker would have to invert
+///   SHA-256 to steer it.
+///
+/// * **One shape for both credential stores.** The persistent user store
+///   already holds hashes and is already looked up by hash. Keeping the
+///   bootstrap map in plaintext meant two different comparisons on the
+///   same code path, one of which would have had to be remembered
+///   separately every time this file changed.
+///
+/// The plaintext token is still read from the environment — it has to
+/// be, an operator types it — but it is hashed once at first use and the
+/// plaintext is not retained past that.
 fn static_token_map() -> &'static HashMap<String, (String, Role)> {
     static MAP: OnceLock<HashMap<String, (String, Role)>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -70,7 +93,7 @@ fn static_token_map() -> &'static HashMap<String, (String, Role)> {
                     if token.is_empty() || owner.is_empty() {
                         None
                     } else {
-                        Some((token, (owner, role)))
+                        Some((hash_token(&token), (owner, role)))
                     }
                 })
                 .collect(),
@@ -81,7 +104,10 @@ fn static_token_map() -> &'static HashMap<String, (String, Role)> {
                      to bootstrap the first real admin via POST /admin/users. \
                      Do not run production traffic against this."
                 );
-                HashMap::from([(DEV_TOKEN.to_string(), (DEV_OWNER.to_string(), Role::Admin))])
+                HashMap::from([(
+                    hash_token(DEV_TOKEN),
+                    (DEV_OWNER.to_string(), Role::Admin),
+                )])
             }
         }
     })
@@ -131,11 +157,15 @@ pub async fn auth_middleware(
         }
     };
 
-    let identity = if let Some((owner, role)) = static_token_map().get(provided) {
+    // Hash once, then look the digest up in both credential stores. The
+    // presented secret is never compared byte-for-byte against a stored
+    // one on either path.
+    let hash = hash_token(provided);
+
+    let identity = if let Some((owner, role)) = static_token_map().get(&hash) {
         Some(AuthIdentity { owner: owner.clone(), role: *role })
     } else {
-        let hash = hash_token(provided);
-        let engine = db.engine.read().expect("storage engine lock poisoned");
+        let engine = db.engine();
         engine
             .find_user_by_hash(&hash)
             .map(|record| AuthIdentity { owner: record.owner.clone(), role: record.role })

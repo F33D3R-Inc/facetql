@@ -206,3 +206,117 @@ pub fn history_key(address: &str, version: u64) -> Vec<u8> {
     key.extend_from_slice(&version.to_be_bytes());
     key
 }
+
+// ---------------------------------------------------------------------
+// Key admissibility
+// ---------------------------------------------------------------------
+//
+// A key that the B+tree refuses is not a slow write, it is an
+// *unrecoverable* one — and that is the whole reason these checks
+// exist rather than being left to `BTree::put`.
+//
+// The durable write path is: WAL record fsync'd, then heap, then
+// indexes. By the time `put` sees a 2 KiB address the intent is already
+// durable in the WAL, so the failure it returns is not a rejected
+// request: it is a committed operation that cannot be applied. Recovery
+// replays that record on the next start, hits the same refusal, and
+// startup fails — permanently, from one HTTP request.
+//
+// So admissibility is decided *before* anything is logged. The bounds
+// below are not invented constants: they are the actual encoded keys
+// this module builds, measured against the actual limit
+// `btree::MAX_KEY_LEN` enforces. Change the key encoding and these
+// follow it automatically.
+
+use crate::storage::btree::MAX_KEY_LEN;
+
+/// Longest a single key component may be, imposed by [`component`]'s
+/// `u16` length prefix.
+///
+/// Checked ahead of the composite-key bound purely so the cast in
+/// `component` can never silently wrap a longer string down into a
+/// short one — a wrapped length would produce a key that parses as a
+/// *different* key, which is corruption rather than a rejected write.
+/// In practice `MAX_KEY_LEN` is far smaller and fires first.
+pub const MAX_COMPONENT_LEN: usize = u16::MAX as usize;
+
+fn check_component(name: &str, value: &str) -> std::result::Result<(), String> {
+    if value.len() > MAX_COMPONENT_LEN {
+        return Err(format!(
+            "{name} is {} bytes; the maximum is {MAX_COMPONENT_LEN}",
+            value.len()
+        ));
+    }
+
+    Ok(())
+}
+
+/// One already-built key, measured against the tree's own limit.
+pub fn check_key_admissible(index: &str, key: &[u8]) -> std::result::Result<(), String> {
+    if key.is_empty() {
+        return Err(format!("the {index} index key would be empty"));
+    }
+
+    if key.len() > MAX_KEY_LEN {
+        return Err(format!(
+            "the {index} index key would be {} bytes; the maximum is \
+             {MAX_KEY_LEN}",
+            key.len()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Every durable key a node's identity produces, checked as a set.
+///
+/// Checking the composites rather than each field separately is what
+/// keeps the limit honest: `address` and `kind` share one key, so
+/// neither has a bound of its own — what has a bound is the key they
+/// build together.
+pub fn check_node_keys(
+    address: &str,
+    kind: &str,
+    owner: &str,
+) -> std::result::Result<(), String> {
+    check_component("node address", address)?;
+    check_component("node kind", kind)?;
+    check_component("node owner", owner)?;
+
+    check_key_admissible("primary", address.as_bytes())?;
+    check_key_admissible("kind", &kind_key(kind, address))?;
+    check_key_admissible("owner", &owner_key(owner, address))?;
+
+    // The version is a fixed-width suffix, so any version produces a key
+    // of the same length; `u64::MAX` stands in for all of them.
+    check_key_admissible("history", &history_key(address, u64::MAX))?;
+
+    Ok(())
+}
+
+/// The keys an archived state produces. A history entry carries a whole
+/// node, and that node is handed back on a history read, so it is held
+/// to the same admissibility as a live one.
+pub fn check_history_keys(
+    address: &str,
+    node_address: &str,
+    node_kind: &str,
+    node_owner: &str,
+) -> std::result::Result<(), String> {
+    check_component("history address", address)?;
+    check_key_admissible("history", &history_key(address, u64::MAX))?;
+
+    check_node_keys(node_address, node_kind, node_owner)
+}
+
+/// Both edge index keys for one edge identity.
+pub fn check_edge_keys(from: &str, to: &str, kind: &str) -> std::result::Result<(), String> {
+    check_component("edge 'from'", from)?;
+    check_component("edge 'to'", to)?;
+    check_component("edge 'kind'", kind)?;
+
+    check_key_admissible("outgoing-edge", &edge_out_key(from, kind, to))?;
+    check_key_admissible("incoming-edge", &edge_in_key(to, kind, from))?;
+
+    Ok(())
+}

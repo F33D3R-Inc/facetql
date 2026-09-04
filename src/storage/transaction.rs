@@ -33,6 +33,7 @@ use crate::core::history::HistoryEntry;
 use crate::core::node::Node;
 use crate::core::user::UserRecord;
 use crate::storage::commit::StagedCommit;
+use crate::storage::index as keys;
 use crate::storage::wal::WalOperation;
 
 /// One resolved mutation within a transaction.
@@ -82,6 +83,52 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Refuse a mutation whose durable keys the indexes could not
+    /// accept, *before* it is written to the WAL.
+    ///
+    /// This is a durability check disguised as a validation. The write
+    /// path logs intent first and applies second, so an operation that
+    /// the index layer rejects at apply time has already been made
+    /// durable: recovery replays it on the next start, hits the same
+    /// rejection, and startup fails for good. One oversized address in
+    /// one request would be enough. Checking here — at the last point
+    /// before anything is logged — turns that into an ordinary rejected
+    /// request.
+    ///
+    /// The bounds are the index layer's own (see
+    /// [`crate::storage::index`]), so there is one definition of an
+    /// admissible key rather than a copy of it here that can drift.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Operation::Archive(entry) => keys::check_history_keys(
+                &entry.address,
+                &entry.node.address,
+                &entry.node.kind,
+                &entry.node.owner,
+            ),
+
+            Operation::Insert(node) => {
+                keys::check_node_keys(&node.address, &node.kind, &node.owner)
+            }
+
+            Operation::Delete(address) => {
+                keys::check_key_admissible("primary", address.as_bytes())
+            }
+
+            Operation::InsertEdge(edge) => {
+                keys::check_edge_keys(&edge.from, &edge.to, &edge.kind)
+            }
+
+            Operation::DeleteEdge(id) => {
+                keys::check_edge_keys(&id.from, &id.to, &id.kind)
+            }
+
+            // Users live in their own flat log, not in an index, so
+            // there is no key to admit.
+            Operation::InsertUser(_) | Operation::RevokeUser(_) => Ok(()),
+        }
+    }
+
     /// Lower this resolved mutation to its WAL representation.
     ///
     /// Cloning is deliberate: the caller keeps the [`Operation`] to apply
@@ -195,6 +242,18 @@ impl Transaction {
     {
         if self.operations.is_empty() {
             return Ok(0);
+        }
+
+        // Admissibility first, for the whole batch, before the frame is
+        // opened. An operation the indexes would refuse must never
+        // become durable — see [`Operation::validate`] — and refusing
+        // the batch as a unit here keeps the all-or-nothing contract:
+        // one inadmissible operation rejects the request rather than
+        // committing its neighbours.
+        for operation in &self.operations {
+            operation
+                .validate()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         }
 
         let mut frame = StagedCommit::open()?;

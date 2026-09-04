@@ -738,3 +738,14 @@ pub fn read_all_records<T: DeserializeOwned>(path: &std::path::Path) -> std::io:
 pub fn users_path() -> std::path::PathBuf {
     config::data_file("facetql.users")
 }
+
+/// Largest complete record frame — header plus the largest payload
+/// [`encode_frame`] will write.
+///
+/// The heap's overflow stub carries a record's total *frame* length as a
+/// bare `u32` read straight off a page, and that number is the size of
+/// the buffer the reassembly loop allocates. Bounding it against the
+/// same limit the writer honours is what keeps a corrupt stub from
+/// naming four gigabytes: an oversized declaration becomes an ordinary
+/// integrity error instead of an allocation.
+pub const MAX_RECORD_FRAME_LEN: usize = FRAME_HEADER_LEN + MAX_RECORD_PAYLOAD_LEN;

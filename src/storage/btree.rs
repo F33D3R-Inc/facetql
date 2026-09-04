@@ -82,6 +82,41 @@ const META_B: u32 = 1;
 /// First page id available for tree data.
 const FIRST_DATA_PAGE: u32 = 2;
 
+/// Hard ceiling on how deep any walk of the tree may go.
+///
+/// A B+tree's real depth is logarithmic: with `MAX_KEY_LEN` at 1 KiB a
+/// branch still holds a dozen separators, so even the worst legitimate
+/// fan-out reaches billions of entries within a handful of levels. 64 is
+/// therefore unreachable by a correct tree of any size this engine can
+/// hold, and is chosen for exactly that property.
+///
+/// It exists because a *damaged* tree has no such bound. Every page is
+/// individually verified — magic, version, CRC, slot bounds, and the
+/// AEAD tag over the whole page — but nothing in a page proves that the
+/// child pointer inside it points *downward*. A branch whose child
+/// pointer names itself, or names an ancestor, is a structurally
+/// well-formed page in every local sense and an infinite descent in
+/// every global one: `descend` would loop forever holding a lock, and
+/// the recursive walks would exhaust the stack and abort the process.
+/// Neither of those is recoverable, and neither produces a diagnosis.
+/// Bounding the walk converts both into an ordinary `InvalidData` error
+/// naming the index, which is a thing an operator can act on.
+const MAX_TREE_DEPTH: usize = 64;
+
+/// The error a walk raises when it exceeds [`MAX_TREE_DEPTH`].
+fn descent_too_deep(operation: &str) -> Error {
+    Error::new(
+        ErrorKind::InvalidData,
+        format!(
+            "tree {operation} exceeded {MAX_TREE_DEPTH} levels — a B+tree \
+             this deep cannot be built by any legitimate insert, so the \
+             index holds a cyclic or otherwise impossible child pointer. \
+             The index is derived state and can be rebuilt from the record \
+             heap, which is the authoritative copy."
+        ),
+    )
+}
+
 const META_MAGIC: [u8; 4] = *b"FQBT";
 
 /// Which direction, and whether the search key itself may be the
@@ -387,7 +422,7 @@ impl BTree {
 
     /// The leaf page a key belongs in.
     fn descend(&self, mut page_id: u32, key: &[u8]) -> Result<u32> {
-        loop {
+        for _ in 0..MAX_TREE_DEPTH {
             let page = self.pager.read(page_id)?;
 
             match page.kind() {
@@ -403,6 +438,8 @@ impl BTree {
                 }
             }
         }
+
+        Err(descent_too_deep("descent"))
     }
 
     /// The entry nearest `key` in the requested direction, or `None`
@@ -421,6 +458,10 @@ impl BTree {
         let mut page_id = root;
 
         let leaf = loop {
+            if path.len() >= MAX_TREE_DEPTH {
+                return Err(descent_too_deep("seek"));
+            }
+
             let page = self.pager.read(page_id)?;
 
             match page.kind() {
@@ -509,6 +550,22 @@ impl BTree {
         page_id: u32,
         first: bool,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.edge_entry_at(page_id, first, 0)
+    }
+
+    /// The recursive half, carrying the depth that bounds it. A cyclic
+    /// child pointer would otherwise recurse until the stack is gone,
+    /// which aborts the process rather than failing the query.
+    fn edge_entry_at(
+        &self,
+        page_id: u32,
+        first: bool,
+        depth: usize,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(descent_too_deep("walk"));
+        }
+
         let page = self.pager.read(page_id)?;
 
         match page.kind() {
@@ -533,7 +590,9 @@ impl BTree {
                     let slot = if first { step } else { children - 1 - step };
                     let child = branch_child_at(&page, slot);
 
-                    if let Some(entry) = self.edge_entry(child, first)? {
+                    if let Some(entry) =
+                        self.edge_entry_at(child, first, depth + 1)?
+                    {
                         return Ok(Some(entry));
                     }
                 }
@@ -634,7 +693,7 @@ impl BTree {
         let mut state = self.lock();
         let root = state.root;
 
-        match self.insert_into(&mut state, root, key, value)? {
+        match self.insert_into(&mut state, root, key, value, 0)? {
             Insert::Kept(page) => state.root = page,
 
             Insert::Split(left, separator, right) => {
@@ -669,12 +728,19 @@ impl BTree {
         page_id: u32,
         key: &[u8],
         value: &[u8],
+        depth: usize,
     ) -> Result<Insert> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(descent_too_deep("insert"));
+        }
+
         let kind = self.pager.read(page_id)?.kind();
 
         match kind {
             PageKind::Leaf => self.insert_into_leaf(state, page_id, key, value),
-            PageKind::Branch => self.insert_into_branch(state, page_id, key, value),
+            PageKind::Branch => {
+                self.insert_into_branch(state, page_id, key, value, depth)
+            }
             other => Err(Error::new(
                 ErrorKind::InvalidData,
                 format!("tree insert reached a {other:?} page"),
@@ -746,12 +812,13 @@ impl BTree {
         page_id: u32,
         key: &[u8],
         value: &[u8],
+        depth: usize,
     ) -> Result<Insert> {
         let page = self.pager.read(page_id)?;
         let (slot, child) = branch_child_for(&page, key);
         drop(page);
 
-        match self.insert_into(state, child, key, value)? {
+        match self.insert_into(state, child, key, value, depth + 1)? {
             Insert::Kept(new_child) => {
                 if new_child == child {
                     // The child was already dirty in this generation, so
@@ -821,7 +888,7 @@ impl BTree {
         let mut state = self.lock();
         let root = state.root;
 
-        let outcome = self.remove_from(&mut state, root, key)?;
+        let outcome = self.remove_from(&mut state, root, key, 0)?;
 
         if !outcome.removed {
             return Ok(false);
@@ -833,7 +900,7 @@ impl BTree {
         // A root branch that has lost every separator is one indirection
         // with no information in it; drop it so the tree does not grow a
         // permanent spine of single-child branches.
-        loop {
+        for _ in 0..MAX_TREE_DEPTH {
             let root_id = state.root;
             let page = self.pager.read(root_id)?;
 
@@ -856,7 +923,12 @@ impl BTree {
         state: &mut TreeState,
         page_id: u32,
         key: &[u8],
+        depth: usize,
     ) -> Result<Removal> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(descent_too_deep("remove"));
+        }
+
         let page = self.pager.read(page_id)?;
 
         match page.kind() {
@@ -883,7 +955,7 @@ impl BTree {
                 let (slot, child) = branch_child_for(&page, key);
                 drop(page);
 
-                let outcome = self.remove_from(state, child, key)?;
+                let outcome = self.remove_from(state, child, key, depth + 1)?;
 
                 if !outcome.removed {
                     return Ok(Removal { page: page_id, removed: false, empty: false });

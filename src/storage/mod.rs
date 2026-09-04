@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod heap;
 pub mod index;
 pub mod location;
+pub mod lock;
 pub mod page;
 pub mod pager;
 pub mod wal;

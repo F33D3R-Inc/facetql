@@ -27,9 +27,31 @@ use tower::util::ServiceExt;
 /// whole project has served went through the equivalent call), rather
 /// than pulling in a wrapper crate with its own separate version
 /// constraints.
-pub async fn serve_tls(listener: TcpListener, app: Router, acceptor: TlsAcceptor) {
+///
+/// `shutdown` is awaited alongside the accept loop. `axum::serve` grew a
+/// `with_graceful_shutdown` for the plaintext path; this loop is our own,
+/// so it has to select on the signal itself — otherwise the TLS
+/// deployment would be the one that never stops cleanly, and TLS is the
+/// deployment that is actually in production.
+///
+/// Shutdown here means "stop accepting". Connections already handed to
+/// hyper are spawned tasks and finish on their own; the process then
+/// takes its final checkpoint (`settle` in `main`) before exiting.
+pub async fn serve_tls(
+    listener: TcpListener,
+    app: Router,
+    acceptor: TlsAcceptor,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
+    tokio::pin!(shutdown);
+
     loop {
-        let (tcp_stream, remote_addr) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = &mut shutdown => return,
+        };
+
+        let (tcp_stream, remote_addr) = match accepted {
             Ok(conn) => conn,
             Err(e) => {
                 eprintln!("warning: failed to accept a connection: {e}");

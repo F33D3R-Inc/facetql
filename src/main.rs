@@ -557,7 +557,7 @@ async fn run_server(
         Err(error) => report_startup_failure(error),
     };
 
-    let app = create_router(db);
+    let app = create_router(std::sync::Arc::clone(&db));
 
     println!(
         "Data directory: {}",
@@ -633,6 +633,7 @@ async fn run_server(
                 listener,
                 app,
                 acceptor,
+                shutdown_signal(),
             )
                 .await;
         }
@@ -647,14 +648,146 @@ async fn run_server(
                  real traffic)"
             );
 
-            axum::serve(listener, app)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "FacetQL HTTP server failed: {error}"
-                    )
-                });
+            /*
+             * Graceful, but on a clock.
+             *
+             * `with_graceful_shutdown` waits for every open connection
+             * to close, and `GET /events` is an SSE stream that stays
+             * open for as long as the subscriber wants it. Waiting
+             * unconditionally would mean a single live subscriber turns
+             * every SIGTERM into a hang until the supervisor's SIGKILL
+             * — strictly worse than not draining at all, because the
+             * final checkpoint below would never run either.
+             *
+             * So the drain gets a deadline: in-flight requests finish
+             * normally, and if something is still holding a connection
+             * when it expires, the server stops waiting and moves on to
+             * settle and exit. The oneshot is what starts the clock —
+             * the deadline must run from the moment the signal arrives,
+             * not from startup.
+             */
+            let (signalled, awaiting_signal) =
+                tokio::sync::oneshot::channel::<()>();
+
+            let graceful = async move {
+                shutdown_signal().await;
+                let _ = signalled.send(());
+            };
+
+            let drain_deadline = async move {
+                if awaiting_signal.await.is_ok() {
+                    tokio::time::sleep(SHUTDOWN_GRACE).await;
+                } else {
+                    // The server stopped for some other reason and the
+                    // sender was dropped; never fire.
+                    std::future::pending::<()>().await;
+                }
+            };
+
+            tokio::select! {
+                result = axum::serve(listener, app)
+                    .with_graceful_shutdown(graceful) =>
+                {
+                    result.unwrap_or_else(|error| {
+                        panic!(
+                            "FacetQL HTTP server failed: {error}"
+                        )
+                    });
+                }
+
+                _ = drain_deadline => {
+                    eprintln!(
+                        "FacetQL: connections still open after \
+                         {}s; closing them and stopping",
+                        SHUTDOWN_GRACE.as_secs()
+                    );
+                }
+            }
         }
+    }
+
+    settle(&db);
+}
+
+/// How long a shutdown waits for open connections before stopping
+/// anyway.
+///
+/// Chosen to sit under the two defaults that would otherwise kill the
+/// process mid-drain — Kubernetes' 30s `terminationGracePeriodSeconds`
+/// and systemd's 90s `TimeoutStopSec` — with room left for the final
+/// checkpoint afterwards. A request that has not finished in fifteen
+/// seconds is not going to be helped by thirty.
+const SHUTDOWN_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// Resolves when the process is asked to stop.
+///
+/// Both signals a supervisor actually sends are handled. SIGTERM is what
+/// systemd, Docker and Kubernetes send first, and answering only SIGINT
+/// would mean every orchestrated shutdown reached the SIGKILL timeout
+/// instead — the case where a clean stop matters most is exactly the one
+/// that would not get one.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+
+            // Without a SIGTERM handler the default disposition applies
+            // and the process dies immediately on one. That is the old
+            // behaviour, so fall back to it rather than refusing to
+            // serve.
+            Err(error) => {
+                eprintln!(
+                    "warning: could not install a SIGTERM handler \
+                     ({error}); shutdown on SIGTERM will not be graceful"
+                );
+
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    println!("FacetQL: shutdown signal received; finishing in-flight requests");
+}
+
+/// Take one last checkpoint on the way out.
+///
+/// Skipping this is *safe* — every acknowledged mutation is already
+/// fsync'd to the WAL, so nothing is lost either way — but it is not
+/// free. Whatever the last checkpoint did not cover is replayed at the
+/// next start, and replay re-appends every record it redoes, so a
+/// process stopped mid-interval starts slower and leaves a superseded
+/// copy of each replayed record for compaction to clean up. Checkpointing
+/// here is what makes a planned restart cost nothing: the heap, the
+/// catalog and the indexes are on disk, the durability boundary is past
+/// them, and the WAL rotates behind it.
+///
+/// A failure is reported and not fatal. The process is already stopping,
+/// the data is already durable, and the only consequence is the replay
+/// this was trying to avoid.
+fn settle(db: &std::sync::Arc<Database>) {
+    match db.engine_mut().checkpoint() {
+        Ok(()) => println!("FacetQL: storage checkpointed; stopped cleanly"),
+
+        Err(error) => eprintln!(
+            "warning: the final checkpoint failed: {error}. Nothing is \
+             lost — every acknowledged write is durable in the \
+             write-ahead log — but the next start will replay more of it."
+        ),
     }
 }
 

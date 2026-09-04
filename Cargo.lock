@@ -496,6 +496,7 @@ dependencies = [
  "hyper 1.11.0",
  "hyper-util",
  "indexmap",
+ "libc",
  "native-tls",
  "openssl",
  "openssl-sys",
