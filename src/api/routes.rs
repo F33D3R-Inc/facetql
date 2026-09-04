@@ -1146,6 +1146,18 @@ async fn get_edges_in(
     }
 }
 
+/// Largest `POST /publish` payload, in bytes.
+///
+/// Paired with `database::BROADCAST_CAPACITY`: the two multiply to the
+/// most memory the event channel can hold, which is the number that
+/// actually matters. 64 KiB × 1024 events is a 64 MiB ceiling.
+///
+/// It is also well above what the channel is for. Every event FacetQL
+/// publishes itself is a short JSON notice naming an address; a
+/// subscriber that needs the record reads it. A payload near this bound
+/// is a sign the channel is being used as a transport, which it is not.
+const MAX_EVENT_PAYLOAD: usize = 64 * 1024;
+
 #[derive(Deserialize)]
 pub struct PublishRequest {
     pub payload: String,
@@ -1189,6 +1201,30 @@ async fn publish_event(
     Extension(identity): Extension<AuthIdentity>,
     Json(payload): Json<PublishRequest>,
 ) -> impl IntoResponse {
+    // The body limit alone does not bound this one. A published payload
+    // does not pass through and get dropped — it is retained in the
+    // broadcast ring until every subscriber has read past it, and the
+    // ring holds `BROADCAST_CAPACITY` events. So the memory a caller can
+    // pin is capacity × payload size, and with only the 4 MiB body limit
+    // in front of it that product is gigabytes, reachable by one
+    // authenticated identity in a loop with no subscribers at all.
+    //
+    // Bounding the payload is what makes the ring's own bound mean
+    // something: the two constants multiply to a fixed ceiling.
+    if payload.payload.len() > MAX_EVENT_PAYLOAD {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "event payload is {} bytes; the maximum is \
+                 {MAX_EVENT_PAYLOAD}. `/publish` is a notification \
+                 channel, not a transport — publish an address and let \
+                 subscribers read the node.",
+                payload.payload.len()
+            ),
+        )
+            .into_response();
+    }
+
     let audience = if identity.is_admin() {
         Audience::Everyone
     } else {

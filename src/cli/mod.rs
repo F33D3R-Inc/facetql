@@ -4,8 +4,8 @@
 //! separate tool.
 //!
 //! Everything here is a client of a *running* `facetql start` — see
-//! `client.rs` for why (the same single-writer reasoning `importer.rs`
-//! documents). No command in this module touches storage directly or
+//! `client.rs` for why, and `storage::lock` for the single-writer rule it
+//! follows from. No command in this module touches storage directly or
 //! adds a server endpoint; each maps one-to-one onto a route that already
 //! exists in `api/routes.rs`.
 

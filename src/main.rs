@@ -5,7 +5,6 @@ mod rules;
 mod database;
 mod auth;
 mod config;
-mod importer;
 mod crypto;
 mod tls_server;
 mod facet;
@@ -73,14 +72,6 @@ enum Command {
         input_dir: PathBuf,
     },
 
-    /// Bring rows from an existing database into FacetQL. Currently
-    /// supports Postgres. Talks to a *running* `facetql start` over
-    /// its normal API — start the server first.
-    Import {
-        #[command(subcommand)]
-        source: ImportSource,
-    },
-
     /// Manage identities (admin only). Talks to a *running* server over
     /// its API — start the server first.
     User {
@@ -104,39 +95,6 @@ enum Command {
     Stats(cli::StatsArgs),
 }
 
-#[derive(Subcommand, Debug)]
-enum ImportSource {
-    /// `facetql import postgres --pg-url postgres://... --table clients --kind Client --token <admin-or-user-token>`
-    Postgres {
-        /// Postgres connection string, e.g. postgres://user:pass@host/db
-        #[arg(long)]
-        pg_url: String,
-
-        /// Table to import, one FacetQL node per row.
-        #[arg(long)]
-        table: String,
-
-        /// Node `kind` to assign every imported row.
-        #[arg(long)]
-        kind: String,
-
-        /// Column used to build a stable node address (pg_<table>_<value>).
-        /// Falls back to the row's position in the result set if this
-        /// column isn't present.
-        #[arg(long, default_value = "id")]
-        id_column: String,
-
-        /// FacetQL server to import into.
-        #[arg(long, default_value = "http://localhost:8080")]
-        server: String,
-
-        /// FacetQL x-api-key to authenticate the import as. Imported
-        /// rows are owned by whichever identity this token maps to —
-        /// same rule as every other write.
-        #[arg(long, env = "ENOCHIAN_TOKEN")]
-        token: String,
-    },
-}
 
 #[tokio::main]
 async fn main() {
@@ -178,10 +136,6 @@ async fn main() {
 
         Some(Command::Restore { input_dir }) => {
             run_restore(input_dir)
-        }
-
-        Some(Command::Import { source }) => {
-            run_import(source).await
         }
 
         // Client commands: each maps onto an existing API route and, on
@@ -340,59 +294,6 @@ fn run_restore(input_dir: PathBuf) {
         input_dir.display(),
         config::data_dir().display()
     );
-}
-
-async fn run_import(source: ImportSource) {
-    match source {
-        ImportSource::Postgres {
-            pg_url,
-            table,
-            kind,
-            id_column,
-            server,
-            token,
-        } => {
-            println!(
-                "Importing table '{table}' from Postgres into \
-                 FacetQL ({server})..."
-            );
-
-            match importer::import_postgres_table(
-                &pg_url,
-                &table,
-                &kind,
-                "",
-                &id_column,
-                &server,
-                &token,
-            )
-                .await
-            {
-                Ok(summary) => {
-                    println!(
-                        "Imported {} row(s).",
-                        summary.imported
-                    );
-
-                    if !summary.failed.is_empty() {
-                        println!(
-                            "{} row(s) failed:",
-                            summary.failed.len()
-                        );
-
-                        for (address, err) in &summary.failed {
-                            println!("  {address}: {err}");
-                        }
-                    }
-                }
-
-                Err(e) => {
-                    eprintln!("import failed: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
 }
 
 /// Render a startup failure for whoever is reading the terminal or the

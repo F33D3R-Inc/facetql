@@ -1,17 +1,18 @@
 //! Thin HTTP client over FacetQL's existing API.
 //!
-//! This is deliberately just another API client — the same design choice
-//! `importer.rs` makes and explains at length: FacetQL's on-disk files
-//! are only safe for the single running server process to write, so every
-//! other tool (importer, this CLI) talks to a *running* `facetql start`
-//! over HTTP instead of touching storage directly. Nothing here opens a
-//! data file.
+//! This is deliberately just another API client. A data directory is
+//! owned by exactly one process — `storage::lock` takes an advisory lock
+//! to enforce that, because the page allocator, the index metadata and
+//! the WAL counters are all process-local state over shared files — so a
+//! second tool that opened those files would corrupt them structurally
+//! rather than fail. Every tool therefore talks to a *running* `facetql
+//! start` over HTTP instead, and nothing here opens a data file.
 //!
-//! It mirrors `importer.rs`'s request style exactly — manual
-//! `content-type` header plus a string body, responses read via `.text()`
-//! and parsed with `serde_json` — rather than reqwest's `.json()` helper,
-//! because the project depends on reqwest with `default-features = false`
-//! and cannot assume the `json` feature is compiled in.
+//! Requests are built by hand — `content-type` header plus a string
+//! body, responses read via `.text()` and parsed with `serde_json` —
+//! rather than with reqwest's `.json()` helper, because the project
+//! depends on reqwest with `default-features = false` and cannot assume
+//! the `json` feature is compiled in.
 
 use serde_json::{json, Value};
 
@@ -82,7 +83,7 @@ impl FacetClient {
     /// `POST /node` — client-supplied address, coordinate defaults to
     /// 0/0/0/0. `data` is stored as an opaque string by the server (same
     /// as every other write), so we send the caller's validated JSON as a
-    /// string, exactly as `importer.rs` does.
+    /// string.
     pub async fn put_node(
         &self,
         address: &str,

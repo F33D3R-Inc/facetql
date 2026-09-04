@@ -199,6 +199,21 @@ fn integrity_failure(detail: &str) -> Option<bool> {
     None
 }
 
+/// Events the live channel retains before the slowest subscriber starts
+/// missing them.
+///
+/// A retained event is memory: the ring holds every event until all
+/// receivers have read past it, so this bound and the per-payload bound
+/// in `api::routes` multiply to the channel's memory ceiling. Named
+/// rather than inline so the two are visibly a pair — changing one
+/// without the other silently changes that ceiling.
+///
+/// Lagging is a subscriber's problem, not the database's: a receiver
+/// that falls behind gets a `Lagged` error, which `subscribe_events`
+/// skips, and the stream continues. Events are best-effort
+/// notifications, never the source of truth.
+pub const BROADCAST_CAPACITY: usize = 1024;
+
 /// Exit code for "a mutation panicked; in-memory state is untrustworthy".
 ///
 /// Continues the numbering in [`DatabaseError::exit_code`] (1 storage,
@@ -353,8 +368,20 @@ impl Database {
         recovery::recover(&mut engine)
             .map_err(DatabaseError::recovering)?;
 
+        // Recovery is the last thing that can change the identity set,
+        // so this is the first point at which the user log can be
+        // rewritten to just the identities that survive. Non-fatal: an
+        // uncompacted log is long, not wrong.
+        if let Err(error) = engine.compact_user_log() {
+            eprintln!(
+                "warning: could not compact the user log: {error}. The \
+                 existing log is intact and correct; it will simply stay \
+                 longer than it needs to be."
+            );
+        }
+
         let (broadcaster, _) =
-            broadcast::channel(1024);
+            broadcast::channel(BROADCAST_CAPACITY);
 
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),

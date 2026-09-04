@@ -749,3 +749,98 @@ pub fn users_path() -> std::path::PathBuf {
 /// naming four gigabytes: an oversized declaration becomes an ordinary
 /// integrity error instead of an allocation.
 pub const MAX_RECORD_FRAME_LEN: usize = FRAME_HEADER_LEN + MAX_RECORD_PAYLOAD_LEN;
+
+/// Replace `path` with exactly `records`, atomically.
+///
+/// The counterpart to [`append_record`] for a log that has to be
+/// *rewritten* rather than extended — the one caller is the user log's
+/// compaction, which replaces a history of puts and revocations with one
+/// `Put` per surviving identity.
+///
+/// # Why this is not a loop over `append_record`
+///
+/// Two reasons, and both are the difference between correct and nearly
+/// correct:
+///
+/// * **Atomicity.** Appending into a truncated file leaves every
+///   intermediate state visible on disk, and a crash partway through
+///   would publish a *subset* of the identities as if it were all of
+///   them — silently revoking whoever had not been written yet. Writing
+///   a temp file and renaming means the name resolves to the complete
+///   old log or the complete new one, never to a partial one.
+///
+/// * **Cost.** `append_record` fsyncs per record because each of its
+///   calls is an independent durability boundary. Here the boundary is
+///   the whole file, so it is one fsync plus the rename, not one per
+///   identity.
+///
+/// The protocol is the one the catalog and the checkpoint use: temp file
+/// → `sync_all` → `rename` → `sync_all` the parent directory. Each step
+/// is load-bearing for the same reasons documented there — in
+/// particular, the directory fsync is what makes the rename itself
+/// survive a power loss rather than reverting to the old inode.
+pub fn rewrite_records<T: Serialize>(
+    path: &std::path::Path,
+    records: &[T],
+) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    let mut body = Vec::new();
+
+    for record in records {
+        let bytes = bincode::serialize(record).map_err(|e| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("failed to serialize record: {e}"),
+            )
+        })?;
+
+        body.extend_from_slice(&encode_frame(&crypto::encrypt(&bytes))?);
+    }
+
+    // Built from the full file name rather than with `with_extension`,
+    // which would replace `.users` and leave a temp file whose name says
+    // nothing about what it is. Unique per write so two writers cannot
+    // truncate each other's temp file. Same directory, so the rename
+    // stays within one filesystem and therefore atomic.
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "facetql.log".to_string());
+
+    let tmp = path.with_file_name(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&body)?;
+        // sync_all, not sync_data: the rename publishes this inode, and
+        // an inode whose length has not reached the disk is published as
+        // an empty log — which here means every identity revoked.
+        file.sync_all()?;
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    sync_parent_dir(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}

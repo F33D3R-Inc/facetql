@@ -308,6 +308,11 @@ pub struct StorageEngine {
 
     /// How many mutations to let accumulate before checkpointing.
     checkpoint_interval: u64,
+
+    /// Records currently in `facetql.users`, tracked so the log can be
+    /// compacted when it has grown far past the identities it describes.
+    /// See [`StorageEngine::compact_user_log`].
+    user_log_records: usize,
 }
 
 impl StorageEngine {
@@ -737,6 +742,7 @@ impl StorageEngine {
             applied_sequence: 0,
             pending_mutations: 0,
             checkpoint_interval,
+            user_log_records: 0,
         })
     }
 
@@ -760,9 +766,11 @@ impl StorageEngine {
     pub fn load() -> io::Result<Self> {
         let mut engine = Self::open()?;
 
-        for (_offset, record) in
-            binary::read_all_records::<UserOpRecord>(&binary::users_path())?
-        {
+        let log = binary::read_all_records::<UserOpRecord>(&binary::users_path())?;
+
+        engine.user_log_records = log.len();
+
+        for (_offset, record) in log {
             match record {
                 UserOpRecord::Put(user) => {
                     engine.users.insert(user.token_hash.clone(), user);
@@ -1849,6 +1857,62 @@ impl StorageEngine {
         self.apply_atomic(vec![Operation::RevokeUser(token_hash.to_string())])
     }
 
+    /// Rewrite `facetql.users` as one `Put` per live identity, when the
+    /// log has grown far past the identities it describes.
+    ///
+    /// # Why this exists
+    ///
+    /// The user log is append-only and was the last durable structure
+    /// with no reclamation at all. The heap has compaction, the WAL has
+    /// rotation, the indexes reuse freed pages — this grew forever. Its
+    /// *content* is bounded by the number of identities, but its
+    /// *length* is bounded by the number of administrative operations
+    /// ever performed, and those are not the same thing for any
+    /// deployment that rotates credentials on a schedule. Every startup
+    /// reads the whole file, so the cost of opening the database grew
+    /// with the history of its identities rather than with how many it
+    /// has.
+    ///
+    /// Rewriting is lossless because replay is last-write-wins over a
+    /// total order: a log of one `Put` per surviving identity replays to
+    /// exactly the map that is live right now. Revocations are not
+    /// dropped — they are *applied*, which is the same thing once no
+    /// earlier record survives to be outranked.
+    ///
+    /// # When it runs
+    ///
+    /// Once, at startup, after WAL recovery — the first moment the set
+    /// of live identities is final. Never while serving: an append
+    /// racing the rename would land in the file being replaced.
+    ///
+    /// A failure is reported and non-fatal. The old log is still intact
+    /// and still correct; the only cost is that it stays long.
+    pub fn compact_user_log(&mut self) -> io::Result<()> {
+        // Rewriting costs one pass over the identities, so it should be
+        // rare relative to appends. Four times the live count means an
+        // idle database never rewrites and a heavily-rotated one
+        // amortizes to a constant factor. The floor keeps a database
+        // with a handful of users from rewriting on every restart.
+        let threshold = (self.users.len() * 4).max(64);
+
+        if self.user_log_records <= threshold {
+            return Ok(());
+        }
+
+        let live: Vec<UserOpRecord> = self
+            .users
+            .values()
+            .cloned()
+            .map(UserOpRecord::Put)
+            .collect();
+
+        binary::rewrite_records(&binary::users_path(), &live)?;
+
+        self.user_log_records = live.len();
+
+        Ok(())
+    }
+
     pub fn find_user_by_hash(&self, token_hash: &str) -> Option<&UserRecord> {
         self.users.get(token_hash)
     }
@@ -2497,6 +2561,8 @@ impl StorageEngine {
                     &UserOpRecord::Put(record.clone()),
                 )?;
 
+                self.user_log_records += 1;
+
                 self.users.insert(record.token_hash.clone(), record.clone());
             }
 
@@ -2505,6 +2571,8 @@ impl StorageEngine {
                     &binary::users_path(),
                     &UserOpRecord::Revoke(token_hash.clone()),
                 )?;
+
+                self.user_log_records += 1;
 
                 self.users.remove(token_hash);
             }
@@ -3519,7 +3587,9 @@ mod delete_where_tests {
                 "field": "status",
                 "obj": { "kind": "ref", "name": "item" }
             },
-            "r": { "kind": "lit", "val": status, "vtype": "string" }
+            // "text" is what FCT emits for a string literal; "string"
+            // is not one of its vtypes.
+            "r": { "kind": "lit", "val": status, "vtype": "text" }
         }))
         .expect("valid predicate")
     }

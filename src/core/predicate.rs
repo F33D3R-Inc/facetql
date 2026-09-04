@@ -68,6 +68,46 @@ pub struct Expr {
 /// Returns a JSON `Value` so callers can chain comparisons the same way
 /// SQL does (`(a + b) > c`); top-level callers should expect a `Bool`.
 pub fn eval(expr: &Expr, item_var: &str, data: &Value) -> Result<Value, String> {
+    eval_at(expr, item_var, data, 0)
+}
+
+/// Deepest a predicate may nest.
+///
+/// `Expr` is a tree that arrives from the wire, and `eval` walks it
+/// recursively, so its depth is the recursion depth of this thread. A
+/// stack overflow is not a caught error — it aborts the whole process,
+/// taking every other in-flight request with it — which makes this the
+/// one bound that must not be left to a dependency's default.
+///
+/// `serde_json` does happen to stop at its own nesting limit today, so
+/// this is not a live hole. It is also not a guarantee anyone stated:
+/// it is a constant inside another crate, it protects deserialization
+/// rather than evaluation, and nothing would notice if a future version
+/// raised it or if a predicate ever reached `eval` by another route
+/// (a `delete_where` built in-process, say). Stating the bound here
+/// makes it a property of this evaluator instead of an inherited
+/// accident.
+///
+/// 64 is far past any predicate a compiler emits — FCT's own expressions
+/// nest a handful of levels — and shallow enough to be safe on a small
+/// async task stack.
+const MAX_PREDICATE_DEPTH: usize = 64;
+
+fn eval_at(
+    expr: &Expr,
+    item_var: &str,
+    data: &Value,
+    depth: usize,
+) -> Result<Value, String> {
+    if depth >= MAX_PREDICATE_DEPTH {
+        return Err(format!(
+            "predicate nests deeper than {MAX_PREDICATE_DEPTH} levels; \
+             simplify it or split the query"
+        ));
+    }
+
+    let eval = |e: &Expr| eval_at(e, item_var, data, depth + 1);
+
     match expr.kind.as_str() {
         "lit" => Ok(lit_value(expr)),
 
@@ -101,7 +141,7 @@ pub fn eval(expr: &Expr, item_var: &str, data: &Value) -> Result<Value, String> 
                 .as_deref()
                 .ok_or_else(|| "un expression missing x".to_string())?;
 
-            let value = eval(x, item_var, data)?;
+            let value = eval(x)?;
 
             match expr.op.as_deref() {
                 Some("!") => Ok(Value::Bool(!truthy(&value))),
@@ -132,24 +172,24 @@ pub fn eval(expr: &Expr, item_var: &str, data: &Value) -> Result<Value, String> 
             // `x != null && x.field > 0`) never gets evaluated.
             match expr.op.as_deref() {
                 Some("&&") => {
-                    let lv = eval(l, item_var, data)?;
+                    let lv = eval(l)?;
                     if !truthy(&lv) {
                         return Ok(Value::Bool(false));
                     }
-                    let rv = eval(r, item_var, data)?;
+                    let rv = eval(r)?;
                     Ok(Value::Bool(truthy(&rv)))
                 }
                 Some("||") => {
-                    let lv = eval(l, item_var, data)?;
+                    let lv = eval(l)?;
                     if truthy(&lv) {
                         return Ok(Value::Bool(true));
                     }
-                    let rv = eval(r, item_var, data)?;
+                    let rv = eval(r)?;
                     Ok(Value::Bool(truthy(&rv)))
                 }
                 Some(op) => {
-                    let lv = eval(l, item_var, data)?;
-                    let rv = eval(r, item_var, data)?;
+                    let lv = eval(l)?;
+                    let rv = eval(r)?;
                     eval_bin_op(op, &lv, &rv)
                 }
                 None => Err("bin expression missing op".to_string()),
@@ -250,17 +290,53 @@ fn values_equal(l: &Value, r: &Value) -> bool {
     }
 }
 
+/// A literal's value, in the type its `vtype` declares.
+///
+/// FCT emits exactly three literal types — `int`, `text` and `bool`
+/// (`lower` in `internal/ir/build.go`; `money` and `date` are field
+/// types, never literal kinds) — and each is handled explicitly.
+///
+/// # Why the fallback is the value's own type
+///
+/// The previous fallback stringified anything that was not already a
+/// string, which is right for `text` and wrong for everything else. It
+/// never fired for FCT, which always sets a `vtype`, but a hand-written
+/// request is a documented client of this endpoint (see
+/// `QueryWhereRequest`), and `{"kind":"lit","val":5}` is the obvious way
+/// to write one. Under the old rule that literal became `"5"`, and the
+/// consequences were silent rather than loud:
+///
+/// ```text
+///   item.score == 5    →  Number(3) vs String("5")  →  never matches
+///   item.score != 5    →  ...                       →  matches every row
+/// ```
+///
+/// An ordering comparison at least failed with "requires numeric
+/// operands", but equality just answered the wrong question. A wrong
+/// answer that looks like a valid empty page is the worst outcome
+/// available to a query engine, so an absent or unrecognized `vtype`
+/// now means "this literal is whatever JSON says it is" — which is both
+/// the least surprising reading and a no-op for FCT.
 fn lit_value(expr: &Expr) -> Value {
     let val = expr.val.clone().unwrap_or(Value::Null);
 
     match expr.vtype.as_deref() {
+        // Already an exact integer: keep it, rather than round-tripping
+        // it through `f64` and losing precision past 2^53.
+        Some("int") if val.is_i64() || val.is_u64() => val,
+
         Some("int") => as_f64(&val)
             .map(|n| number_value(n.trunc()))
             .unwrap_or(Value::Null),
+
         Some("bool") => Value::Bool(val.as_bool().unwrap_or(false)),
-        _ => match val {
+
+        // The one type for which coercing a non-string is the intent.
+        Some("text") => match val {
             Value::String(_) => val,
             other => Value::String(other.to_string()),
         },
+
+        _ => val,
     }
 }
