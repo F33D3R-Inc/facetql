@@ -1,263 +1,716 @@
-# FacetQL API Reference — v0.2
+# FacetQL API Reference
 
-This is the surface a client (Swift/iOS, Kotlin/Android, web, Facet, or
-anything else that speaks HTTP+JSON) needs to build against. It documents
-what's actually implemented and tested, not the long-term vision — see
-`SECURITY_NOTES.md` for what's deliberately not built yet.
+Every route below was verified against `create_router` and its handler in
+`src/api/routes.rs` for FacetQL `0.13.0`. Nothing here is carried forward
+from an earlier version of this document.
 
-Base URL: `http://<host>:8080` (no TLS in this checkpoint — see Known Gaps).
+Base URL: `http://<host>:8080` (HTTPS if the server was started with
+`--tls-identity`).
+
+---
 
 ## Authentication
 
-Every route except `GET /` requires an `x-api-key` header. The server maps
-that key to an owner identity via the `ENOCHIAN_TOKENS` environment variable
-it was started with (`token1:alice,token2:bob`). **There is no per-request
-identity field anywhere else in the API** — whatever `owner` ends up on a
-node or edge you create is determined entirely by which token you sent, not
-by anything in the request body. This is intentional: it's what makes
-ownership spoofing impossible from the client side.
+Every route except `GET /` sits behind the auth middleware
+(`src/api/routes.rs:316`, `src/auth.rs:297`).
 
 ```
-x-api-key: <your token>
+x-api-key: <token>
 ```
 
-Missing or unrecognized key → `401 Unauthorized`.
+`GET /events` additionally accepts `?key=<token>` in the query string,
+because browser `EventSource` cannot set headers. There is no
+`Authorization: Bearer` support.
 
-## Data model
+* Missing credential → **401** `missing x-api-key header (or ?key= for SSE)`
+* Unrecognized credential → **401** `invalid x-api-key`
 
-- **Node** — the basic entity. Every node has an `address` (unique ID),
-  a `kind` (free-text entity type — `"Person"`, `"Goal"`, `"Resource"`,
-  whatever your application needs), `data` (an opaque string — put your
-  JSON payload here, the DB doesn't validate its shape), an `owner`, and
-  a `visibility` (`"Private"` or `"Public"`).
-- **Edge** — a directed, typed relationship between two nodes: `from`,
-  `to`, `kind` (free-text, e.g. `"BELONGS_TO"`, `"VERIFIED_BY"`), `owner`.
+The token resolves to an identity of `{owner, role}`. **No request body
+anywhere carries an `owner`** — the owner stamped on a node or edge is
+always the authenticated caller's, which is what makes ownership
+spoofing impossible from the client side.
 
-## Endpoints
+Roles are `User` and `Admin`. An `Admin` bypasses the per-node
+visibility and ownership checks on every path (same idea as a Postgres
+superuser bypassing row-level security). Routes marked **admin** below
+return **403** `admin only` to anyone else.
 
-### `POST /node` — create a node (optionally with edges, atomically)
+### Request body limit
+
+4 MiB by default, applied before any deserialization
+(`FACETQL_MAX_BODY_BYTES`). Over it → **413**.
+
+### CORS
+
+Permissive: any origin, any header, `GET`/`POST`/`PUT`/`DELETE`
+(`src/api/routes.rs:244`). Development-appropriate; narrow before
+exposing publicly.
+
+---
+
+## Object shapes
+
+### Node
 
 ```json
 {
-  "address": "Goal1",
-  "kind": "Goal",
-  "x": 2, "y": 1, "z": 0, "q": 0,
-  "data": "{\"title\":\"Get off the streets\"}",
-  "public": true,
-  "edges": [
-    { "to": "Pers1", "kind": "BELONGS_TO" }
-  ]
+  "address": "post:1",
+  "coordinate": { "x": 0, "y": 0, "z": 0, "q": 0 },
+  "value": 0,
+  "kind": "Post",
+  "data": "{\"title\":\"hello\"}",
+  "owner": "alice",
+  "claimed_by": null,
+  "visibility": "Private"
 }
 ```
 
-- `x/y/z/q` are the coordinate fields — pick any values for now; nothing
-  currently depends on their meaning beyond identifying the node's position
-  in the grid. `address` must be unique.
-- `edges` is optional. If present, each edge is created from the new node
-  to an **existing** node right after the node itself. See "Atomicity" below
-  for exactly what happens if one fails.
-- `owner` is NOT a field here — see Authentication.
+`visibility` is `"Private"` or `"Public"`. `data` is an opaque string —
+the server never validates its shape, and only parses it as JSON to
+evaluate a `where` predicate or build a declared index key. `value` is
+always `0`; nothing writes it. `coordinate` is stored and returned but
+not interpreted by any read or write path.
 
-**Success — `201 Created`:**
+### Edge
+
 ```json
-{ "address": "Goal1", "edges_created": [ { "from": "Goal1", "to": "Pers1", "kind": "BELONGS_TO", "owner": "alice" } ] }
+{ "from": "person:1", "to": "post:1", "kind": "AUTHORED", "owner": "alice" }
 ```
 
-**Failure (e.g. an edge target doesn't exist) — `400 Bad Request`:**
+Identity is `(from, to, kind)`. `owner` is not part of it; it decides who
+may delete the edge.
+
+### HistoryEntry
+
 ```json
-{ "error": "edge 'to' address not found: DoesNotExist", "edges_created_before_failure": [] }
+{
+  "address": "post:1",
+  "archived_at_unix": 1730000000,
+  "node": { "...": "the full node as it was" },
+  "version": 41
+}
 ```
 
-#### Atomicity — read this before you rely on it
+### Error bodies
 
-If any edge in the `edges` list fails, the server tombstones (deletes) the
-node it just created, so you never end up with a live node that's missing
-an expected relationship — verified with a live test. **What it does NOT
-do:** roll back edges that succeeded *before* the failing one. If you send
-three edges and the second one fails, the first edge still exists pointing
-at a now-deleted node. For the common case — one node, one edge — this is
-fully safe. For multi-edge creates, check `edges_created`/
-`edges_created_before_failure` in the response and clean up if needed.
+Plain text with the status, except three JSON-bodied cases: `POST /node`
+(both outcomes), `POST /nodes/query` success, and the admin/stats reads.
 
-### `GET /node/:address` — read one node
+---
 
-Returns the node if it's public, or if you're the owner. Otherwise `403`.
-`404` if it doesn't exist (including if it was deleted).
+## Nodes
 
-### `PUT /node/:address` — update a node
+### `POST /node`
+
+Create or overwrite a node, optionally with outgoing edges, as one
+crash-atomic mutation.
+
+```json
+{
+  "address": "post:1",
+  "kind": "Post",
+  "x": 0, "y": 0, "z": 0, "q": 0,
+  "data": "{\"title\":\"hello\"}",
+  "public": true,
+  "edges": [ { "to": "person:1", "kind": "AUTHORED" } ],
+  "if_absent": false
+}
+```
+
+| field | required | notes |
+|---|---|---|
+| `address` | yes | client-supplied identity |
+| `kind` | yes | free text |
+| `x`,`y`,`z`,`q` | yes | `u8` each; stored, not interpreted |
+| `data` | yes | opaque string |
+| `public` | no | `true` → `Public`, absent/`false` → `Private` |
+| `edges` | no | each `{to, kind}`; `from` is the new node |
+| `if_absent` | no | `true` → fail with 409 instead of overwriting |
+
+Every edge target must already exist, or be the node being created. The
+node, its history entry (if it replaced something) and all N edges are
+staged in one `BEGIN…COMMIT` frame — they become visible together or not
+at all.
+
+**201 Created**
+
+```json
+{ "address": "post:1",
+  "edges_created": [ { "from": "post:1", "to": "person:1", "kind": "AUTHORED", "owner": "alice" } ] }
+```
+
+**400 Bad Request**
+
+```json
+{ "error": "edge 'to' address not found: nope", "edges_created_before_failure": [] }
+```
+
+`edges_created_before_failure` is now **always empty** — the batch is
+atomic, so there is no such thing as an edge created before the failure.
+The field is retained for wire compatibility.
+
+**409 Conflict** — `if_absent: true` and the address exists:
+`node already exists: <address>`.
+
+> **Known gap:** this route does *not* check ownership on overwrite.
+> Writing to an address another identity owns replaces their node and
+> transfers ownership to the caller. `PUT`, `DELETE` and every
+> transaction op do check.
+
+### `GET /node/:address`
+
+**200** the Node · **403** `not authorized to read this node` · **404**
+`node not found` · **500** on a storage failure.
+
+Readable if it is `Public`, or you own it, or you are an admin.
+
+### `PUT /node/:address`
 
 ```json
 { "data": "{\"title\":\"updated\"}", "public": false }
 ```
-Owner-only (`403` otherwise). Full replace of `data`/`visibility` — there's
-no partial-field patch.
 
-### `DELETE /node/:address` — delete a node
+Full replacement of `data`; `public` is optional and only changes
+visibility when present. There is no partial patch. The previous state
+is archived to history automatically.
 
-Owner-only. `204 No Content` on success. This is a tombstone, not a byte
-erasure — the historical record isn't recoverable through the API, but the
-raw log isn't scrubbed either (see `SECURITY_NOTES.md` if that distinction
-matters for your compliance requirements).
+**200** `Node updated` · **403** `not authorized to modify this node` ·
+**404** `node not found` · **500**.
 
-### `GET /node/:address/owned` — list everything you own
+### `DELETE /node/:address`
 
-Returns every live node whose owner matches your authenticated identity.
+**204 No Content** · **403** `not authorized to delete this node` ·
+**404** `node not found` · **500**.
 
-### `POST /transaction` — multiple operations, validated and applied together
+The removed state is archived to history first. Removing the index entry
+is what makes the node gone; the record's bytes remain in the heap until
+compaction reclaims them.
+
+### `GET /node/:address/history`
+
+Every archived previous state, oldest first, as an array of
+`HistoryEntry`. Does **not** include the current live value. Empty array
+if the node was never overwritten.
+
+Authorized against the node's **current** owner and visibility — a node
+that changed hands shows its full history to whoever owns it now.
+
+**200** `[HistoryEntry, …]` · **403** · **404** · **500**.
+
+### `GET /node/:address/owned`
+
+Every live node owned by the **authenticated caller**.
+
+> The `:address` path segment is accepted and **entirely ignored** —
+> the handler takes no path parameter (`src/api/routes.rs:537`). Pass
+> anything; you get your own nodes.
+
+**200** `[Node, …]` · **500**.
+
+Not paginated. Refuses with **400** past `FACETQL_MAX_SCAN_ROWS`
+(100 000) rather than truncating.
+
+### `POST /node/:address/claim`
+
+Atomically claim a node for the caller if nobody holds it. No request
+body. This is the `FOR UPDATE SKIP LOCKED` primitive for a durable job
+queue: the check and the write happen inside one mutation, so exactly
+one concurrent caller wins.
+
+**200** `claimed` · **404** `node not found` · **409**
+`already claimed by <owner>` · **500**.
+
+There is no unclaim route; release a claim by overwriting the node.
+
+---
+
+## Listing and querying
+
+### `GET /nodes`
+
+```
+GET /nodes?kind=Post&owner=alice&limit=20&offset=0
+```
+
+All parameters optional. `limit` defaults to 50, capped at 500. `offset`
+defaults to 0 and is refused past `FACETQL_MAX_QUERY_OFFSET` (10 000)
+with **400**.
+
+The access path is chosen from the filters: `kind` given → kind index;
+`owner` only → owner index; neither → primary index scan.
+
+Visibility: a `User` sees public nodes plus its own; an `Admin` sees
+everything matching the filter.
+
+**200** — a **bare JSON array**, not an object:
+
+```json
+[ { "address": "post:1", "...": "..." } ]
+```
+
+### `POST /nodes/query`
+
+Predicate pushdown, in-engine ordering, and keyset pagination. The field
+names mirror FCT's `runtime.Query`.
 
 ```json
 {
-  "operations": [
-    {"type":"insert_node","address":"Goal1","kind":"Goal","x":2,"y":1,"z":0,"q":0,"data":"{}","public":true},
-    {"type":"insert_edge","from":"Goal1","to":"Pers1","kind":"BELONGS_TO"},
-    {"type":"delete_node","address":"OldGoal"}
-  ]
+  "kind": "Post",
+  "owner": "alice",
+  "where": { "kind": "bin", "op": ">", "l": {...}, "r": {...} },
+  "item_var": "item",
+  "order": "created_at",
+  "desc": true,
+  "after": "eyJvIjoxNzMwMDAwMDAwLCJhIjoicG9zdDoxIn0",
+  "limit": 20,
+  "offset": 0
 }
 ```
 
-An edge can reference a node created earlier in the same batch. If ANY
-operation is invalid (bad edge target, delete target not found/not
-yours), **nothing in the batch is applied** — verified live, including
-that a node which would have succeeded on its own doesn't get created if
-a later operation in the same batch fails.
+| field | default | notes |
+|---|---|---|
+| `kind` | — | optional exact match |
+| `owner` | — | optional exact match |
+| `where` | — | optional `Expr` (below); omitted = no predicate |
+| `item_var` | `"item"` | loop variable the predicate's field accesses name |
+| `order` | — | top-level `data` field; `"id"` or absent = order by `address` |
+| `desc` | `false` | reverse the ordering |
+| `after` | — | opaque cursor from the previous page's `next` |
+| `limit` | `50` | capped at 500 |
+| `offset` | `0` | ignored when `after` is present; else capped at 10 000 |
 
-**Not** crash-mid-commit-safe yet — see `SECURITY_NOTES.md` for exactly
-what guarantee this does and doesn't provide.
-
-### `POST /node/:address/claim` — atomic job claim
-
-No body. Claims the node for the authenticated identity if nobody has yet.
-
-**Success — `200 OK`**, body `claimed`.
-**Already claimed — `409 Conflict`**, body `already claimed by <owner>`.
-
-Safe under real concurrency — verified with genuinely simultaneous requests
-from multiple identities; exactly one wins.
-
-### `GET /events` — live change feed (Server-Sent Events)
-
-Connect and keep the connection open (`curl -N`, or `EventSource` in a
-browser/native client). Every successful write anywhere in the database — 
-node created/updated/deleted, edge created, node claimed, user
-created/revoked, transaction committed — is pushed here as it happens.
-
-**Auth for this endpoint specifically:** browser `EventSource` can't set
-custom headers, so if `x-api-key` is absent this endpoint also accepts
-`?key=<token>` in the URL. Real security tradeoff: a token in a URL can
-end up in logs in a way a header wouldn't — use the header everywhere
-else, this fallback exists only because SSE from a browser has no other
-option today.
-
-**Known gap:** this is currently unfiltered — every connected subscriber
-sees every event regardless of node ownership/visibility. Do not point this
-at anything with sensitive multi-owner data yet; see `SECURITY_NOTES.md`.
-
-## CORS
-
-Enabled and permissive (`Access-Control-Allow-Origin: *`) so a browser
-page on any origin can call this API — needed for `facetql-console.html`
-(or any other browser-based client) to work at all during development.
-**Narrow this before running anything public** — see `cors_layer()` in
-`src/api/routes.rs`.
-
-### `GET /nodes?kind=&owner=&limit=&offset=` — the query endpoint
-
-This is the one to build list views against. All params optional:
-
-- `kind` — exact match on the `kind` field (`?kind=Goal`)
-- `owner` — exact match on owner (`?owner=alice`)
-- `limit` — default 50, capped at 500
-- `offset` — for pagination
-
-Applies the same visibility rule as a single GET — you only see nodes that
-are public or that you own, regardless of filters.
-
-```
-GET /nodes?kind=Goal&owner=alice&limit=20
-```
-
-### `POST /edge` — create a relationship directly
+**200**
 
 ```json
-{ "from": "Pers1", "to": "Goal1", "kind": "HAS_GOAL" }
+{ "nodes": [ { "...": "Node" } ], "next": "eyJvIjoxNzI5OTk5OTk5LCJhIjoicG9zdDo3In0" }
 ```
-Both `from` and `to` must already exist, or `400`. Owner is your
-authenticated identity, same rule as nodes.
 
-### `GET /node/:address/history` — every archived previous state
+`next` is `""` on the last page. Otherwise feed it back as `after`.
+Anything else — a bad cursor, an unevaluable predicate, an over-limit
+offset, a scan that would exceed `FACETQL_MAX_SCAN_ROWS` — is **400**
+with the reason in the body. A predicate the engine cannot evaluate is
+always an error, never a partial or wrong result set.
 
-Returns every prior value this node has ever had, oldest first, as full
-node snapshots (not just the `data` field — owner, visibility, kind too,
-as they were at that point). Does NOT include the current live value —
-that's the plain `GET /node/:address`. Empty array if the node has never
-been overwritten. Every `PUT` archives the value it's about to replace,
-automatically, no opt-in needed.
+#### The cursor
+
+Opaque to the client: base64url of compact JSON `{"o":<order value or
+omitted>,"a":"<address>"}`, capped at 4 KiB
+(`Cursor`, `src/storage/engine.rs`). The ordering is the composite
+`(order_field, address)` — `address` is the stable tiebreak that keeps
+the total order deterministic when order values collide — and the next
+page selects rows *strictly past* the cursor in the requested direction.
+Paging is therefore stable under concurrent inserts and deletes in a way
+`offset` is not.
+
+The same cursor works whether the query is served by a declared index or
+by the sort path, so declaring or dropping an index never invalidates an
+outstanding cursor.
+
+#### Which access path serves it
+
+Chosen in this order (`StorageEngine::query_where`):
+
+1. **Equality prefix.** `kind` is given and `where` pins a field covered
+   by a declared index to a literal — `item.f == <lit>`, at the top level
+   or under `&&`, with a non-null literal — and either no `order` or an
+   `order` on that same field. Only the entries holding that value are
+   read.
+2. **Address range scan.** `order` absent or `"id"`. One page read.
+3. **Declared-index range scan.** `order` names a field with a declared
+   index over `(kind, field)`. One page read, no scan-row ceiling.
+4. **Materialize and sort.** Everything else: every matching candidate is
+   held in memory, sorted by `(order_field, address)`, and the page is
+   cut out. Bounded by `FACETQL_MAX_SCAN_ROWS`; over it, **400** rather
+   than a truncated answer.
+
+The result is identical whichever path runs — the predicate is evaluated
+in full on every candidate in all four. Only the cost differs.
+
+#### `Expr` — the predicate
+
+Wire-compatible with FCT's `ir.Expr` (`src/core/predicate.rs`). Fields:
+`kind`, `val`, `vtype`, `name`, `field`, `obj`, `key`, `op`, `args`,
+`l`, `r`, `x`, `var`, `where`. The evaluated subset is:
+
+* `{"kind":"lit","val":…,"vtype":"int"|"text"|"bool"}` — a literal.
+  With no `vtype`, the literal is whatever JSON says it is.
+* `{"kind":"get","obj":{"kind":"ref","name":"<item_var>"},"field":"f"}`
+  — read `data.f`. A `get` whose object is not a reference to
+  `item_var` is rejected.
+* `{"kind":"un","op":"!"|"-","x":…}`
+* `{"kind":"bin","op":…,"l":…,"r":…}` with
+  `== != < <= > >= + - * / % && ||`. `&&`/`||` short-circuit. `+`
+  concatenates when both sides are strings, otherwise adds. Ordering
+  comparisons require numeric operands.
+
+Anything else — a `call`, a `filter`, a nested object access — is
+rejected with a message naming what could not be evaluated, so a client
+can fall back to filtering its own rows. Nesting deeper than 64 levels
+is refused.
+
+Example — `item.status == "open" && item.score > 10`:
 
 ```json
-[
-  { "address": "Doc1", "archived_at_unix": 1784602708, "node": { "...": "full node as it was" } },
-  { "address": "Doc1", "archived_at_unix": 1784602710, "node": { "...": "the next state" } }
-]
+{"kind":"bin","op":"&&",
+ "l":{"kind":"bin","op":"==",
+      "l":{"kind":"get","obj":{"kind":"ref","name":"item"},"field":"status"},
+      "r":{"kind":"lit","val":"open","vtype":"text"}},
+ "r":{"kind":"bin","op":">",
+      "l":{"kind":"get","obj":{"kind":"ref","name":"item"},"field":"score"},
+      "r":{"kind":"lit","val":10,"vtype":"int"}}}
 ```
 
-Read-only — there's no "restore to version N" call yet. To revert,
-fetch the version you want and `PUT` its data yourself.
+---
 
-### `GET /node/:address/edges/out` / `GET /node/:address/edges/in`
+## Edges
 
-Outgoing and incoming edges for a node. Gated by whether you can read the
-node itself — private node, private edge list, even to someone who could
-otherwise see the edge's other endpoint.
+### `POST /edge`
 
-## Error shape
+```json
+{ "from": "person:1", "to": "post:1", "kind": "AUTHORED" }
+```
 
-Most errors are plain-text bodies with the relevant HTTP status
-(`401`/`403`/`404`/`400`/`500`). The two JSON-shaped exceptions are the
-`POST /node` success/failure bodies documented above, since those need to
-carry structured edge-creation results.
+Both endpoints must already exist. **Upsert on identity**: re-asserting
+the same `(from, to, kind)` lands on the same entry rather than beside
+it — but replacing an edge owned by someone else is refused, because the
+owner is who may retract it.
 
-## Roles and admin
+**201** `Edge created` · **400** with the reason (`edge 'from' address
+not found: …`, `edge … is owned by …`).
 
-Every identity is `User` or `Admin`. An Admin bypasses ownership checks
-entirely on reads/writes/queries — the same idea as a Postgres superuser.
-Bootstrap your first admin via `ENOCHIAN_TOKENS=token:owner:admin`; create
-every subsequent user through the API below instead of growing that env var.
+### `DELETE /edge`
 
-### `POST /admin/users` — create a user (admin only)
+Addressed by **request body**, not by path — `from`, `to` and `kind` are
+arbitrary strings that may contain `/`, and a path segment cannot carry
+one without an escaping convention both sides must get right
+(`src/api/routes.rs:124-147`).
+
+```json
+{ "from": "person:1", "to": "post:1", "kind": "AUTHORED" }
+```
+
+The edge's owner, or an admin. **204** · **403** `not authorized to
+delete this edge` · **404** `edge not found` · **500**.
+
+### `GET /node/:address/edges/out` · `GET /node/:address/edges/in`
+
+Outgoing and incoming edges for one node, as `[Edge, …]`. Gated by
+whether you can read the node itself, not by who owns each edge.
+
+**200** · **403** · **404** `node not found` · **500**.
+
+---
+
+## Transactions
+
+### `POST /transaction`
+
+```json
+{ "operations": [ { "type": "insert_node", "...": "..." } ] }
+```
+
+Each operation is tagged by `"type"` with snake_case values. `owner` and
+`is_admin` are stamped onto every op from the authenticated identity —
+a batch cannot ask to act as somebody else.
+
+The batch is resolved and validated in full against a staged view of the
+data (live state overlaid with what the batch has done so far) before a
+byte is written, then staged into one durable `BEGIN … COMMIT` frame,
+then applied. A crash before the `COMMIT` is durable discards the whole
+batch; a crash after it replays the whole batch.
+
+#### `insert_node`
+
+```json
+{ "type": "insert_node", "address": "post:1", "kind": "Post",
+  "x": 0, "y": 0, "z": 0, "q": 0, "data": "{}", "public": false }
+```
+
+Upsert. Unlike `POST /node`, overwriting an address owned by a different
+identity **aborts the batch** (`address X is owned by Y`). An overwrite
+archives the previous state.
+
+#### `delete_node`
+
+```json
+{ "type": "delete_node", "address": "post:1" }
+```
+
+Targeted, so it is strict: the handler pre-checks under the same write
+lock the engine will use and returns **403** `not authorized to delete
+<address>` or **404** `delete target not found: <address>` before
+anything is written. Deleting an address this same batch already removed
+is a no-op, not an error. The removed state is archived.
+
+#### `insert_edge`
+
+```json
+{ "type": "insert_edge", "from": "person:1", "to": "post:1", "kind": "AUTHORED" }
+```
+
+Endpoints are checked against the staged view: an edge may reference a
+node this batch inserted **earlier**, but not one it deleted, and not one
+inserted later.
+
+#### `delete_edge`
+
+```json
+{ "type": "delete_edge", "from": "person:1", "to": "post:1", "kind": "AUTHORED" }
+```
+
+Targeted like `delete_node`: **403** or **404** rather than a silent
+skip. `owner` is never taken from the body — it is not part of an edge's
+identity.
+
+#### `clear_kind`
+
+```json
+{ "type": "clear_kind", "kind": "Post" }
+```
+
+Remove every node of `kind` the caller may write, as one all-or-nothing
+step. Never rejects on authorization: a non-admin clears only its own
+nodes of that kind and an admin clears all of them — non-writable nodes
+are skipped, not an error. Each removed node is archived. Driven by the
+kind index, so the cost is the kind, not the database.
+
+#### `delete_where`
+
+```json
+{ "type": "delete_where", "kind": "__session",
+  "where": { "kind": "bin", "op": "<", "...": "..." } }
+```
+
+`clear_kind`'s predicated superset. Selection is: kind matches **and**
+the caller may write it **and** (when `where` is present) the predicate
+holds against the decoded `data`. Omitting `where` is exactly
+`clear_kind`. The predicate runs through the same `predicate::eval` the
+query path uses, so a bulk delete selects the rows the equivalent query
+would return. An unevaluable predicate is a **400** that aborts the whole
+batch before anything is written — never a wrong or partial delete. The
+loop variable is `"item"` (this op carries no `item_var`).
+
+#### `set_if`
+
+Compare-and-set on one field of one node.
+
+```json
+{ "type": "set_if", "address": "cron:nightly", "field": "next_run",
+  "expect_le": 1730000000,
+  "set": { "next_run": 1730086400, "owner_worker": "w1" } }
+```
+
+Exactly one expectation must be given, or **400**:
+
+| expectation | holds when |
+|---|---|
+| `expect_le: <number>` | the field is a number and is ≤ this (lease / deadline) |
+| `expect_eq: <value>` | the field equals this exactly (version CAS) |
+| `expect_absent: true` | the field is unset or `null` (create-once) |
+
+`expect_absent: false` states no condition and counts as "not given".
+`set` is **merged** into the node's `data`, so unrelated fields are not
+clobbered. The target must exist and be writable by the caller. A won CAS
+archives the previous state.
+
+**Responses**
+
+* **200** `transaction committed`
+* **400** the batch was invalid — nothing was applied
+* **403** / **404** from the `delete_node` / `delete_edge` pre-checks
+* **412 Precondition Failed** a `set_if` condition did not hold. Nothing
+  in the batch was applied: you lost the race.
+* **500** the batch was fine; the storage was not
+
+On success the batch publishes one `transaction_committed` event naming
+the node addresses it touched, to the caller's own audience.
+
+**Size:** the *lowered* batch is capped at
+`FACETQL_MAX_TRANSACTION_OPS` (50 000). One wire op can lower into many
+— `clear_kind` over a large kind is one delete plus one archive per node
+— so the check is on the resolved list, not on the request.
+
+---
+
+## Events
+
+### `GET /events` — Server-Sent Events
+
+Open and hold the connection (`curl -N`, or `EventSource`). Auth via
+`x-api-key` or `?key=<token>`.
+
+Every event carries an audience stamped by the handler that wrote it, and
+a subscriber receives only the events that admit it
+(`src/database.rs:286-327`):
+
+* an event about a **public** node → everyone
+* an event about a **private** node → its owner, plus admins
+* an edge event → everyone only when **both** endpoints are public,
+  otherwise the edge owner plus admins
+* a `transaction_committed` → the caller, plus admins
+* a `user_created` / `user_revoked` → the acting admin, plus admins
+
+Payloads are JSON strings:
+
+```json
+{"event":"node_created","address":"post:1","kind":"Post"}
+{"event":"node_updated","address":"post:1"}
+{"event":"node_deleted","address":"post:1"}
+{"event":"node_claimed","address":"job:1","worker":"w1"}
+{"event":"edge_created","from":"a","to":"b","kind":"AUTHORED"}
+{"event":"edge_deleted","from":"a","to":"b","kind":"AUTHORED"}
+{"event":"transaction_committed","addresses":["post:1","post:2"]}
+{"event":"user_created","owner":"bob","created_by":"root"}
+{"event":"user_revoked","owner":"bob"}
+```
+
+Events are best-effort notifications, never the source of truth. The
+channel retains 1024 events; a subscriber that falls behind silently
+misses some and the stream continues.
+
+### `POST /publish`
+
+```json
+{ "payload": "anything you like" }
+```
+
+Puts an arbitrary application message on the same feed — the
+LISTEN/NOTIFY replacement. The audience comes from the caller's identity,
+never from the body: an **admin** reaches everyone; anyone else reaches
+their own subscribers and admins.
+
+**200** `published` · **413** if the payload exceeds 64 KiB.
+
+---
+
+## Administration
+
+### `GET /stats` — admin
+
+```json
+{
+  "node_count": 1024,
+  "edge_count": 96,
+  "user_count": 3,
+  "history_entries": 512,
+  "kinds": [ { "kind": "Post", "count": 900 }, { "kind": "Person", "count": 124 } ],
+  "reads_total": 88123,
+  "writes_total": 4021,
+  "storage": { "page_size": 16384, "segments": 3, "pages": 812, "obsolete_bytes": 190233 }
+}
+```
+
+Structural counts come off the indexes' own entry counters and are free.
+`kinds` walks the kind index (index-only, but proportional to the number
+of nodes) and is sorted by kind. `reads_total`/`writes_total` are
+process-lifetime counters that reset on restart — difference two samples
+for a rate.
+
+**200** · **403** `admin only`.
+
+### `POST /admin/users` — admin
 
 ```json
 { "owner": "bob", "role": "user" }
 ```
-`role` is `"admin"` or `"user"` (defaults to `"user"` if omitted).
 
-**Success — `201 Created`:**
+`role` is `"admin"`, `"user"`, or omitted (defaults to `"user"`). An
+unknown value is **400**.
+
+**201**
+
 ```json
-{ "owner": "bob", "role": "User", "token": "f949ad35..." }
+{ "owner": "bob", "role": "User", "token": "f949ad35…" }
 ```
-The token is shown **exactly once**, here. It's stored only as a hash —
-there's no way to retrieve it again. If it's lost, revoke and recreate.
 
-### `GET /admin/users` — list persistent users (admin only)
+The token is shown **exactly once**. Only its SHA-256 hash is stored;
+there is no way to retrieve it again. If it is lost, revoke and recreate.
 
-Returns `[{ "owner": "bob", "role": "User" }, ...]` — never tokens or
-hashes. Does **not** include static `ENOCHIAN_TOKENS` bootstrap identities,
-only ones created through this API.
+### `GET /admin/users` — admin
 
-### `DELETE /admin/users/:owner` — revoke a user (admin only)
+**200** `[ { "owner": "bob", "role": "User" }, … ]`. Never tokens or
+hashes. Does **not** include `ENOCHIAN_TOKENS` bootstrap identities.
 
-Immediately invalidates that owner's token(s). `204` on success, `404` if
-no persistent user has that owner name (a static bootstrap identity isn't
-revocable this way — remove it from `ENOCHIAN_TOKENS` and restart instead).
+### `DELETE /admin/users/:owner` — admin
 
-## Known gaps a client team should plan around
+Revokes every persistent record for that owner.
 
-- **No TLS.** Put this behind a reverse proxy (nginx/Caddy) that terminates
-  TLS before this goes anywhere near production traffic or a mobile client.
-- **No pushed/real-time updates.** Everything here is request/response;
-  there's no websocket/SSE feed yet if Project Interstate needs live updates
-  (e.g. "notify the app the moment a step gets verified").
-- **`data` is an opaque string, not validated JSON.** The server will
-  happily store garbage in `data` — schema validation is the client's job
-  for now (or Facet's, if that's the layer in front of this).
-- **No batch/multi-node reads.** One `GET /node/:address` per node; there's
-  no "give me these 20 addresses" endpoint yet.
+**204** · **404** `no persistent user with that owner`. A bootstrap
+identity cannot be revoked this way — edit `ENOCHIAN_TOKENS` and
+restart.
+
+### `POST /admin/indexes` — admin
+
+Declare an index over one top-level `data` field of one kind.
+
+```json
+{ "name": "post_created", "kind": "Post", "field": "created_at" }
+```
+
+* `name` — 1–64 bytes, `[A-Za-z0-9_-]` only (it becomes the filename
+  `facetql.idx.data.<name>`).
+* `kind` — the node kind the index covers. Per-kind because `data` has
+  no schema across kinds.
+* `field` — the top-level field, the same name you would pass as
+  `order` on `POST /nodes/query`.
+
+**This call reads every existing node of the kind**, twice over: once to
+prove every existing value produces an admissible key, and once to
+backfill. It therefore costs the size of the kind. It is a logged,
+crash-atomic mutation (WAL `CreateIndex`) whose replay is idempotent.
+
+**201** — the stored definition:
+
+```json
+{ "name": "post_created", "kind": "Post", "field": "created_at" }
+```
+
+**409 Conflict** — a *different* index already holds that name, or
+another index already covers that `(kind, field)`. Re-declaring the
+**identical** index is a successful 201, so a setup script may run twice.
+
+**400 Bad Request** — a name/kind/field the storage layer cannot honour,
+or a kind that already contains a value whose encoding exceeds 512 bytes
+(`cannot index Post.body: node 'post:9' field 'body' is 900 bytes
+encoded, over the 512-byte maximum for index 'post_body'`). Nothing is
+logged in that case: the index is simply not created.
+
+Once declared, a write producing an oversized encoded value for that
+index is rejected too — again before anything reaches the WAL, because a
+logged-but-unapplicable mutation would fail every subsequent startup.
+
+### `GET /admin/indexes` — admin
+
+**200** `[ { "name": …, "kind": …, "field": … }, … ]`, in name order.
+
+### `DELETE /admin/indexes/:name` — admin
+
+**204** · **404** `no index named '<name>'`.
+
+Queries the index was serving keep working — they fall back to the
+materialize-and-sort path, which is slower and bounded by
+`FACETQL_MAX_SCAN_ROWS`, not wrong.
+
+---
+
+## `GET /` — liveness
+
+The one unauthenticated route. **200**, body `FacetQL Online`.
+
+---
+
+## Status codes, at a glance
+
+| code | meaning |
+|---|---|
+| 200 | OK |
+| 201 | node / user / index created, edge created |
+| 204 | deleted (node, edge, user, index) |
+| 400 | malformed request, invalid batch, unevaluable predicate, bad cursor, over a scan/offset bound |
+| 401 | missing or invalid `x-api-key` |
+| 403 | authenticated but not permitted (ownership, or `admin only`) |
+| 404 | no such node / edge / user / index |
+| 409 | `if_absent` collision, already-claimed node, contradictory index declaration |
+| 412 | a `set_if` precondition did not hold; nothing in the batch applied |
+| 413 | request body over `FACETQL_MAX_BODY_BYTES`, or `/publish` payload over 64 KiB |
+| 500 | storage failure — the request was fine, the disk was not |

@@ -53,6 +53,81 @@ can't silently clobber something.
 facetql restore ~/facetql-backups/2026-07-20
 ```
 
+## `facetql index <action>`
+
+Declares, lists and drops **secondary indexes over a node's `data`
+fields** — admin only, and a client of a *running* server (it goes
+through `POST/GET/DELETE /admin/indexes`, so start the server first).
+
+An index is a declaration that one top-level field of one `kind` is worth
+keeping in sorted order. It changes what a read *costs*, never what it
+returns:
+
+- Without one, `POST /nodes/query` with `--order <field>` materializes
+  every matching row and sorts it. That path is bounded by
+  `FACETQL_MAX_SCAN_ROWS` and **fails outright** once a kind grows past
+  the bound.
+- With one, the same query walks an already-ordered access path and stops
+  at `--limit` — a range scan, not a sort.
+
+An index covers exactly one `kind` and one top-level `data` field. It is
+per-kind because `data` has no schema across kinds: `created_at` on a
+`Post` and `created_at` on a `Session` are unrelated fields that happen
+to share a name. It is top-level because that is what `query --order` can
+name — an index on a path no query can express would be an index no query
+could use.
+
+```
+facetql index create post_created --kind Post --field created_at --token <admin-token>
+facetql index list
+facetql index drop post_created
+```
+
+### `facetql index create <name> --kind <Kind> --field <field>`
+
+Declares the index and **backfills it**, which reads every existing node
+of that kind once. The command therefore costs the size of the kind — run
+it when that's affordable, not in a hot path.
+
+Re-declaring the *identical* index (same name, kind and field) is a
+successful no-op, so a provisioning script is safe to run twice. A
+*different* index under a name already in use, or a second index over a
+field already covered, is a conflict (HTTP 409) — those are
+contradictions, not repeats.
+
+`<name>` may contain only letters, digits, `_` and `-`, up to 64 bytes:
+the name becomes part of the index's filename on disk, so anything that
+could be read as a path is rejected — before the request is sent, as a
+usage error (exit 2).
+
+### `facetql index list`
+
+Prints every declared index as a `NAME` / `KIND` / `FIELD` table, or the
+raw server JSON under `--json`.
+
+### `facetql index drop <name> [--yes]`
+
+Removes the index. **This never breaks a query** — one that was being
+served by the index simply falls back to the materialize-and-sort path.
+It prompts for confirmation anyway (`--yes` skips) because rebuilding
+costs another full read of the kind, and because queries that were fast
+range scans become sorts bounded by `FACETQL_MAX_SCAN_ROWS`. Dropping a
+name that was never declared is an error (HTTP 404), not a silent
+success.
+
+| Flag / env var | Required? | Default | What it does |
+|---|---|---|---|
+| `--kind` | `create` only | — | Node `kind` the index covers |
+| `--field` | `create` only | — | Top-level `data` field to keep ordered |
+| `--yes` | no | off | `drop` only — skip the confirmation prompt |
+| `--url` / `FACETQL_URL` | no | `http://localhost:8080` | Server to talk to |
+| `--token` / `FACETQL_TOKEN` | yes | — | Admin token, sent as `x-api-key` |
+| `--json` | no | off | Emit the server's raw JSON instead of a table |
+
+Exit codes match every other client command: `2` for a usage mistake (bad
+name, missing token), `1` for a transport failure or a non-2xx response,
+`3` when a confirmation prompt is declined.
+
 ## `facetql import postgres`
 
 Pulls rows from an existing Postgres table in, one row = one FacetQL
@@ -92,10 +167,12 @@ facetql import postgres \
 | `FACETQL_TOKENS` | Bootstrap identities, e.g. `token1:alice,token2:bob:admin` (the `:admin` suffix marks that identity as Admin) |
 | `FACETQL_DATA_DIR` | Same as `--data-dir` |
 | `FACETQL_PORT` | Same as `--port` |
-| `FACETQL_TOKEN` | Default `--token` for `import postgres` |
+| `FACETQL_TOKEN` | Default `--token` for every client command (`index`, `user`, `get`, `put`, `delete`, `query`, `stats`). Prefer it over `--token` so the token never lands in shell history |
+| `FACETQL_URL` | Default `--url` for every client command |
+| `FACETQL_MAX_SCAN_ROWS` | Ceiling on rows a sort-path query may materialize. A declared index turns that query into a range scan, so it is no longer subject to this bound |
 
 ## What's NOT a CLI command (common asks that don't exist yet)
 
 - No `facetql stop` — it's a foreground process; stop it the normal way (Ctrl+C, or however your process manager/systemd handles it)
-- No `facetql users` — user management is via the HTTP API (`POST/GET/DELETE /admin/users`), not the CLI, since it needs a running server anyway
-- No `facetql query` / interactive shell — there's no `psql`-style REPL yet; use the HTTP API or `facetql-console.html`
+- No interactive shell — there's no `psql`-style REPL. `facetql query --kind <Kind>` runs one native predicate query and exits; for anything more, use the HTTP API or `facetql-console.html`
+- No index over a nested `data` path, and no multi-field index — an index covers exactly one top-level field of one kind, which is what `query --order` can name

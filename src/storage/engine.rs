@@ -14,7 +14,7 @@ use crate::storage::binary::{self, UserOpRecord};
 use crate::storage::cache::RecordCache;
 use crate::storage::catalog::Catalog;
 use crate::storage::heap::{HeapRecord, RecordStore};
-use crate::storage::index::{self as keys, Indexes};
+use crate::storage::index::{self as keys, IndexDef, IndexOpRecord, Indexes};
 use crate::storage::location::RecordLocation;
 use crate::storage::transaction::{Operation, Transaction};
 use crate::storage::wal;
@@ -432,7 +432,8 @@ impl StorageEngine {
                 // become durable: recovery would replay it into the
                 // same refusal on every subsequent start. See
                 // `Operation::validate`.
-                operation.validate()?;
+                let declared = self.index_definitions();
+                operation.validate(&declared)?;
 
                 let sequence = self.append_wal(0, operation.to_wal())?;
 
@@ -449,8 +450,10 @@ impl StorageEngine {
             // resolved this operation list instead of
             // `lower_transaction` lowering it from a request.
             _ => {
+                let declared = self.index_definitions();
+
                 let sequence = Transaction::from_operations(operations)
-                    .commit(|operation| self.apply_committed(operation))
+                    .commit(&declared, |operation| self.apply_committed(operation))
                     // `Transaction::commit` speaks `io::Result`; the
                     // mutation API speaks `Result<_, String>`. Carry the
                     // message across rather than collapsing it into a
@@ -696,6 +699,20 @@ impl StorageEngine {
         self.apply_committed(&Operation::RevokeUser(token_hash.to_string()))
     }
 
+    pub(crate) fn replay_create_index(
+        &mut self,
+        def: IndexDef,
+    ) -> Result<(), String> {
+        self.apply_committed(&Operation::CreateIndex(def))
+    }
+
+    pub(crate) fn replay_drop_index(
+        &mut self,
+        name: &str,
+    ) -> Result<(), String> {
+        self.apply_committed(&Operation::DropIndex(name.to_string()))
+    }
+
     /// Note how far recovery replayed, so the checkpoint it takes
     /// afterwards moves the durability boundary across the work it just
     /// redid instead of leaving it to be redone again next time.
@@ -782,15 +799,39 @@ impl StorageEngine {
             }
         }
 
-        Ok(engine)
-    }
+        // Declared `data`-field indexes, replayed the same last-write-
+        // wins way and for the same reason: the set of indexes is
+        // bounded by how many an operator declared, is consulted on
+        // every write, and has to be known before the first request is
+        // served — a write applied without maintaining an index it
+        // does not know about is a silently wrong index.
+        let declared =
+            binary::read_all_records::<IndexOpRecord>(&keys::definitions_path())?;
 
-    /// True when the database holds no nodes.
-    ///
-    /// Read off the primary index's entry count rather than by counting
-    /// anything.
-    pub fn is_empty(&self) -> bool {
-        self.indexes.primary.len() == 0
+        let mut definitions: HashMap<String, IndexDef> = HashMap::new();
+
+        for (_offset, record) in declared {
+            match record {
+                IndexOpRecord::Put(def) => {
+                    definitions.insert(def.name.clone(), def);
+                }
+
+                IndexOpRecord::Drop(name) => {
+                    definitions.remove(&name);
+                }
+            }
+        }
+
+        // Name order so opening is deterministic and a failure names the
+        // same index every time.
+        let mut definitions: Vec<IndexDef> = definitions.into_values().collect();
+        definitions.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for def in definitions {
+            engine.indexes.open_data(def)?;
+        }
+
+        Ok(engine)
     }
 
     // ---------------------------------------------------------------------
@@ -1310,7 +1351,22 @@ impl StorageEngine {
     // ---------------------------------------------------------------------
 
     /// Every live node owned by `owner`, through the owner index.
-    pub fn nodes_by_owner(&self, owner: &str) -> io::Result<Vec<Node>> {
+    /// `requester` carries the same visibility semantics as
+    /// [`Self::query`]: `None` means an internal caller that is not
+    /// filtering, `Some(owner)` means only what that identity may read,
+    /// and an admin is passed as `None` because an admin bypasses
+    /// visibility the way a superuser does.
+    ///
+    /// The filter is not optional decoration. This used to have no
+    /// `requester` at all, which was safe only because its single caller
+    /// could ask about one owner: the caller's own. The moment the
+    /// endpoint above it can name somebody else's nodes, an unfiltered
+    /// listing hands out every private node that owner has.
+    pub fn nodes_by_owner(
+        &self,
+        owner: &str,
+        requester: Option<&str>,
+    ) -> io::Result<Vec<Node>> {
         let mut nodes = Vec::new();
         let prefix = keys::owner_prefix(owner);
         let cap = max_scan_rows();
@@ -1325,7 +1381,10 @@ impl StorageEngine {
                 let address = address_from_key(key, &prefix);
 
                 if let Some(node) = self.read_node(&address)? {
-                    nodes.push(node);
+                    match requester {
+                        Some(r) if !node.can_read(r) => {}
+                        _ => nodes.push(node),
+                    }
                 }
 
                 Ok(true)
@@ -1566,9 +1625,40 @@ impl StorageEngine {
                 .map_err(|e| format!("predicate evaluation failed: {e}"))
         };
 
+        // Does the predicate pin an indexed field to one value? Then
+        // the answer lives under a single prefix of that index, and the
+        // rest of the kind never has to be read at all.
+        //
+        // Entries under one prefix are ordered by address — the value
+        // part of the key is identical for all of them — which is why
+        // this serves both orderings without a re-sort: it *is* address
+        // order, and it is also `(value, address)` order for the field
+        // it pins, because that value does not vary within the prefix.
+        if let Some((index, literal)) =
+            self.equality_prefix_plan(kind, order_field, predicate, item_var)
+        {
+            return self.query_by_data_prefix(
+                index, &literal, cursor, desc, limit, offset, matches,
+            );
+        }
+
         if order_field.is_none() {
             return self.query_by_address(
                 kind, owner, cursor, desc, limit, offset, matches,
+            );
+        }
+
+        // An index over exactly this `(kind, field)` turns the sort into
+        // a range scan: the entries are already in `(value, address)`
+        // order, so the page is read by walking from the cursor and
+        // stopping at `limit`. Nothing outside the page is read, and the
+        // `max_scan_rows` refusal below never comes up — which is the
+        // whole reason to declare one.
+        if let (Some(k), Some(field)) = (kind, order_field)
+            && self.indexes.data_find(k, field).is_some()
+        {
+            return self.query_by_data_index(
+                k, field, cursor, desc, limit, offset, matches,
             );
         }
 
@@ -1651,6 +1741,239 @@ impl StorageEngine {
 
         let next = match nodes.last() {
             Some(last) if more => Cursor::from_node(last, None).encode(),
+            _ => String::new(),
+        };
+
+        Ok(QueryPage { nodes, next })
+    }
+
+    /// Pick a declared index whose field the predicate pins to a single
+    /// value, if the requested ordering allows using it.
+    ///
+    /// Two orderings qualify. With no `order`, the contract is address
+    /// order, which is what a prefix scan produces. With `order` on the
+    /// pinned field itself, every row in the prefix shares that value,
+    /// so the tiebreak — address — is the whole ordering, and a prefix
+    /// scan produces that too. Any other `order` needs the rows sorted
+    /// by a field this prefix does not vary, so it goes elsewhere.
+    ///
+    /// Candidates are considered in name order so that a database with
+    /// two applicable indexes plans the same way on every request rather
+    /// than following hash iteration order.
+    fn equality_prefix_plan(
+        &self,
+        kind: Option<&str>,
+        order_field: Option<&str>,
+        predicate: Option<&Expr>,
+        item_var: &str,
+    ) -> Option<(&crate::storage::index::DataIndex, serde_json::Value)> {
+        let kind = kind?;
+        let predicate = predicate?;
+
+        for index in self.indexes.data_all() {
+            if index.def.kind != kind {
+                continue;
+            }
+
+            if let Some(order) = order_field
+                && order != index.def.field
+            {
+                continue;
+            }
+
+            if let Some(literal) =
+                predicate::equality_literal(predicate, item_var, &index.def.field)
+            {
+                return Some((index, literal));
+            }
+        }
+
+        None
+    }
+
+    /// The page under one value of one declared index.
+    ///
+    /// The narrowest access path this engine has: it reads the entries
+    /// holding that value and nothing else, so a query over a kind with
+    /// a million rows and fifty matches costs the fifty. `matches` still
+    /// runs on every candidate — the prefix answers one conjunct of the
+    /// predicate, not all of it.
+    #[allow(clippy::too_many_arguments)]
+    fn query_by_data_prefix<F>(
+        &self,
+        index: &crate::storage::index::DataIndex,
+        literal: &serde_json::Value,
+        cursor: Option<Cursor>,
+        desc: bool,
+        limit: usize,
+        offset: usize,
+        matches: F,
+    ) -> Result<QueryPage, String>
+    where
+        F: Fn(&Node) -> Result<bool, String>,
+    {
+        let prefix = keys::encode_order_value(Some(literal));
+
+        let after = cursor.as_ref().map(|c| {
+            let mut key = prefix.clone();
+            key.extend_from_slice(c.a.as_bytes());
+            key
+        });
+
+        let to_skip = if cursor.is_some() { 0 } else { offset };
+
+        let order_field = Some(index.def.field.as_str());
+
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut skipped = 0usize;
+        let mut more = false;
+        let mut failure: Option<String> = None;
+
+        index
+            .tree
+            .for_each_range(&prefix, after.as_deref(), desc, |key, _value| {
+                let Some(raw) = keys::address_from_data_key(key) else {
+                    return Ok(true);
+                };
+
+                let address = String::from_utf8_lossy(raw).into_owned();
+
+                let Some(node) = self.read_node(&address)? else {
+                    return Ok(true);
+                };
+
+                match matches(&node) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(true),
+                    Err(e) => {
+                        failure = Some(e);
+                        return Ok(false);
+                    }
+                }
+
+                if skipped < to_skip {
+                    skipped += 1;
+                    return Ok(true);
+                }
+
+                if nodes.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+
+                nodes.push(node);
+
+                Ok(true)
+            })
+            .map_err(io_message)?;
+
+        if let Some(e) = failure {
+            return Err(e);
+        }
+
+        // The cursor carries the order value even when the request did
+        // not ask for an ordering, so that a later page of the same
+        // query — which re-derives the same prefix from the same
+        // predicate — resumes on the same key either way.
+        let next = match nodes.last() {
+            Some(last) if more => Cursor::from_node(last, order_field).encode(),
+            _ => String::new(),
+        };
+
+        Ok(QueryPage { nodes, next })
+    }
+
+    /// The declared-index page: walk the `data` index in its own order
+    /// and stop at `limit`.
+    ///
+    /// The counterpart of [`Self::query_by_address`] for an ordering the
+    /// primary index cannot serve. Both read exactly one page; the
+    /// difference is only which access path is already in the requested
+    /// order.
+    ///
+    /// The cursor is the same opaque `(order_value, address)` pair the
+    /// sorted path issues, and it re-encodes to exactly the key the
+    /// index holds for that row — so a caller can page through this
+    /// index with a cursor a previous, index-less build handed them, and
+    /// declaring or dropping an index never invalidates an outstanding
+    /// cursor.
+    #[allow(clippy::too_many_arguments)]
+    fn query_by_data_index<F>(
+        &self,
+        kind: &str,
+        field: &str,
+        cursor: Option<Cursor>,
+        desc: bool,
+        limit: usize,
+        offset: usize,
+        matches: F,
+    ) -> Result<QueryPage, String>
+    where
+        F: Fn(&Node) -> Result<bool, String>,
+    {
+        let Some(index) = self.indexes.data_find(kind, field) else {
+            return Err(format!("no index over {kind}.{field}"));
+        };
+
+        let after = cursor
+            .as_ref()
+            .map(|c| keys::data_key(c.o.as_ref(), &c.a));
+
+        // As in `query_by_address`: a cursor supersedes `offset`.
+        let to_skip = if cursor.is_some() { 0 } else { offset };
+
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut skipped = 0usize;
+        let mut more = false;
+        let mut failure: Option<String> = None;
+
+        index
+            .tree
+            .for_each_range(&[], after.as_deref(), desc, |key, _value| {
+                let Some(raw) = keys::address_from_data_key(key) else {
+                    // A key with no terminator is not one this encoding
+                    // produced. Skip it rather than fail the query: the
+                    // row is still reachable through every other path.
+                    return Ok(true);
+                };
+
+                let address = String::from_utf8_lossy(raw).into_owned();
+
+                let Some(node) = self.read_node(&address)? else {
+                    return Ok(true);
+                };
+
+                match matches(&node) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(true),
+                    Err(e) => {
+                        failure = Some(e);
+                        return Ok(false);
+                    }
+                }
+
+                if skipped < to_skip {
+                    skipped += 1;
+                    return Ok(true);
+                }
+
+                if nodes.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+
+                nodes.push(node);
+
+                Ok(true)
+            })
+            .map_err(io_message)?;
+
+        if let Some(e) = failure {
+            return Err(e);
+        }
+
+        let next = match nodes.last() {
+            Some(last) if more => Cursor::from_node(last, Some(field)).encode(),
             _ => String::new(),
         };
 
@@ -1783,6 +2106,7 @@ impl StorageEngine {
         &mut self,
         node: Node,
         edge_targets: Vec<(String, String)>,
+        is_admin: bool,
     ) -> Result<Vec<Edge>, (String, Vec<Edge>)> {
         let address = node.address.clone();
         let owner = node.owner.clone();
@@ -1792,8 +2116,29 @@ impl StorageEngine {
         // An overwrite archives what it replaces, exactly as `insert`
         // does — carried inside this frame rather than settled ahead of
         // it as its own record.
+        //
+        // And an overwrite is authorized here, against the node it
+        // replaces. This is the same rule the transaction path applies
+        // in `lower_transaction`, and it lives in the engine for the
+        // same reason: an ownership check that only exists in a handler
+        // is one that the next handler can forget. This one *was*
+        // forgotten — `POST /node` reached this method with no check at
+        // all, so writing to an address another identity owned silently
+        // replaced their node and took ownership of it, while `PUT`,
+        // `DELETE` and `insert_node` inside a transaction all refused
+        // the same write. A rule enforced in three places out of four is
+        // not a rule.
         match self.read_node(&address) {
             Ok(Some(previous)) => {
+                if !(is_admin || previous.can_write(&owner)) {
+                    return Err((
+                        format!(
+                            "not authorized to overwrite node '{address}':                              it belongs to another owner"
+                        ),
+                        Vec::new(),
+                    ));
+                }
+
                 operations.push(Operation::Archive(HistoryEntry::now(previous)));
             }
             Ok(None) => {}
@@ -1842,6 +2187,108 @@ impl StorageEngine {
     // ---------------------------------------------------------------------
     // Users
     // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // Index administration
+    // ---------------------------------------------------------------------
+
+    /// Every declared `data`-field index, in name order.
+    pub fn list_indexes(&self) -> Vec<IndexDef> {
+        self.index_definitions()
+    }
+
+    /// The declared definitions as a plain snapshot.
+    ///
+    /// Taken before the write path borrows the engine mutably, because
+    /// validating a batch needs to know which indexes a node's keys will
+    /// land in while the apply closure needs `&mut self`.
+    fn index_definitions(&self) -> Vec<IndexDef> {
+        self.indexes
+            .data_all()
+            .into_iter()
+            .map(|index| index.def.clone())
+            .collect()
+    }
+
+    /// Declare an index over one `data` field of one kind.
+    ///
+    /// Re-declaring the identical index is a no-op rather than an error:
+    /// an operator re-running their schema setup should converge, and
+    /// the alternative — failing on the second run — makes "make sure
+    /// this index exists" impossible to express.
+    ///
+    /// # Why the whole kind is read before anything is logged
+    ///
+    /// The backfill writes one key per existing row, and a key the tree
+    /// would refuse cannot be discovered *after* the create is durable:
+    /// recovery would replay the create, hit the same refusal, and fail
+    /// startup. So every existing row is measured against the index's
+    /// key bound first, while the index can still simply not be created.
+    /// This is the read Postgres does when it builds an index, for the
+    /// reason Postgres reports as "index row size exceeds maximum".
+    pub fn create_index(&mut self, def: IndexDef) -> Result<(), String> {
+        def.validate()?;
+
+        if let Some(existing) = self.indexes.data_get(&def.name) {
+            if existing.def == def {
+                return Ok(());
+            }
+
+            return Err(format!(
+                "index '{}' already exists, over {}.{} — drop it before                  redefining it",
+                existing.def.name, existing.def.kind, existing.def.field
+            ));
+        }
+
+        if let Some(other) = self.indexes.data_find(&def.kind, &def.field) {
+            return Err(format!(
+                "index '{}' already covers {}.{}",
+                other.def.name, def.kind, def.field
+            ));
+        }
+
+        self.check_backfill_admissible(&def)?;
+
+        self.apply_atomic(vec![Operation::CreateIndex(def)])
+    }
+
+    /// Drop a declared index, removing its tree.
+    pub fn drop_index(&mut self, name: &str) -> Result<(), String> {
+        if self.indexes.data_get(name).is_none() {
+            return Err(format!("no index named '{name}'"));
+        }
+
+        self.apply_atomic(vec![Operation::DropIndex(name.to_string())])
+    }
+
+    /// Refuse a definition whose backfill could not be applied, before
+    /// the create is logged. See [`Self::create_index`].
+    fn check_backfill_admissible(&self, def: &IndexDef) -> Result<(), String> {
+        let mut failure: Option<String> = None;
+
+        self.scan_candidates(Some(&def.kind), None, None, false, |node| {
+            if let Err(e) = keys::check_data_keys(
+                std::iter::once(def),
+                &node.address,
+                &node.data,
+            ) {
+                failure = Some(format!(
+                    "cannot index {}.{}: node '{}' {}",
+                    def.kind, def.field, node.address, e
+                ));
+
+                return Ok(false);
+            }
+
+            Ok(true)
+        })
+        .map_err(io_message)?;
+
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 
     /// Persists a new user record.
     ///
@@ -2024,16 +2471,20 @@ impl StorageEngine {
         // durable and the batch can no longer be refused.
         if lowered.len() > max_transaction_ops() {
             return Err(TransactionError::Invalid(format!(
-                "transaction failed, nothing applied: it resolves to {}                  mutations, over the {} this engine will stage in one                  frame. Split the batch, or raise {MAX_TRANSACTION_OPS_ENV}.",
+                "transaction failed, nothing applied: it resolves to {} \
+                 mutations, over the {} this engine will stage in one \
+                 frame. Split the batch, or raise {MAX_TRANSACTION_OPS_ENV}.",
                 lowered.len(),
                 max_transaction_ops()
             )));
         }
 
+        let declared = self.index_definitions();
+
         let transaction = Transaction::from_operations(lowered);
 
         let sequence = transaction
-            .commit(|operation| self.apply_committed(operation))
+            .commit(&declared, |operation| self.apply_committed(operation))
             .map_err(|e| TransactionError::Storage(e.to_string()))?;
 
         self.note_applied(sequence);
@@ -2489,6 +2940,18 @@ impl StorageEngine {
                     .owner
                     .put(&keys::owner_key(&node.owner, &node.address), &[])?;
 
+                // Declared `data` indexes. The old entry has to be
+                // retracted from the *previous* node's kind and value —
+                // an update can change either — and the retraction has
+                // to happen before the assertion, or an update that
+                // leaves the value alone would remove the entry it just
+                // wrote.
+                if let Some(previous_node) = &previous_node {
+                    self.retract_data_keys(previous_node)?;
+                }
+
+                self.assert_data_keys(node)?;
+
                 if let Some(location) = previous {
                     self.store.mark_obsolete(location);
                 }
@@ -2513,6 +2976,8 @@ impl StorageEngine {
                     self.indexes
                         .owner
                         .remove(&keys::owner_key(&node.owner, address))?;
+
+                    self.retract_data_keys(&node)?;
 
                     self.store.mark_obsolete(location);
                 }
@@ -2576,9 +3041,114 @@ impl StorageEngine {
 
                 self.users.remove(token_hash);
             }
+
+            // Declaration, tree and contents in one operation, in that
+            // order. The definition is what a restart reads, the tree is
+            // what writes maintain, and the backfill is what makes the
+            // index answer for rows that predate it — an index missing
+            // any one of the three is an index that lies.
+            Operation::CreateIndex(def) => {
+                binary::append_record(
+                    &keys::definitions_path(),
+                    &IndexOpRecord::Put(def.clone()),
+                )?;
+
+                self.indexes.open_data(def.clone())?;
+
+                self.backfill_index(&def.name)?;
+            }
+
+            Operation::DropIndex(name) => {
+                binary::append_record(
+                    &keys::definitions_path(),
+                    &IndexOpRecord::Drop(name.clone()),
+                )?;
+
+                self.indexes.drop_data(name)?;
+            }
         }
 
         Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Declared `data`-field indexes
+    // ---------------------------------------------------------------------
+
+    /// Write this node's entry into every index declared over its kind.
+    ///
+    /// Takes `&self` — `BTree::put` does — so it composes with the read
+    /// paths a backfill needs. The empty check comes first so a database
+    /// with no declared indexes does not decode a node's JSON on every
+    /// write to discover there was nothing to index.
+    fn assert_data_keys(&self, node: &Node) -> io::Result<()> {
+        let declared: Vec<_> = self.indexes.data_for_kind(&node.kind).collect();
+
+        if declared.is_empty() {
+            return Ok(());
+        }
+
+        let data: Option<serde_json::Value> =
+            serde_json::from_str(&node.data).ok();
+
+        for index in declared {
+            let value = data.as_ref().and_then(|d| d.get(&index.def.field));
+
+            index
+                .tree
+                .put(&keys::data_key(value, &node.address), &[])?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove this node's entry from every index declared over its kind.
+    fn retract_data_keys(&self, node: &Node) -> io::Result<()> {
+        let declared: Vec<_> = self.indexes.data_for_kind(&node.kind).collect();
+
+        if declared.is_empty() {
+            return Ok(());
+        }
+
+        let data: Option<serde_json::Value> =
+            serde_json::from_str(&node.data).ok();
+
+        for index in declared {
+            let value = data.as_ref().and_then(|d| d.get(&index.def.field));
+
+            index
+                .tree
+                .remove(&keys::data_key(value, &node.address))?;
+        }
+
+        Ok(())
+    }
+
+    /// Populate a freshly declared index from the rows that already
+    /// exist.
+    ///
+    /// Reads through the `kind` index, so it costs the kind rather than
+    /// the database, and writes one entry per row. Every write is a
+    /// `put` keyed by `(value, address)`, which is what makes running it
+    /// twice — as recovery does — converge instead of duplicating.
+    fn backfill_index(&self, name: &str) -> io::Result<()> {
+        let Some(index) = self.indexes.data_get(name) else {
+            return Ok(());
+        };
+
+        let kind = index.def.kind.clone();
+        let field = index.def.field.clone();
+
+        self.scan_candidates(Some(&kind), None, None, false, |node| {
+            let data: Option<serde_json::Value> =
+                serde_json::from_str(&node.data).ok();
+
+            let value = data.as_ref().and_then(|d| d.get(&field));
+
+            index.tree.put(&keys::data_key(value, &node.address), &[])?;
+
+            Ok(true)
+        })
     }
 }
 
@@ -2700,24 +3270,12 @@ fn compare_order_keys(
     a: &Option<serde_json::Value>,
     b: &Option<serde_json::Value>,
 ) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    use serde_json::Value;
-
-    match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
-        (Some(av), Some(bv)) => match (av, bv) {
-            (Value::Number(an), Value::Number(bn)) => an
-                .as_f64()
-                .unwrap_or(0.0)
-                .partial_cmp(&bn.as_f64().unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal),
-            (Value::String(a_s), Value::String(b_s)) => a_s.cmp(b_s),
-            (Value::Bool(a_b), Value::Bool(b_b)) => a_b.cmp(b_b),
-            _ => Ordering::Equal,
-        },
-    }
+    // One definition of "in order", shared with the byte encoding a
+    // declared index is keyed by — see `storage::index`. Two definitions
+    // would mean a sorted read and an index scan could disagree about
+    // where a row belongs, which is exactly the bug an index is supposed
+    // not to have.
+    keys::compare_order_values(a.as_ref(), b.as_ref())
 }
 
 /// One page of `query_where` results plus the opaque keyset cursor for
@@ -4262,5 +4820,929 @@ mod delete_history_tests {
         let history = recovered.history_for("dh_rec:a").expect("read history");
         assert_eq!(history.len(), 1, "the archive is durable, not just in memory");
         assert!(history[0].node.data.contains("final"));
+    }
+}
+
+#[cfg(test)]
+mod data_index_tests {
+    //! Operator-declared indexes over a `data` field.
+    //!
+    //! The property under test throughout is *equivalence*: a query
+    //! served by a declared index must return exactly what the same
+    //! query returns with no index at all. An index that is merely fast
+    //! is worthless — the whole reason to have one is that it answers
+    //! the question the scan would have answered, and the only way to
+    //! know that is to ask both and compare.
+    //!
+    //! Like every other module here, these share one data directory with
+    //! the rest of the binary's tests, so each test works in its own
+    //! `kind` and its own index name.
+
+    use super::*;
+    use crate::core::coordinate::Coordinate;
+    use crate::core::node::{Node, Visibility};
+    use crate::storage::engine::test_support::disk_guard;
+    use crate::storage::index::{IndexDef, MAX_INDEX_VALUE_LEN};
+
+    fn reopen(engine: StorageEngine) -> StorageEngine {
+        drop(engine);
+
+        let mut recovered = StorageEngine::load().expect("reopen storage engine");
+
+        crate::storage::recovery::recover(&mut recovered).expect("wal recovery");
+
+        recovered
+    }
+
+    fn node(kind: &str, address: &str, data: &str) -> Node {
+        let mut n = Node::new(
+            Coordinate::new(0, 0, 0, 0),
+            address.to_string(),
+            kind.to_string(),
+            "owner".to_string(),
+        );
+
+        n.data = data.to_string();
+        n.visibility = Visibility::Public;
+
+        n
+    }
+
+    /// The declared indexes whose names start with `prefix`.
+    ///
+    /// Every test module in this binary shares one data directory, so a
+    /// bare `list_indexes()` also sees whatever the neighbouring tests
+    /// declared. Scoping by name is the listing equivalent of the
+    /// per-test `kind` the query tests use.
+    fn declared(engine: &StorageEngine, prefix: &str) -> Vec<IndexDef> {
+        engine
+            .list_indexes()
+            .into_iter()
+            .filter(|d| d.name.starts_with(prefix))
+            .collect()
+    }
+
+    fn def(name: &str, kind: &str, field: &str) -> IndexDef {
+        IndexDef {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            field: field.to_string(),
+        }
+    }
+
+    /// Every address the query returns, paged all the way through.
+    fn page_all(
+        engine: &StorageEngine,
+        kind: &str,
+        order: Option<&str>,
+        desc: bool,
+        limit: usize,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+
+        for _ in 0..1000 {
+            let page = engine
+                .query_where(
+                    Some(kind),
+                    None,
+                    None,
+                    None,
+                    "item",
+                    order,
+                    desc,
+                    after.as_deref(),
+                    limit,
+                    0,
+                )
+                .expect("query_where ok");
+
+            out.extend(page.nodes.iter().map(|n| n.address.clone()));
+
+            if page.next.is_empty() {
+                return out;
+            }
+
+            after = Some(page.next);
+        }
+
+        panic!("paging did not terminate");
+    }
+
+    // -----------------------------------------------------------------
+    // Encoding
+    // -----------------------------------------------------------------
+
+    /// The one property the whole feature rests on: comparing two values
+    /// and comparing their encodings must give the same answer. If they
+    /// ever disagree, an index scan and a sort return different orders
+    /// for the same query and only one of them can be right.
+    #[test]
+    fn byte_order_matches_value_order() {
+        use serde_json::json;
+
+        let values: Vec<Option<serde_json::Value>> = vec![
+            Some(json!(null)),
+            Some(json!(false)),
+            Some(json!(true)),
+            Some(json!(-1e300)),
+            Some(json!(-2.5)),
+            Some(json!(-1)),
+            Some(json!(0)),
+            Some(json!(0.5)),
+            Some(json!(1)),
+            Some(json!(2)),
+            Some(json!(10)),
+            Some(json!(1e300)),
+            Some(json!("")),
+            Some(json!("a")),
+            Some(json!("aa")),
+            Some(json!("b")),
+            // A NUL inside a string is exactly what the escape exists
+            // for: unescaped, it would read as this value's terminator
+            // and the rest of the key would be parsed as an address.
+            Some(json!("b\u{0}c")),
+            Some(json!("c")),
+            Some(json!([1, 2])),
+            None,
+        ];
+
+        for (i, a) in values.iter().enumerate() {
+            for (j, b) in values.iter().enumerate() {
+                let by_value = keys::compare_order_values(a.as_ref(), b.as_ref());
+
+                let by_bytes = keys::encode_order_value(a.as_ref())
+                    .cmp(&keys::encode_order_value(b.as_ref()));
+
+                assert_eq!(
+                    by_value, by_bytes,
+                    "values[{i}] vs values[{j}]: comparator says \
+                     {by_value:?}, encoding says {by_bytes:?}"
+                );
+
+                assert_eq!(
+                    by_value,
+                    i.cmp(&j),
+                    "values[{i}] vs values[{j}] is out of the declared order"
+                );
+            }
+        }
+    }
+
+    /// The address has to come back out of the key intact, including
+    /// when the indexed value contained the byte the terminator is made
+    /// of.
+    #[test]
+    fn address_survives_the_key_encoding() {
+        use serde_json::json;
+
+        for value in [
+            Some(json!("plain")),
+            Some(json!("has\u{0}nul")),
+            Some(json!(42)),
+            Some(json!(null)),
+            None,
+        ] {
+            let key = keys::data_key(value.as_ref(), "kind:some-address");
+
+            assert_eq!(
+                keys::address_from_data_key(&key),
+                Some(&b"kind:some-address"[..]),
+                "address lost for {value:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Equivalence with the unindexed path
+    // -----------------------------------------------------------------
+
+    /// The same rows, in the same order, whether or not an index exists.
+    /// Run over deliberately messy data — repeated values, mixed types,
+    /// and rows missing the field entirely — because that is where a
+    /// sort and an index are most likely to drift apart.
+    #[test]
+    fn an_index_returns_exactly_what_the_scan_returns() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        let rows = [
+            ("dix1:a", r#"{"score": 30}"#),
+            ("dix1:b", r#"{"score": 10}"#),
+            ("dix1:c", r#"{"score": 20}"#),
+            ("dix1:d", r#"{"score": 10}"#),
+            ("dix1:e", r#"{"score": -5}"#),
+            ("dix1:f", r#"{"other": 1}"#),
+            ("dix1:g", r#"{"score": "text"}"#),
+            ("dix1:h", r#"{"score": null}"#),
+            ("dix1:i", r#"{"score": 2.5}"#),
+        ];
+
+        for (address, data) in rows {
+            e.insert(node("DixOne", address, data)).expect("insert");
+        }
+
+        let unindexed_asc = page_all(&e, "DixOne", Some("score"), false, 2);
+        let unindexed_desc = page_all(&e, "DixOne", Some("score"), true, 2);
+
+        e.create_index(def("dix1_score", "DixOne", "score"))
+            .expect("create index");
+
+        assert_eq!(
+            page_all(&e, "DixOne", Some("score"), false, 2),
+            unindexed_asc,
+            "ascending order changed when the index appeared"
+        );
+
+        assert_eq!(
+            page_all(&e, "DixOne", Some("score"), true, 2),
+            unindexed_desc,
+            "descending order changed when the index appeared"
+        );
+
+        // Every row exactly once, whichever path served it.
+        assert_eq!(unindexed_asc.len(), rows.len());
+
+        let mut sorted = unindexed_asc.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), rows.len(), "a row was returned twice");
+    }
+
+    /// A page size that does not divide the result, walked by cursor,
+    /// through the index. The cursor is re-encoded into an index key on
+    /// the next request, so this is what proves that round trip lands on
+    /// the same row the previous page ended on.
+    #[test]
+    fn index_paging_covers_every_row_once() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        for i in 0..25 {
+            e.insert(node(
+                "DixPage",
+                &format!("dixp:{i:02}"),
+                // Deliberately repeating values, so the address
+                // tiebreak is what makes the order total.
+                &format!(r#"{{"bucket": {}}}"#, i % 4),
+            ))
+            .expect("insert");
+        }
+
+        e.create_index(def("dixp_bucket", "DixPage", "bucket"))
+            .expect("create index");
+
+        for limit in [1usize, 3, 7, 25, 100] {
+            let addresses = page_all(&e, "DixPage", Some("bucket"), false, limit);
+
+            assert_eq!(addresses.len(), 25, "limit {limit} lost or repeated rows");
+
+            let mut unique = addresses.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(unique.len(), 25, "limit {limit} returned a row twice");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Maintenance
+    // -----------------------------------------------------------------
+
+    /// An index is only as good as the writes that maintain it: an
+    /// update has to retract the old value's entry, and a delete has to
+    /// remove the row entirely. Both are checked by reading through the
+    /// index, which is the only place the stale entry would show up.
+    #[test]
+    fn updates_and_deletes_keep_the_index_true() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        for (address, rank) in [("dix2:a", 1), ("dix2:b", 2), ("dix2:c", 3)] {
+            e.insert(node("DixTwo", address, &format!(r#"{{"rank": {rank}}}"#)))
+                .expect("insert");
+        }
+
+        e.create_index(def("dix2_rank", "DixTwo", "rank"))
+            .expect("create index");
+
+        assert_eq!(
+            page_all(&e, "DixTwo", Some("rank"), false, 10),
+            vec!["dix2:a", "dix2:b", "dix2:c"]
+        );
+
+        // Move `a` to the end. If the old entry survived, `a` would come
+        // back twice.
+        e.insert(node("DixTwo", "dix2:a", r#"{"rank": 9}"#))
+            .expect("update");
+
+        assert_eq!(
+            page_all(&e, "DixTwo", Some("rank"), false, 10),
+            vec!["dix2:b", "dix2:c", "dix2:a"]
+        );
+
+        e.delete("dix2:c").expect("delete");
+
+        assert_eq!(
+            page_all(&e, "DixTwo", Some("rank"), false, 10),
+            vec!["dix2:b", "dix2:a"]
+        );
+    }
+
+    /// A node inserted after the index was declared has to appear in it
+    /// without anyone rebuilding anything.
+    #[test]
+    fn later_writes_land_in_an_existing_index() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        e.insert(node("DixThree", "dix3:b", r#"{"n": 2}"#))
+            .expect("insert");
+
+        e.create_index(def("dix3_n", "DixThree", "n"))
+            .expect("create index");
+
+        e.insert(node("DixThree", "dix3:a", r#"{"n": 1}"#))
+            .expect("insert after");
+
+        e.insert(node("DixThree", "dix3:c", r#"{"n": 3}"#))
+            .expect("insert after");
+
+        assert_eq!(
+            page_all(&e, "DixThree", Some("n"), false, 10),
+            vec!["dix3:a", "dix3:b", "dix3:c"]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Durability
+    // -----------------------------------------------------------------
+
+    /// The definition and its contents both have to survive a restart —
+    /// a definition without a populated tree is an index that silently
+    /// returns nothing, which is worse than not having one.
+    #[test]
+    fn a_declared_index_survives_a_restart() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        for (address, n) in [("dix4:a", 3), ("dix4:b", 1), ("dix4:c", 2)] {
+            e.insert(node("DixFour", address, &format!(r#"{{"n": {n}}}"#)))
+                .expect("insert");
+        }
+
+        e.create_index(def("dix4_n", "DixFour", "n"))
+            .expect("create index");
+
+        let mut e = reopen(e);
+
+        assert_eq!(
+            declared(&e, "dix4_"),
+            vec![def("dix4_n", "DixFour", "n")],
+            "the definition did not survive"
+        );
+
+        assert_eq!(
+            page_all(&e, "DixFour", Some("n"), false, 10),
+            vec!["dix4:b", "dix4:c", "dix4:a"],
+            "the index contents did not survive"
+        );
+
+        // And it is still being maintained on the far side of the
+        // restart, which is the part a replayed definition could get
+        // wrong by opening the tree but not registering it.
+        e.insert(node("DixFour", "dix4:d", r#"{"n": 0}"#))
+            .expect("insert after restart");
+
+        assert_eq!(
+            page_all(&e, "DixFour", Some("n"), false, 10),
+            vec!["dix4:d", "dix4:b", "dix4:c", "dix4:a"]
+        );
+    }
+
+    /// A drop has to survive too, and has to leave the query answering
+    /// correctly through the sort path rather than failing.
+    #[test]
+    fn a_dropped_index_stays_dropped_and_queries_still_work() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        for (address, n) in [("dix5:a", 2), ("dix5:b", 1)] {
+            e.insert(node("DixFive", address, &format!(r#"{{"n": {n}}}"#)))
+                .expect("insert");
+        }
+
+        e.create_index(def("dix5_n", "DixFive", "n"))
+            .expect("create index");
+
+        e.drop_index("dix5_n").expect("drop index");
+
+        assert!(declared(&e, "dix5_").is_empty(), "still declared after drop");
+
+        let e = reopen(e);
+
+        assert!(declared(&e, "dix5_").is_empty(), "the drop did not survive");
+
+        assert_eq!(
+            page_all(&e, "DixFive", Some("n"), false, 10),
+            vec!["dix5:b", "dix5:a"],
+            "the query stopped working without its index"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Declaration rules
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn redeclaring_the_same_index_is_a_no_op_but_conflicts_are_errors() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        e.create_index(def("dix6_n", "DixSix", "n"))
+            .expect("create index");
+
+        e.create_index(def("dix6_n", "DixSix", "n"))
+            .expect("re-declaring the identical index must converge");
+
+        let same_name = e.create_index(def("dix6_n", "DixSix", "other"));
+        assert!(same_name.is_err(), "a redefinition under a live name");
+
+        let same_field = e.create_index(def("dix6_again", "DixSix", "n"));
+        assert!(same_field.is_err(), "a second index over the same field");
+
+        assert_eq!(declared(&e, "dix6_").len(), 1);
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_name_is_refused() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        // A path, not a name: this is the one that would escape the data
+        // directory if names were interpolated into filenames unchecked.
+        assert!(e.create_index(def("../escape", "DixSeven", "n")).is_err());
+
+        assert!(e.create_index(def("", "DixSeven", "n")).is_err());
+        assert!(e.create_index(def("ok", "", "n")).is_err());
+        assert!(e.create_index(def("ok", "DixSeven", "")).is_err());
+
+        assert!(e.drop_index("never-declared").is_err());
+    }
+
+    /// A value too large for an index key must be refused *before* the
+    /// create is logged — both when the oversized row is already there
+    /// and when it arrives later. Either way the refusal is an ordinary
+    /// error, never a mutation the WAL has already accepted.
+    #[test]
+    fn an_unindexable_value_is_refused_not_committed() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        let huge = "x".repeat(MAX_INDEX_VALUE_LEN + 64);
+
+        e.insert(node(
+            "DixEight",
+            "dix8:big",
+            &serde_json::json!({ "blob": huge }).to_string(),
+        ))
+        .expect("an unindexed oversized field is ordinary data");
+
+        let refused = e.create_index(def("dix8_blob", "DixEight", "blob"));
+
+        assert!(refused.is_err(), "created an index it cannot maintain");
+        assert!(declared(&e, "dix8_").is_empty(), "a refused index was declared");
+
+        // The reverse order: index a field that is small today, then try
+        // to write a row whose value is too large for it.
+        e.insert(node("DixNine", "dix9:a", r#"{"blob": "small"}"#))
+            .expect("insert");
+
+        e.create_index(def("dix9_blob", "DixNine", "blob"))
+            .expect("create index");
+
+        let refused = e.insert(node(
+            "DixNine",
+            "dix9:b",
+            &serde_json::json!({ "blob": huge }).to_string(),
+        ));
+
+        assert!(refused.is_err(), "wrote a row the index cannot hold");
+
+        assert_eq!(
+            page_all(&e, "DixNine", Some("blob"), false, 10),
+            vec!["dix9:a"],
+            "the refused write left something behind"
+        );
+    }
+
+    /// An index covers one kind. A node of another kind that happens to
+    /// carry the same field name must not appear in it — `data` has no
+    /// schema across kinds, so two same-named fields are unrelated.
+    #[test]
+    fn an_index_covers_only_its_own_kind() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        e.insert(node("DixTenA", "dix10:a", r#"{"n": 1}"#))
+            .expect("insert");
+
+        e.insert(node("DixTenB", "dix10:b", r#"{"n": 2}"#))
+            .expect("insert");
+
+        e.create_index(def("dix10_n", "DixTenA", "n"))
+            .expect("create index");
+
+        assert_eq!(
+            page_all(&e, "DixTenA", Some("n"), false, 10),
+            vec!["dix10:a"]
+        );
+
+        assert_eq!(
+            page_all(&e, "DixTenB", Some("n"), false, 10),
+            vec!["dix10:b"],
+            "the other kind stopped answering"
+        );
+    }
+
+    /// The index narrows the access path; it does not widen who may
+    /// read. A private row belonging to someone else must not become
+    /// visible just because an ordered read now walks an index.
+    #[test]
+    fn an_index_does_not_leak_a_private_row() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        let mut public = node("DixEleven", "dix11:pub", r#"{"n": 1}"#);
+        public.owner = "alice".to_string();
+
+        let mut private = node("DixEleven", "dix11:priv", r#"{"n": 2}"#);
+        private.owner = "alice".to_string();
+        private.visibility = Visibility::Private;
+
+        e.insert(public).expect("insert");
+        e.insert(private).expect("insert");
+
+        e.create_index(def("dix11_n", "DixEleven", "n"))
+            .expect("create index");
+
+        let page = e
+            .query_where(
+                Some("DixEleven"),
+                None,
+                Some("bob"),
+                None,
+                "item",
+                Some("n"),
+                false,
+                None,
+                10,
+                0,
+            )
+            .expect("query_where ok");
+
+        assert_eq!(
+            page.nodes.iter().map(|n| n.address.as_str()).collect::<Vec<_>>(),
+            vec!["dix11:pub"],
+            "an index scan bypassed visibility"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Equality pushdown: the index as a filter, not only an ordering
+    // -----------------------------------------------------------------
+
+    fn eq(field: &str, value: serde_json::Value) -> Expr {
+        serde_json::from_value(serde_json::json!({
+            "kind": "bin",
+            "op": "==",
+            "l": {
+                "kind": "get",
+                "field": field,
+                "obj": { "kind": "ref", "name": "item" }
+            },
+            "r": { "kind": "lit", "val": value }
+        }))
+        .expect("valid predicate")
+    }
+
+    fn bin(op: &str, l: Expr, r: Expr) -> Expr {
+        Expr {
+            kind: "bin".to_string(),
+            op: Some(op.to_string()),
+            l: Some(Box::new(l)),
+            r: Some(Box::new(r)),
+            val: None,
+            vtype: None,
+            name: None,
+            field: None,
+            obj: None,
+            key: None,
+            args: None,
+            x: None,
+            var: None,
+            where_: None,
+        }
+    }
+
+    /// Run one query both ways — with the index declared and with it
+    /// dropped — and require identical answers. The index is a plan
+    /// choice; a plan choice that changes the result is a bug.
+    fn same_with_and_without_index(
+        engine: &mut StorageEngine,
+        kind: &str,
+        index: IndexDef,
+        predicate: &Expr,
+        order: Option<&str>,
+        desc: bool,
+        limit: usize,
+    ) -> Vec<String> {
+        let name = index.name.clone();
+
+        let unindexed = page_filtered(engine, kind, predicate, order, desc, limit);
+
+        engine.create_index(index).expect("create index");
+
+        let indexed = page_filtered(engine, kind, predicate, order, desc, limit);
+
+        engine.drop_index(&name).expect("drop index");
+
+        assert_eq!(
+            indexed, unindexed,
+            "the index changed the answer for order={order:?} desc={desc} \
+             limit={limit}"
+        );
+
+        unindexed
+    }
+
+    /// Page a predicated query all the way through, collecting
+    /// addresses.
+    fn page_filtered(
+        engine: &StorageEngine,
+        kind: &str,
+        predicate: &Expr,
+        order: Option<&str>,
+        desc: bool,
+        limit: usize,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+
+        for _ in 0..1000 {
+            let page = engine
+                .query_where(
+                    Some(kind),
+                    None,
+                    None,
+                    Some(predicate),
+                    "item",
+                    order,
+                    desc,
+                    after.as_deref(),
+                    limit,
+                    0,
+                )
+                .expect("query_where ok");
+
+            out.extend(page.nodes.iter().map(|n| n.address.clone()));
+
+            if page.next.is_empty() {
+                return out;
+            }
+
+            after = Some(page.next);
+        }
+
+        panic!("paging did not terminate");
+    }
+
+    /// The headline case: `where status == "open"` over an index on
+    /// `status`. Same rows, same order, every page size, both
+    /// directions, ordered and unordered.
+    #[test]
+    fn an_equality_predicate_is_served_by_a_prefix_of_the_index() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        for i in 0..20 {
+            let status = if i % 3 == 0 { "open" } else { "closed" };
+
+            e.insert(node(
+                "DixEq",
+                &format!("dixeq:{i:02}"),
+                &format!(r#"{{"status": "{status}", "n": {i}}}"#),
+            ))
+            .expect("insert");
+        }
+
+        let predicate = eq("status", serde_json::json!("open"));
+
+        for (order, desc, limit) in [
+            (None, false, 2usize),
+            (None, true, 3),
+            (Some("status"), false, 1),
+            (Some("status"), true, 4),
+            (None, false, 100),
+        ] {
+            let got = same_with_and_without_index(
+                &mut e,
+                "DixEq",
+                def("dixeq_status", "DixEq", "status"),
+                &predicate,
+                order,
+                desc,
+                limit,
+            );
+
+            assert_eq!(got.len(), 7, "wrong number of matches");
+        }
+    }
+
+    /// An ordering on a *different* indexed field, filtered by equality
+    /// on this one. The prefix cannot serve it — every row in the prefix
+    /// shares the pinned value but varies in the ordered one — so the
+    /// planner must not take it, and the answer must still be right.
+    #[test]
+    fn an_ordering_on_another_field_is_not_served_by_the_prefix() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        for (address, group, n) in [
+            ("dixord:a", "x", 3),
+            ("dixord:b", "x", 1),
+            ("dixord:c", "y", 2),
+            ("dixord:d", "x", 2),
+        ] {
+            e.insert(node(
+                "DixOrd",
+                address,
+                &format!(r#"{{"group": "{group}", "n": {n}}}"#),
+            ))
+            .expect("insert");
+        }
+
+        let predicate = eq("group", serde_json::json!("x"));
+
+        let got = same_with_and_without_index(
+            &mut e,
+            "DixOrd",
+            def("dixord_group", "DixOrd", "group"),
+            &predicate,
+            Some("n"),
+            false,
+            2,
+        );
+
+        assert_eq!(got, vec!["dixord:b", "dixord:d", "dixord:a"]);
+    }
+
+    /// `a == 1 || b == 2` is not a requirement on either field: a row
+    /// can satisfy one branch and not the other. Pushing either side
+    /// into a prefix would drop the rows that matched only the other,
+    /// so the analysis must refuse to descend through `||`.
+    #[test]
+    fn a_disjunction_is_not_pushed_into_a_prefix() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        for (address, tag, n) in [
+            ("dixor:a", "keep", 1),
+            ("dixor:b", "drop", 9),
+            ("dixor:c", "drop", 1),
+        ] {
+            e.insert(node(
+                "DixOr",
+                address,
+                &format!(r#"{{"tag": "{tag}", "n": {n}}}"#),
+            ))
+            .expect("insert");
+        }
+
+        // tag == "keep" || n == 9  →  a and b, never c.
+        let predicate = bin(
+            "||",
+            eq("tag", serde_json::json!("keep")),
+            eq("n", serde_json::json!(9)),
+        );
+
+        let got = same_with_and_without_index(
+            &mut e,
+            "DixOr",
+            def("dixor_tag", "DixOr", "tag"),
+            &predicate,
+            None,
+            false,
+            10,
+        );
+
+        assert_eq!(got, vec!["dixor:a", "dixor:b"]);
+    }
+
+    /// A conjunct *is* a requirement, so `tag == "keep" && n == 1`
+    /// may be served by a prefix on either field — and must give the
+    /// same answer whichever one the planner picks.
+    #[test]
+    fn a_conjunction_is_pushed_and_still_applies_the_rest() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        for (address, tag, n) in [
+            ("dixand:a", "keep", 1),
+            ("dixand:b", "keep", 2),
+            ("dixand:c", "other", 1),
+        ] {
+            e.insert(node(
+                "DixAnd",
+                address,
+                &format!(r#"{{"tag": "{tag}", "n": {n}}}"#),
+            ))
+            .expect("insert");
+        }
+
+        let predicate = bin(
+            "&&",
+            eq("tag", serde_json::json!("keep")),
+            eq("n", serde_json::json!(1)),
+        );
+
+        for index in [
+            def("dixand_tag", "DixAnd", "tag"),
+            def("dixand_n", "DixAnd", "n"),
+        ] {
+            let got = same_with_and_without_index(
+                &mut e,
+                "DixAnd",
+                index,
+                &predicate,
+                None,
+                false,
+                10,
+            );
+
+            assert_eq!(got, vec!["dixand:a"]);
+        }
+    }
+
+    /// `item.x == null` matches a row whose `x` is null *and* a row with
+    /// no `x` at all, because a field access yields null for both. The
+    /// index keys them apart, so no single prefix covers the predicate
+    /// and it must stay on the scan path.
+    #[test]
+    fn a_null_comparison_is_not_pushed_into_a_prefix() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        e.insert(node("DixNull", "dixnull:explicit", r#"{"x": null}"#))
+            .expect("insert");
+
+        e.insert(node("DixNull", "dixnull:absent", r#"{"y": 1}"#))
+            .expect("insert");
+
+        e.insert(node("DixNull", "dixnull:present", r#"{"x": 1}"#))
+            .expect("insert");
+
+        let predicate = eq("x", serde_json::json!(null));
+
+        let got = same_with_and_without_index(
+            &mut e,
+            "DixNull",
+            def("dixnull_x", "DixNull", "x"),
+            &predicate,
+            None,
+            false,
+            10,
+        );
+
+        assert_eq!(got, vec!["dixnull:absent", "dixnull:explicit"]);
+    }
+
+    /// An integer literal and the same value stored as a float are the
+    /// same value to `==`, and must land in the same prefix — otherwise
+    /// the indexed path would answer a question the scan path does not.
+    #[test]
+    fn numeric_equality_ignores_the_written_representation() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        e.insert(node("DixNum", "dixnum:int", r#"{"n": 7}"#))
+            .expect("insert");
+
+        e.insert(node("DixNum", "dixnum:float", r#"{"n": 7.0}"#))
+            .expect("insert");
+
+        e.insert(node("DixNum", "dixnum:other", r#"{"n": 8}"#))
+            .expect("insert");
+
+        let got = same_with_and_without_index(
+            &mut e,
+            "DixNum",
+            def("dixnum_n", "DixNum", "n"),
+            &eq("n", serde_json::json!(7)),
+            None,
+            false,
+            10,
+        );
+
+        assert_eq!(got, vec!["dixnum:float", "dixnum:int"]);
     }
 }

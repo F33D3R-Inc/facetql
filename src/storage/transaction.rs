@@ -33,7 +33,7 @@ use crate::core::history::HistoryEntry;
 use crate::core::node::Node;
 use crate::core::user::UserRecord;
 use crate::storage::commit::StagedCommit;
-use crate::storage::index as keys;
+use crate::storage::index::{self as keys, IndexDef};
 use crate::storage::wal::WalOperation;
 
 /// One resolved mutation within a transaction.
@@ -80,6 +80,20 @@ pub enum Operation {
 
     /// Revoke a persistent user by token hash.
     RevokeUser(String),
+
+    /// Declare an index over a `data` field, and populate it from the
+    /// nodes that already exist.
+    ///
+    /// A mutation rather than an operator side-effect because it is one:
+    /// it adds a durable access path that every later write must
+    /// maintain, and a half-created index is a wrong answer waiting to
+    /// happen. Logging it means recovery re-declares and re-populates it
+    /// — both idempotent by key — rather than restarting into a database
+    /// whose definition log and trees disagree.
+    CreateIndex(IndexDef),
+
+    /// Drop a declared index and remove its tree.
+    DropIndex(String),
 }
 
 impl Operation {
@@ -98,7 +112,12 @@ impl Operation {
     /// The bounds are the index layer's own (see
     /// [`crate::storage::index`]), so there is one definition of an
     /// admissible key rather than a copy of it here that can drift.
-    pub fn validate(&self) -> Result<(), String> {
+    ///
+    /// `indexes` is the set of declared `data`-field indexes the
+    /// mutation will have to maintain: a node carries one key per index
+    /// over its kind, and those keys are subject to the same
+    /// "admissible before it is logged" rule as the built-in ones.
+    pub fn validate(&self, indexes: &[IndexDef]) -> Result<(), String> {
         match self {
             Operation::Archive(entry) => keys::check_history_keys(
                 &entry.address,
@@ -108,7 +127,13 @@ impl Operation {
             ),
 
             Operation::Insert(node) => {
-                keys::check_node_keys(&node.address, &node.kind, &node.owner)
+                keys::check_node_keys(&node.address, &node.kind, &node.owner)?;
+
+                keys::check_data_keys(
+                    indexes.iter().filter(|def| def.kind == node.kind),
+                    &node.address,
+                    &node.data,
+                )
             }
 
             Operation::Delete(address) => {
@@ -126,6 +151,15 @@ impl Operation {
             // Users live in their own flat log, not in an index, so
             // there is no key to admit.
             Operation::InsertUser(_) | Operation::RevokeUser(_) => Ok(()),
+
+            // A definition, not a row: what has to hold is that the name
+            // can be a filename and the kind/field can be key
+            // components. The keys its backfill will write are checked
+            // by the backfill itself, which is the only thing that knows
+            // what values are out there.
+            Operation::CreateIndex(def) => def.validate(),
+
+            Operation::DropIndex(_) => Ok(()),
         }
     }
 
@@ -143,6 +177,8 @@ impl Operation {
             Operation::DeleteEdge(id) => WalOperation::DeleteEdge(id.clone()),
             Operation::InsertUser(user) => WalOperation::InsertUser(user.clone()),
             Operation::RevokeUser(hash) => WalOperation::RevokeUser(hash.clone()),
+            Operation::CreateIndex(def) => WalOperation::CreateIndex(def.clone()),
+            Operation::DropIndex(name) => WalOperation::DropIndex(name.clone()),
         }
     }
 }
@@ -167,17 +203,6 @@ impl Transaction {
     /// A transaction over an already-resolved list of mutations.
     pub fn from_operations(operations: Vec<Operation>) -> Self {
         Self { operations }
-    }
-
-    /// Append one resolved mutation.
-    pub fn push(&mut self, operation: Operation) {
-        self.operations.push(operation);
-    }
-
-    /// True when there is nothing to apply. An empty transaction commits
-    /// trivially without opening a frame (see [`Transaction::commit`]).
-    pub fn is_empty(&self) -> bool {
-        self.operations.is_empty()
     }
 
     /// Stage, commit, and apply this transaction atomically.
@@ -236,7 +261,7 @@ impl Transaction {
     /// An empty transaction is a no-op: it opens no frame, writes no
     /// records, and returns sequence 0 — a value below every real
     /// sequence, so it can never move the checkpoint forward.
-    pub fn commit<F>(self, mut apply: F) -> io::Result<u64>
+    pub fn commit<F>(self, indexes: &[IndexDef], mut apply: F) -> io::Result<u64>
     where
         F: FnMut(&Operation) -> Result<(), String>,
     {
@@ -252,7 +277,7 @@ impl Transaction {
         // committing its neighbours.
         for operation in &self.operations {
             operation
-                .validate()
+                .validate(indexes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         }
 

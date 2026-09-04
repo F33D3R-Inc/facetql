@@ -1,13 +1,11 @@
 mod api;
 mod core;
 mod storage;
-mod rules;
 mod database;
 mod auth;
 mod config;
 mod crypto;
 mod tls_server;
-mod facet;
 mod cli;
 
 use api::routes::create_router;
@@ -79,6 +77,14 @@ enum Command {
         action: cli::UserAction,
     },
 
+    /// Manage secondary indexes over node `data` fields (admin only).
+    /// Talks to a *running* server over its API — start the server
+    /// first.
+    Index {
+        #[command(subcommand)]
+        action: cli::IndexAction,
+    },
+
     /// Fetch a single node by address.
     Get(cli::GetArgs),
 
@@ -147,6 +153,12 @@ async fn main() {
             }
         }
 
+        Some(Command::Index { action }) => {
+            if let Err(e) = cli::run_index(action).await {
+                cli::report_error(e);
+            }
+        }
+
         Some(Command::Get(args)) => {
             if let Err(e) = cli::run_get(args).await {
                 cli::report_error(e);
@@ -191,9 +203,17 @@ async fn main() {
 /// not be backed up, and its absence would only be discovered during a
 /// restore.
 ///
-/// In-progress temp files (`*.tmp`) are skipped: they are the
-/// write-then-rename halves of a catalog or checkpoint update, and a
-/// copy of one is either redundant or garbage.
+/// Two kinds of file are skipped, for different reasons:
+///
+/// * In-progress temp files (`*.tmp`) — the write-then-rename halves of
+///   a catalog, checkpoint or user-log update. A copy of one is either
+///   redundant or garbage.
+///
+/// * The lock file (`facetql.lock`) — it holds no data. What it carries
+///   is a kernel-held lock on an open descriptor, which is precisely the
+///   thing a copy cannot reproduce, so backing it up would ship a file
+///   whose only meaning is "some other process is running", into a
+///   directory where that is false.
 fn data_files() -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(config::data_dir())
         .into_iter()
@@ -202,6 +222,7 @@ fn data_files() -> Vec<String> {
         .filter(|entry| entry.path().is_file())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| !name.ends_with(".tmp"))
+        .filter(|name| name != storage::lock::LOCK_FILE)
         .collect();
 
     // Sorted so a backup lists its files in a stable order run to run.
@@ -816,6 +837,64 @@ mod cli_tests {
         // --kind is mandatory; omitting it is a parse (usage) error.
         let err = Cli::try_parse_from(["facetql", "query"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn index_create_parses_name_kind_field() {
+        let cli = parse(&[
+            "facetql", "index", "create", "post_created", "--kind", "Post", "--field",
+            "created_at", "--token", "T",
+        ]);
+        match cli.command {
+            Some(Command::Index { action: cli::IndexAction::Create { name, kind, field, common } }) => {
+                assert_eq!(name, "post_created");
+                assert_eq!(kind, "Post");
+                assert_eq!(field, "created_at");
+                assert_eq!(common.token.as_deref(), Some("T"));
+            }
+            other => panic!("expected index create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_create_requires_kind_and_field() {
+        // Both are mandatory: an index is defined by exactly one kind
+        // and one field, so a partial declaration is a usage error, not
+        // a request the server should have to reject.
+        let err = Cli::try_parse_from(["facetql", "index", "create", "n", "--kind", "Post"])
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        let err = Cli::try_parse_from(["facetql", "index", "create", "n", "--field", "created_at"])
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn index_list_takes_json_flag() {
+        let cli = parse(&["facetql", "index", "list", "--json"]);
+        match cli.command {
+            Some(Command::Index { action: cli::IndexAction::List { common } }) => {
+                assert!(common.json);
+            }
+            other => panic!("expected index list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_drop_defaults_to_prompting() {
+        let cli = parse(&["facetql", "index", "drop", "post_created"]);
+        match cli.command {
+            Some(Command::Index { action: cli::IndexAction::Drop { name, yes, .. } }) => {
+                assert_eq!(name, "post_created");
+                assert!(!yes, "yes must default false so drops prompt");
+            }
+            other => panic!("expected index drop, got {other:?}"),
+        }
+        let cli = parse(&["facetql", "index", "drop", "post_created", "--yes"]);
+        match cli.command {
+            Some(Command::Index { action: cli::IndexAction::Drop { yes, .. } }) => assert!(yes),
+            other => panic!("expected index drop, got {other:?}"),
+        }
     }
 
     #[test]

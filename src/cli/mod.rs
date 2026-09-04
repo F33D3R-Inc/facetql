@@ -16,6 +16,8 @@ mod output;
 use clap::{Args, Subcommand};
 use std::io::{self, Write};
 
+use crate::storage::index::MAX_INDEX_NAME_LEN;
+
 pub use error::CliError;
 
 use client::FacetClient;
@@ -78,6 +80,69 @@ pub enum UserAction {
     Delete {
         /// Owner whose token(s) to revoke.
         owner: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        common: ClientArgs,
+    },
+}
+
+/// `facetql index <action>` — secondary-index administration (admin
+/// only).
+///
+/// An index is an operator's declaration that one `data` field of one
+/// `kind` is worth keeping in sorted order. It exists to change how
+/// `POST /nodes/query` reads: with `order` on an indexed field the
+/// server walks an already-ordered access path and stops at `limit`,
+/// instead of materializing every matching row and sorting it — which is
+/// bounded by FACETQL_MAX_SCAN_ROWS and fails outright past that bound.
+/// Nothing about the query's *result* changes, only what it costs, which
+/// is why declaring and dropping indexes is an operational act on the
+/// control plane and not something an application asks for mid-request.
+///
+/// Modelled as a nested subcommand rather than three top-level verbs
+/// (`index-create`, …) for the same reason `user` is: these three share
+/// one noun and one admin-only route family, and grouping them keeps
+/// `facetql --help` a list of things you can manage rather than a list of
+/// every verb crossed with every noun.
+#[derive(Subcommand, Debug)]
+pub enum IndexAction {
+    /// Declare an index over one `data` field of one kind.
+    ///
+    /// Backfilling reads every existing node of the kind once, so this
+    /// costs the size of the kind — run it when that's affordable, not
+    /// blindly in a hot path. Re-declaring the identical index is a
+    /// successful no-op, so a setup script may run twice.
+    Create {
+        /// Index name. Letters, digits, '_' and '-' only (max 64 bytes)
+        /// — it becomes a filename.
+        name: String,
+        /// Node kind the index covers. An index is per-kind because
+        /// `data` has no schema across kinds.
+        #[arg(long)]
+        kind: String,
+        /// Top-level `data` field to keep ordered — the same name you
+        /// would pass to `query --order`.
+        #[arg(long)]
+        field: String,
+        #[command(flatten)]
+        common: ClientArgs,
+    },
+    /// List every declared index.
+    List {
+        #[command(flatten)]
+        common: ClientArgs,
+    },
+    /// Drop a declared index.
+    ///
+    /// Never breaks a query: one that was being served by this index
+    /// falls back to the materialize-and-sort path. It is still gated
+    /// behind a confirmation like the other removals, because rebuilding
+    /// costs another full read of the kind.
+    Drop {
+        /// Name of the index to drop.
+        name: String,
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
@@ -170,6 +235,42 @@ fn validate_kind(kind: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// An index name is both a path segment (`/admin/indexes/:name`) and,
+/// server-side, part of the index's filename. The engine enforces this
+/// same alphabet and length — we check it here too so an obvious typo
+/// costs a usage error (exit 2) instead of a round trip and a 400, and
+/// so the failure reads as "your argument is wrong" rather than "the
+/// server said no".
+fn validate_index_name(name: &str) -> Result<(), CliError> {
+    if name.is_empty() || name.len() > MAX_INDEX_NAME_LEN {
+        return Err(CliError::InvalidInput(format!(
+            "index name must be 1..={MAX_INDEX_NAME_LEN} bytes"
+        )));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(CliError::InvalidInput(format!(
+            "invalid index name {name:?}: may contain only letters, digits, '_' and '-'"
+        )));
+    }
+    Ok(())
+}
+
+/// The indexed field names a top-level key inside each node's `data`.
+/// Only emptiness is checkable here: any other JSON key is legal, and
+/// whether the field actually exists on a given node is a property of
+/// the data, not of the argument.
+fn validate_field(field: &str) -> Result<(), CliError> {
+    if field.trim().is_empty() {
+        return Err(CliError::InvalidInput(
+            "field must not be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate and normalize a `--data` argument: it must be a JSON
 /// document. We re-serialize the parsed value so what we send is
 /// canonical and we've proven it parses (a malformed blob is a client
@@ -253,6 +354,54 @@ pub async fn run_user(action: UserAction) -> Result<(), CliError> {
             )?;
             common.client()?.delete_user(&owner).await?;
             println!("Revoked persistent identity {owner:?}.");
+            Ok(())
+        }
+    }
+}
+
+pub async fn run_index(action: IndexAction) -> Result<(), CliError> {
+    match action {
+        IndexAction::Create { name, kind, field, common } => {
+            validate_index_name(&name)?;
+            validate_kind(&kind)?;
+            validate_field(&field)?;
+            let def = common.client()?.create_index(&name, &kind, &field).await?;
+            if common.json {
+                println!("{}", output::json_pretty(&def));
+            } else {
+                println!("Declared index {name:?} on {kind}.{field}.");
+                // Say the cost out loud: the command has already paid it
+                // by the time this prints, and an operator who did not
+                // expect a full read of the kind should learn that here
+                // rather than from a latency graph.
+                eprintln!(
+                    "Backfilled from every existing {kind} node. Queries on \
+                     this kind ordering by {field:?} now read through the \
+                     index instead of sorting a full scan."
+                );
+            }
+            Ok(())
+        }
+        IndexAction::List { common } => {
+            let indexes = common.client()?.list_indexes().await?;
+            if common.json {
+                println!("{}", output::json_pretty(&serde_json::Value::Array(indexes)));
+            } else {
+                println!("{}", output::render_indexes(&indexes));
+            }
+            Ok(())
+        }
+        IndexAction::Drop { name, yes, common } => {
+            validate_index_name(&name)?;
+            confirm_or_abort(
+                yes,
+                &format!(
+                    "Drop index {name:?}? Queries it served fall back to \
+                     sorting a full scan; rebuilding it re-reads the kind."
+                ),
+            )?;
+            common.client()?.drop_index(&name).await?;
+            println!("Dropped index {name:?}.");
             Ok(())
         }
     }
@@ -402,6 +551,35 @@ mod tests {
         assert!(validate_kind("Client").is_ok());
         assert!(validate_kind("").is_err());
         assert!(validate_kind("   ").is_err());
+    }
+
+    #[test]
+    fn validate_index_name_alphabet_and_length() {
+        assert!(validate_index_name("post_created_at").is_ok());
+        assert!(validate_index_name("idx-1").is_ok());
+        assert!(validate_index_name("").is_err());
+        // The name becomes a filename and a path segment, so anything
+        // that could be read as a path is rejected outright.
+        assert!(validate_index_name("a/b").is_err());
+        assert!(validate_index_name("a.b").is_err());
+        assert!(validate_index_name("a b").is_err());
+        assert!(validate_index_name(&"x".repeat(MAX_INDEX_NAME_LEN)).is_ok());
+        assert!(validate_index_name(&"x".repeat(MAX_INDEX_NAME_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn validate_index_name_failures_are_usage_errors() {
+        // Exit code 2, not 1: a bad name is the operator's mistake and
+        // never reaches the wire.
+        let err = validate_index_name("bad/name").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn validate_field_rules() {
+        assert!(validate_field("created_at").is_ok());
+        assert!(validate_field("").is_err());
+        assert!(validate_field("   ").is_err());
     }
 
     #[test]

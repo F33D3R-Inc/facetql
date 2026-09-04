@@ -10,6 +10,7 @@ use crate::core::history::HistoryEntry;
 use crate::core::node::Node;
 use crate::core::user::UserRecord;
 use crate::crypto;
+use crate::storage::index::IndexDef;
 
 /// Current on-disk WAL record format.
 ///
@@ -385,6 +386,17 @@ pub enum WalOperation {
 
     /// Revoke a persistent user.
     RevokeUser(String),
+
+    /// Declare an index over a `data` field.
+    ///
+    /// Carries the whole definition rather than a name, because replay
+    /// has to be able to re-create the index from the WAL alone — the
+    /// definition log it also writes is applied by the same operation,
+    /// so a crash between the two must be repairable from this record.
+    CreateIndex(IndexDef),
+
+    /// Drop a declared index.
+    DropIndex(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,18 +438,6 @@ impl WalRecord {
         }
     }
 
-    /// Create a standalone WAL record.
-    pub fn standalone(
-        operation: WalOperation,
-    ) -> Self {
-        Self::new(
-            next_sequence(),
-            STANDALONE_TRANSACTION_ID,
-            next_operation_id(),
-            operation,
-        )
-    }
-
     /// Create a BEGIN record.
     pub fn begin(
         transaction_id: u64,
@@ -474,44 +474,6 @@ impl WalRecord {
         )
     }
 
-    /// Returns true when this record starts a transaction.
-    pub fn is_begin(&self) -> bool {
-        matches!(
-            self.operation,
-            WalOperation::Begin
-        )
-    }
-
-    /// Returns true when this record commits a transaction.
-    pub fn is_commit(&self) -> bool {
-        matches!(
-            self.operation,
-            WalOperation::Commit
-        )
-    }
-
-    /// Returns true when this record aborts a transaction.
-    pub fn is_abort(&self) -> bool {
-        matches!(
-            self.operation,
-            WalOperation::Abort
-        )
-    }
-
-    /// Returns true when this record contains a mutation rather than a
-    /// transaction-control marker.
-    pub fn is_mutation(&self) -> bool {
-        matches!(
-            self.operation,
-            WalOperation::Archive(_)
-                | WalOperation::Insert(_)
-                | WalOperation::Delete(_)
-                | WalOperation::InsertEdge(_)
-                | WalOperation::DeleteEdge(_)
-                | WalOperation::InsertUser(_)
-                | WalOperation::RevokeUser(_)
-        )
-    }
 }
 
 /// Allocate the next process-local sequence.
@@ -985,32 +947,6 @@ pub fn truncate_torn_tail(
     directory.sync_all()?;
 
     Ok(())
-}
-
-/// Append a standalone operation.
-pub fn append_standalone(
-    operation: WalOperation,
-) -> io::Result<WalRecord> {
-    if matches!(
-        operation,
-        WalOperation::Begin
-            | WalOperation::Commit
-            | WalOperation::Abort
-    ) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "transaction control records cannot be standalone operations",
-        ));
-    }
-
-    let record =
-        WalRecord::standalone(
-            operation,
-        );
-
-    append(&record)?;
-
-    Ok(record)
 }
 
 /// Append BEGIN.

@@ -20,6 +20,7 @@ use crate::core::user::{Role, UserRecord};
 use crate::core::history::HistoryEntry;
 use crate::auth::{auth_middleware, hash_token, AuthIdentity};
 use crate::storage::engine::{ClaimError, Expectation, TransactionError, TxOperation};
+use crate::storage::index::IndexDef;
 
 /// A read that could not reach the storage it needed.
 ///
@@ -308,6 +309,9 @@ pub fn create_router(db: Arc<Database>) -> Router {
         .route("/admin/users", post(create_user))
         .route("/admin/users", get(list_users))
         .route("/admin/users/:owner", delete(revoke_user))
+        .route("/admin/indexes", post(create_index))
+        .route("/admin/indexes", get(list_indexes))
+        .route("/admin/indexes/:name", delete(drop_index))
         .route("/stats", get(stats))
         .route_layer(middleware::from_fn_with_state(db.clone(), auth_middleware))
         .with_state(db);
@@ -329,6 +333,7 @@ async fn create_node(
     Json(payload): Json<CreateNodeRequest>,
 ) -> impl IntoResponse {
     let coordinate = Coordinate::new(payload.x, payload.y, payload.z, payload.q);
+    let is_admin = identity.is_admin();
     let mut node = Node::new(coordinate, payload.address.clone(), payload.kind.clone(), identity.owner);
     node.data = payload.data;
     if payload.public.unwrap_or(false) {
@@ -358,7 +363,7 @@ async fn create_node(
             .into_response();
     }
 
-    match engine.insert_with_edges(node, edge_targets) {
+    match engine.insert_with_edges(node, edge_targets, is_admin) {
         Ok(edges_created) => {
             drop(engine);
             db.publish(
@@ -371,6 +376,15 @@ async fn create_node(
             )
                 .into_response()
         }
+        // An ownership refusal is a 403, not a 400: the request is
+        // well-formed and the caller simply may not make it. `PUT` and
+        // `DELETE` already answer that way for the same refusal, and a
+        // client that saw 400 here would retry after "fixing" a body
+        // that was never wrong.
+        Err((e, _)) if e.starts_with("not authorized") => {
+            (StatusCode::FORBIDDEN, e).into_response()
+        }
+
         Err((e, edges_created_before_failure)) => (
             StatusCode::BAD_REQUEST,
             Json(CreateNodeError { error: e, edges_created_before_failure }),
@@ -530,12 +544,54 @@ async fn claim_node(
     }
 }
 
+/// `GET /node/:address/owned` — every node held by the same owner as the
+/// node at `:address`.
+///
+/// The route has always declared `:address` and the handler used to
+/// ignore it, returning the caller's own nodes whatever address was
+/// passed. That is not a stricter reading of the route, it is a
+/// different endpoint wearing its name: a caller asking about one node
+/// got an answer about themselves, and the parameter documented a
+/// capability that did not exist.
+///
+/// The subject is therefore resolved from `:address`, and because the
+/// answer can now be about somebody else, three rules apply that did not
+/// have to before:
+///
+///   * reading the subject node needs read permission on it, so an
+///     address the caller cannot see cannot be used to discover who owns
+///     it;
+///   * the listing is filtered to what the caller may read, so a private
+///     node never appears in another identity's result; and
+///   * an admin bypasses both, the same way it does everywhere else.
 async fn list_owned(
     State(db): State<Arc<Database>>,
+    Path(address): Path<String>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> impl IntoResponse {
     let engine = db.engine();
-    match engine.nodes_by_owner(&identity.owner) {
+
+    let subject = match engine.get(&address) {
+        Ok(Some(node)) => node,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, "node not found").into_response()
+        }
+        Err(e) => return storage_failure(e),
+    };
+
+    if !identity.is_admin() && !subject.can_read(&identity.owner) {
+        return (StatusCode::FORBIDDEN, "not authorized to read this node")
+            .into_response();
+    }
+
+    // An admin filters by nothing, matching `query`'s superuser bypass.
+    let requester = if identity.is_admin() {
+        None
+    } else {
+        Some(identity.owner.as_str())
+    };
+
+    match engine.nodes_by_owner(&subject.owner, requester) {
         Ok(owned) => {
             let owned: Vec<Node> = owned;
             (StatusCode::OK, Json(owned)).into_response()
@@ -1424,6 +1480,104 @@ async fn revoke_user(
     (StatusCode::NO_CONTENT, "").into_response()
 }
 
+// ---------------------------------------------------------------------
+// Index administration
+// ---------------------------------------------------------------------
+//
+// Admin-only, and on the control plane (`/admin/*`) rather than beside
+// the data endpoints, because declaring an index is an operational
+// decision about how the database is shaped — not something an
+// application makes on its own behalf mid-request. It is also the one
+// write whose cost is proportional to the data already stored, which is
+// not a cost an ordinary caller should be able to impose.
+
+#[derive(Deserialize)]
+struct CreateIndexRequest {
+    name: String,
+    kind: String,
+    field: String,
+}
+
+/// Declare an index over one `data` field of one kind.
+///
+/// Returns 201 with the definition. Re-declaring the identical index
+/// succeeds — the operation an operator actually wants is "make sure
+/// this exists", and failing the second run of a setup script is not
+/// that. A *different* index under an existing name, or a second index
+/// over the same field, is a 409: those are contradictions, not repeats.
+async fn create_index(
+    State(db): State<Arc<Database>>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(request): Json<CreateIndexRequest>,
+) -> impl IntoResponse {
+    if !identity.is_admin() {
+        return (StatusCode::FORBIDDEN, "admin only").into_response();
+    }
+
+    let def = IndexDef {
+        name: request.name,
+        kind: request.kind,
+        field: request.field,
+    };
+
+    let mut engine = db.engine_mut();
+
+    match engine.create_index(def.clone()) {
+        Ok(()) => {}
+
+        Err(e) if e.contains("already") => {
+            return (StatusCode::CONFLICT, e).into_response();
+        }
+
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
+    }
+
+    drop(engine);
+
+    (StatusCode::CREATED, Json(def)).into_response()
+}
+
+/// Every declared index. Admin-only for the same reason the definitions
+/// are: the shape of the access paths is operational detail, and an
+/// application that had to know about them would be an application
+/// coupled to them.
+async fn list_indexes(
+    State(db): State<Arc<Database>>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> impl IntoResponse {
+    if !identity.is_admin() {
+        return (StatusCode::FORBIDDEN, "admin only").into_response();
+    }
+
+    let engine = db.engine();
+
+    (StatusCode::OK, Json(engine.list_indexes())).into_response()
+}
+
+/// Drop a declared index.
+///
+/// Queries that were being served by it keep working — they fall back to
+/// the materialize-and-sort path, which is slower and bounded by
+/// `FACETQL_MAX_SCAN_ROWS`, not wrong.
+async fn drop_index(
+    State(db): State<Arc<Database>>,
+    Path(name): Path<String>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> impl IntoResponse {
+    if !identity.is_admin() {
+        return (StatusCode::FORBIDDEN, "admin only").into_response();
+    }
+
+    let mut engine = db.engine_mut();
+
+    match engine.drop_index(&name) {
+        Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod stats_route_tests {
     //! HTTP-level tests for `GET /stats` driven through the real router
@@ -1586,5 +1740,313 @@ mod stats_route_tests {
 
         let resp = router().oneshot(req).await.expect("router response");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[cfg(test)]
+mod write_authorization_tests {
+    //! Regression tests for two holes in the node endpoints, both found
+    //! by reading the routes against the handlers rather than by a
+    //! failing request:
+    //!
+    //!   * `POST /node` overwrote a node belonging to another identity
+    //!     and reassigned ownership to the caller, while `PUT`, `DELETE`
+    //!     and `insert_node` inside a transaction all refused exactly
+    //!     that write.
+    //!   * `GET /node/:address/owned` declared a path parameter and
+    //!     ignored it, answering about the caller instead of about the
+    //!     address — so the parameter promised a capability that did not
+    //!     exist, and the listing had never needed a visibility filter.
+    //!
+    //! Driven through the real router so the auth middleware, the status
+    //! codes and the JSON shape are all part of what is asserted.
+    use super::*;
+    use crate::core::coordinate::Coordinate;
+    use crate::core::user::{Role, UserRecord};
+    use crate::database::Database;
+    use crate::storage::engine::test_support::disk_guard;
+    use crate::storage::engine::StorageEngine;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::RwLock;
+    use tower::ServiceExt;
+
+    const ALICE_TOKEN: &str = "authz-alice-token";
+    const BOB_TOKEN: &str = "authz-bob-token";
+    const ADMIN_TOKEN: &str = "authz-admin-token";
+
+    const KIND: &str = "AuthzNode";
+
+    fn owned_node(address: &str, owner: &str, public: bool) -> Node {
+        let mut node = Node::new(
+            Coordinate::new(0, 0, 0, 0),
+            address.to_string(),
+            KIND.to_string(),
+            owner.to_string(),
+        );
+
+        if public {
+            node.visibility = Visibility::Public;
+        }
+
+        node
+    }
+
+    /// Alice owns a public node, a private node, and nothing else.
+    fn router() -> axum::Router {
+        let mut engine = StorageEngine::open().expect("open storage engine");
+
+        for (address, owner, public) in [
+            ("authz:alice-public", "alice", true),
+            ("authz:alice-private", "alice", false),
+            ("authz:bob-public", "bob", true),
+        ] {
+            engine
+                .insert(owned_node(address, owner, public))
+                .expect("insert node");
+        }
+
+        for (token, owner, role) in [
+            (ALICE_TOKEN, "alice", Role::User),
+            (BOB_TOKEN, "bob", Role::User),
+            (ADMIN_TOKEN, "authz-admin", Role::Admin),
+        ] {
+            engine.users.insert(
+                hash_token(token),
+                UserRecord {
+                    token_hash: hash_token(token),
+                    owner: owner.to_string(),
+                    role,
+                },
+            );
+        }
+
+        let (broadcaster, _) = tokio::sync::broadcast::channel(16);
+
+        create_router(Arc::new(Database {
+            engine: Arc::new(RwLock::new(engine)),
+            broadcaster,
+        }))
+    }
+
+    fn post_node(token: &str, address: &str) -> Request<Body> {
+        let body = serde_json::json!({
+            "address": address,
+            "kind": KIND,
+            "x": 0, "y": 0, "z": 0, "q": 0,
+            "data": r#"{"written_by":"the caller"}"#,
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri("/node")
+            .header("x-api-key", token)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build request")
+    }
+
+    fn get(token: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("x-api-key", token)
+            .body(Body::empty())
+            .expect("build request")
+    }
+
+    async fn json_body(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+
+        serde_json::from_slice(&bytes).expect("valid JSON")
+    }
+
+    // -----------------------------------------------------------------
+    // POST /node
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_node_cannot_overwrite_another_owners_node() {
+        let _guard = disk_guard();
+
+        let resp = router()
+            .oneshot(post_node(BOB_TOKEN, "authz:alice-public"))
+            .await
+            .expect("router response");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a cross-owner overwrite must be refused, not accepted"
+        );
+    }
+
+    /// The refusal has to leave the node exactly as it was — owner
+    /// included. A check that rejects the response but not the write
+    /// would be worse than none, because it would look safe.
+    #[tokio::test]
+    async fn a_refused_overwrite_changes_nothing() {
+        let _guard = disk_guard();
+
+        let app = router();
+
+        app.clone()
+            .oneshot(post_node(BOB_TOKEN, "authz:alice-public"))
+            .await
+            .expect("router response");
+
+        let resp = app
+            .oneshot(get(ALICE_TOKEN, "/node/authz:alice-public"))
+            .await
+            .expect("router response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let node = json_body(resp).await;
+
+        assert_eq!(node["owner"], "alice", "ownership was reassigned");
+        assert_ne!(
+            node["data"].as_str().unwrap_or_default(),
+            r#"{"written_by":"the caller"}"#,
+            "the refused write landed anyway"
+        );
+    }
+
+    /// The owner overwriting their own node is the ordinary upsert and
+    /// must keep working — the fix must not turn `POST` into
+    /// create-only.
+    #[tokio::test]
+    async fn an_owner_may_still_overwrite_their_own_node() {
+        let _guard = disk_guard();
+
+        let resp = router()
+            .oneshot(post_node(ALICE_TOKEN, "authz:alice-public"))
+            .await
+            .expect("router response");
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// Creating a brand-new address is unaffected: there is nothing to
+    /// authorize against.
+    #[tokio::test]
+    async fn creating_a_fresh_address_is_unaffected() {
+        let _guard = disk_guard();
+
+        let resp = router()
+            .oneshot(post_node(BOB_TOKEN, "authz:brand-new"))
+            .await
+            .expect("router response");
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// An admin overwrites anything, the same way it bypasses
+    /// visibility on every read path.
+    #[tokio::test]
+    async fn an_admin_may_overwrite_any_node() {
+        let _guard = disk_guard();
+
+        let resp = router()
+            .oneshot(post_node(ADMIN_TOKEN, "authz:alice-public"))
+            .await
+            .expect("router response");
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // -----------------------------------------------------------------
+    // GET /node/:address/owned
+    // -----------------------------------------------------------------
+
+    /// The listing is now about the address, and filtered to what the
+    /// caller may read: Bob asking about Alice's public node sees
+    /// Alice's public nodes and none of her private ones.
+    #[tokio::test]
+    async fn owned_answers_about_the_address_without_leaking_private_nodes() {
+        let _guard = disk_guard();
+
+        let resp = router()
+            .oneshot(get(BOB_TOKEN, "/node/authz:alice-public/owned"))
+            .await
+            .expect("router response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let addresses: Vec<String> = json_body(resp)
+            .await
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|n| n["address"].as_str().unwrap_or_default().to_string())
+            .collect();
+
+        assert!(
+            addresses.contains(&"authz:alice-public".to_string()),
+            "the subject's own public node is missing: {addresses:?}"
+        );
+
+        assert!(
+            !addresses.contains(&"authz:alice-private".to_string()),
+            "a private node leaked to another identity: {addresses:?}"
+        );
+
+        assert!(
+            !addresses.contains(&"authz:bob-public".to_string()),
+            "the caller's own nodes are not what was asked for: {addresses:?}"
+        );
+    }
+
+    /// The owner asking about their own node still sees everything they
+    /// own, private included.
+    #[tokio::test]
+    async fn an_owner_sees_their_own_private_nodes() {
+        let _guard = disk_guard();
+
+        let resp = router()
+            .oneshot(get(ALICE_TOKEN, "/node/authz:alice-private/owned"))
+            .await
+            .expect("router response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let addresses: Vec<String> = json_body(resp)
+            .await
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|n| n["address"].as_str().unwrap_or_default().to_string())
+            .collect();
+
+        assert!(addresses.contains(&"authz:alice-private".to_string()));
+        assert!(addresses.contains(&"authz:alice-public".to_string()));
+    }
+
+    /// An address the caller cannot read cannot be used to find out who
+    /// owns it, or what else they own.
+    #[tokio::test]
+    async fn an_unreadable_address_cannot_be_used_as_a_subject() {
+        let _guard = disk_guard();
+
+        let resp = router()
+            .oneshot(get(BOB_TOKEN, "/node/authz:alice-private/owned"))
+            .await
+            .expect("router response");
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_address_is_not_found() {
+        let _guard = disk_guard();
+
+        let resp = router()
+            .oneshot(get(BOB_TOKEN, "/node/authz:no-such-node/owned"))
+            .await
+            .expect("router response");
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

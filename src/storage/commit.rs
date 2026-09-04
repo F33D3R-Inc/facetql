@@ -75,9 +75,14 @@
 //!    advances the durable checkpoint past COMMIT, now that physical
 //!    storage reflects the whole batch.
 //!
-//! If anything fails between steps 1 and 3, call
-//! [`StagedCommit::abort`]: it writes a durable `ABORT` marker and
-//! releases the fence, and recovery discards the frame.
+//! If anything fails between steps 1 and 3, the frame is simply
+//! dropped. There is no explicit abort call, because there is nothing
+//! for one to do that `Drop` does not: an uncommitted frame has no
+//! durable `COMMIT`, and recovery discards a frame without one whether
+//! or not an `ABORT` marker follows it. So [`Drop`] releases the fence
+//! and writes the `ABORT` marker best-effort — the marker records the
+//! intent explicitly in the log, but the missing `COMMIT` is what
+//! actually makes the frame invisible.
 
 use std::io;
 
@@ -88,10 +93,10 @@ use crate::storage::wal::{self, WalOperation, WalRecord};
 ///
 /// Constructed by [`StagedCommit::open`], which allocates the
 /// transaction id, makes the `BEGIN` marker durable, and registers a
-/// checkpoint fence at the BEGIN sequence. It must be consumed by
-/// exactly one of [`StagedCommit::settle`] (success) or
-/// [`StagedCommit::abort`] (failure) so the fence is always released.
-#[must_use = "an open commit frame must be settled or aborted to release its checkpoint fence"]
+/// checkpoint fence at the BEGIN sequence. A successful frame is
+/// consumed by [`StagedCommit::settle`]; a failed one is dropped, and
+/// [`Drop`] releases the fence for it.
+#[must_use = "an open commit frame must be settled, or dropped so its checkpoint fence is released"]
 pub struct StagedCommit {
     /// The transaction id every record in this frame carries. Non-zero
     /// and distinct from the standalone id `0`.
@@ -134,11 +139,6 @@ impl StagedCommit {
             begin_sequence,
             commit_sequence: None,
         })
-    }
-
-    /// The transaction id of this frame.
-    pub fn transaction_id(&self) -> u64 {
-        self.transaction_id
     }
 
     /// Stage one resolved mutation into the frame.
@@ -225,8 +225,8 @@ impl StagedCommit {
     ///
     /// Returns an error if the frame was never committed — settling an
     /// uncommitted frame would unpin the checkpoint over operations that
-    /// recovery is going to discard, losing them. Abort uncommitted
-    /// frames with [`StagedCommit::abort`] instead.
+    /// recovery is going to discard, losing them. An uncommitted frame
+    /// is dropped instead; see [`Drop`].
     ///
     /// # Why this does not advance the checkpoint
     ///
@@ -257,36 +257,13 @@ impl StagedCommit {
         Ok(commit_sequence)
     }
 
-    /// Abort an open, uncommitted frame.
-    ///
-    /// Appends+fsyncs an `Abort` marker for this transaction and releases
-    /// the checkpoint fence. Recovery discards a `BEGIN … ABORT` frame
-    /// (and equally a `BEGIN … EOF` frame if even the ABORT never
-    /// reached disk), so none of the staged operations become visible.
-    ///
-    /// The checkpoint is intentionally left where it was: the aborted
-    /// records sit above it and will simply be filtered out by any later
-    /// advance, never replayed.
-    pub fn abort(self) -> io::Result<()> {
-        // Best-effort ABORT marker: even if this append fails, the frame
-        // has no COMMIT, so recovery already discards it. The fence
-        // release below is the part that must always happen.
-        let abort_result = wal::abort(self.transaction_id).map(|_| ());
-
-        checkpoint::release_fence(self.begin_sequence);
-
-        std::mem::forget(self);
-
-        abort_result
-    }
 }
 
 impl Drop for StagedCommit {
-    /// Safety net for a frame dropped without an explicit
-    /// [`StagedCommit::settle`] or [`StagedCommit::abort`] (e.g. an early
-    /// `?` unwinds the caller). What it does depends on whether COMMIT
-    /// reached disk, because that decides what recovery will do with the
-    /// frame:
+    /// The disposal path for a frame that was not settled — a failure
+    /// between BEGIN and COMMIT, or an early `?` unwinding the caller.
+    /// What it does depends on whether COMMIT reached disk, because that
+    /// decides what recovery will do with the frame:
     ///
     /// * **No durable COMMIT** — recovery discards the frame, so the
     ///   fence has nothing left to protect and is released (plus a

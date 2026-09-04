@@ -73,6 +73,46 @@ pub fn render_users(users: &[Value]) -> String {
     out
 }
 
+/// Render the index list (`GET /admin/indexes`) as an aligned table.
+///
+/// Three columns rather than the one-record-per-block form
+/// [`render_node`] uses: an index definition is three short scalars, and
+/// the question an operator asks of this list — "is the field I'm
+/// ordering by covered?" — is answered by scanning a column, which only
+/// works if the columns line up.
+pub fn render_indexes(indexes: &[Value]) -> String {
+    if indexes.is_empty() {
+        return "(no indexes declared)".to_string();
+    }
+    let width = |header: &str, key: &str| {
+        indexes
+            .iter()
+            .filter_map(|i| i.get(key).and_then(Value::as_str))
+            .map(str::len)
+            .max()
+            .unwrap_or(0)
+            .max(header.len())
+    };
+    let name_width = width("NAME", "name");
+    let kind_width = width("KIND", "kind");
+
+    let mut out = format!(
+        "{:<name_width$}  {:<kind_width$}  FIELD\n",
+        "NAME", "KIND"
+    );
+    for index in indexes {
+        let field = |k: &str| index.get(k).and_then(Value::as_str).unwrap_or("-");
+        out.push_str(&format!(
+            "{:<name_width$}  {:<kind_width$}  {}\n",
+            field("name"),
+            field("kind"),
+            field("field")
+        ));
+    }
+    out.push_str(&format!("\n{} index(es)", indexes.len()));
+    out
+}
+
 fn visibility(node: &Value) -> String {
     match node.get("visibility") {
         Some(Value::String(s)) => s.clone(),
@@ -152,5 +192,31 @@ mod tests {
     #[test]
     fn render_users_empty() {
         assert_eq!(render_users(&[]), "(no users)");
+    }
+
+    #[test]
+    fn render_indexes_aligns_and_counts() {
+        let indexes = vec![
+            json!({"name": "post_created", "kind": "Post", "field": "created_at"}),
+            json!({"name": "s_exp", "kind": "__session", "field": "_expires_unix"}),
+        ];
+        let out = render_indexes(&indexes);
+        assert!(out.contains("NAME"));
+        assert!(out.contains("KIND"));
+        assert!(out.contains("FIELD"));
+        assert!(out.contains("post_created"));
+        assert!(out.contains("_expires_unix"));
+        assert!(out.contains("2 index(es)"));
+        // Columns are padded to the widest cell, header included, so the
+        // KIND column starts at the same offset on every line.
+        let lines: Vec<&str> = out.lines().collect();
+        let kind_col = lines[0].find("KIND").expect("header has a KIND column");
+        assert!(lines[1][kind_col..].starts_with("Post"));
+        assert!(lines[2][kind_col..].starts_with("__session"));
+    }
+
+    #[test]
+    fn render_indexes_empty() {
+        assert_eq!(render_indexes(&[]), "(no indexes declared)");
     }
 }

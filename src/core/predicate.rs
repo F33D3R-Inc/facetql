@@ -340,3 +340,108 @@ fn lit_value(expr: &Expr) -> Value {
         _ => val,
     }
 }
+
+// ---------------------------------------------------------------------
+// Sargability: which part of a predicate an index can answer
+// ---------------------------------------------------------------------
+
+/// The literal a predicate requires one field to equal, if it requires
+/// one unconditionally.
+///
+/// This is the analysis that lets a declared index *filter* rather than
+/// only order: `item.status == "open"` over an index on `status` becomes
+/// a scan of just the entries holding `"open"`, instead of a walk of
+/// every node of the kind with a JSON decode and an evaluation per row.
+///
+/// # Why only equality
+///
+/// Because equality is the only comparison here that cannot fail.
+/// [`eval_bin_op`]'s ordering operators demand numeric operands and
+/// return `Err` otherwise — and a `get` of an absent field yields
+/// `Null` — so `item.score > 5` does not skip a row whose `score` is a
+/// string or missing, it *fails the whole query*. Narrowing such a scan
+/// to a numeric range would quietly turn that error into a page of
+/// results: the indexed and unindexed paths would then disagree about
+/// what the request even means, which is precisely the divergence an
+/// index must never introduce. `==` goes through `values_equal`, which
+/// answers false rather than failing, so restricting the scan to the
+/// matching entries removes only rows that were going to evaluate false
+/// anyway.
+///
+/// A `null` literal is deliberately not sargable either: `get` returns
+/// `Null` for a field that is absent as well as one that is explicitly
+/// null, so `item.x == null` matches both — while the index keys them
+/// apart (an absent value sorts after every present one). One prefix
+/// cannot cover both, so this stays on the scan path.
+///
+/// # Why only top-level `&&`
+///
+/// A conjunct is a requirement: every row in the result satisfies it, so
+/// narrowing to it removes nothing. Under `||` that is false — a row can
+/// satisfy the other branch — and under `!` it is inverted. So the walk
+/// descends through `&&` and stops at anything else. The result is
+/// conservative by construction: it may fail to find a bound that
+/// exists, which costs a scan, and can never invent one that does not,
+/// which would cost correctness.
+pub fn equality_literal(expr: &Expr, item_var: &str, field: &str) -> Option<Value> {
+    equality_literal_at(expr, item_var, field, 0)
+}
+
+fn equality_literal_at(
+    expr: &Expr,
+    item_var: &str,
+    field: &str,
+    depth: usize,
+) -> Option<Value> {
+    if depth >= MAX_PREDICATE_DEPTH {
+        return None;
+    }
+
+    if expr.kind != "bin" {
+        return None;
+    }
+
+    let l = expr.l.as_deref()?;
+    let r = expr.r.as_deref()?;
+
+    match expr.op.as_deref() {
+        Some("&&") => equality_literal_at(l, item_var, field, depth + 1)
+            .or_else(|| equality_literal_at(r, item_var, field, depth + 1)),
+
+        Some("==") => match_equality(l, r, item_var, field)
+            .or_else(|| match_equality(r, l, item_var, field)),
+
+        _ => None,
+    }
+}
+
+/// `<field access> == <literal>`, in that order, for this exact field.
+fn match_equality(
+    access: &Expr,
+    literal: &Expr,
+    item_var: &str,
+    field: &str,
+) -> Option<Value> {
+    if access.kind != "get" || literal.kind != "lit" {
+        return None;
+    }
+
+    if access.field.as_deref() != Some(field) {
+        return None;
+    }
+
+    let obj = access.obj.as_deref()?;
+
+    if obj.kind != "ref" || obj.name.as_deref() != Some(item_var) {
+        return None;
+    }
+
+    let value = lit_value(literal);
+
+    // See the doc comment: `null` cannot be served by one prefix.
+    if value.is_null() {
+        return None;
+    }
+
+    Some(value)
+}

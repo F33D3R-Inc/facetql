@@ -72,6 +72,52 @@ impl FacetClient {
         expect_success(resp).await
     }
 
+    // ── admin: index administration ────────────────────────────────────
+
+    /// `POST /admin/indexes` — declare a secondary index over one
+    /// `data` field of one kind.
+    ///
+    /// The server answers 201 with the stored definition, 409 when the
+    /// name or the (kind, field) pair contradicts an index that already
+    /// exists, and 400 when the definition is one the storage layer
+    /// cannot honour. All three come back through `read_json` as an
+    /// `Api` error carrying the server's own words, so the CLI does not
+    /// second-guess the engine's rules — it only pre-checks the ones it
+    /// can check without a round trip (see `validate_index_name`).
+    pub async fn create_index(
+        &self,
+        name: &str,
+        kind: &str,
+        field: &str,
+    ) -> Result<Value, CliError> {
+        let body = json!({
+            "name": name,
+            "kind": kind,
+            "field": field,
+        });
+        let resp = self.post("/admin/indexes", &body).await?;
+        read_json(resp).await
+    }
+
+    /// `GET /admin/indexes` — every declared index, as an array of
+    /// `{name, kind, field}`.
+    pub async fn list_indexes(&self) -> Result<Vec<Value>, CliError> {
+        let resp = self.get("/admin/indexes").await?;
+        read_json_array(resp).await
+    }
+
+    /// `DELETE /admin/indexes/:name` — drop a declared index. 204 on
+    /// success, 404 if no index by that name exists; the latter reaches
+    /// the operator as an `Api` error rather than being swallowed,
+    /// because "the index I meant to drop was never there" is a fact
+    /// worth surfacing.
+    pub async fn drop_index(&self, name: &str) -> Result<(), CliError> {
+        let resp = self
+            .send(self.http.delete(self.url(&format!("/admin/indexes/{name}"))))
+            .await?;
+        expect_success(resp).await
+    }
+
     // ── data ───────────────────────────────────────────────────────────
 
     /// `GET /node/:address`.

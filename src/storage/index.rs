@@ -42,13 +42,19 @@
 //! through `StorageEngine::apply_committed` and nothing else writes
 //! records or index entries.
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::io::Result;
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config;
 use crate::storage::btree::BTree;
 
-/// The six durable access paths, opened together.
+/// The six built-in access paths plus every operator-declared one,
+/// opened together.
 pub struct Indexes {
     /// `address → RecordLocation` of the node's current record. The one
     /// index a point read cannot be served without.
@@ -74,6 +80,128 @@ pub struct Indexes {
     /// prefix scan and reading one node's history never touches
     /// another's.
     pub history: BTree,
+
+    /// Operator-declared indexes over a `data` field, keyed by name.
+    ///
+    /// The six above are fixed because the questions they answer are
+    /// fixed — an address, a kind, an owner, an edge, a version. A
+    /// `data` field is not: `data` is opaque JSON whose shape the
+    /// application chooses, so the only honest way to have an access
+    /// path over it is to let the application declare which field
+    /// deserves one. See [`DataIndex`].
+    ///
+    /// Definition and tree live in the same value on purpose: they are
+    /// one thing. Keeping the catalog in a second map beside the trees
+    /// is how an index ends up open with no definition (invisible, still
+    /// maintained) or defined with no tree (planned for, absent at read
+    /// time) — the exact drift that makes a derived structure lie.
+    data: HashMap<String, DataIndex>,
+}
+
+/// One operator-declared access path over a `data` field.
+pub struct DataIndex {
+    pub def: IndexDef,
+    pub tree: BTree,
+}
+
+/// The declaration of a `data`-field index.
+///
+/// Small, bounded by the number of indexes rather than the amount of
+/// data, and consulted on every write — so, like users, it is fully
+/// resident and lives in its own append-only log rather than in the
+/// heap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexDef {
+    /// Operator-chosen identity. Also the index's filename suffix,
+    /// which is why [`IndexDef::validate`] restricts its alphabet.
+    pub name: String,
+
+    /// The node `kind` this index covers. An index is per-kind because
+    /// `data` has no schema across kinds: `created_at` on a `Post` and
+    /// `created_at` on a `Session` are unrelated fields that happen to
+    /// share a name.
+    pub kind: String,
+
+    /// The top-level `data` field it orders by. Top-level to match
+    /// `order` on `POST /nodes/query`, which is the read this exists to
+    /// serve — an index on a path the query language cannot name would
+    /// be an index no query could use.
+    pub field: String,
+}
+
+/// One operation in `facetql.indexes`, the index-definition log.
+///
+/// Same shape and the same last-write-wins replay as
+/// [`crate::storage::binary::UserOpRecord`], for the same reason: file
+/// order in one log is the total order for the key, so an index can be
+/// created, dropped, and created again with nothing to reconcile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IndexOpRecord {
+    Put(IndexDef),
+    Drop(String),
+}
+
+/// Longest an index name may be.
+///
+/// The name becomes a filename (`facetql.idx.data.<name>`), so this is a
+/// path-length bound as much as an identity one.
+pub const MAX_INDEX_NAME_LEN: usize = 64;
+
+/// Longest encoded `data` value an index entry may carry.
+///
+/// A `data` field is caller-supplied JSON of any size, and the index key
+/// is that value followed by the address. `BTree::put` refuses a key
+/// over [`MAX_KEY_LEN`], and the write path logs intent *before* it
+/// applies — so an unbounded value would be a committed mutation that
+/// cannot be applied, which recovery re-attempts and fails on forever.
+/// Bounding the value here, ahead of the WAL, is what turns "this row
+/// bricks the database" into "this row is rejected".
+///
+/// The bound is deliberately checked rather than worked around by
+/// truncating the key to a prefix. A truncated key makes the index
+/// non-covering: two values sharing a prefix become indistinguishable,
+/// so an ordered read through it returns rows in an order the index
+/// cannot actually justify. A refusal is recoverable — index a shorter
+/// field, or don't index this one. A wrong order is not.
+pub const MAX_INDEX_VALUE_LEN: usize = 512;
+
+impl IndexDef {
+    /// Reject a definition the storage layer could not honour, at the
+    /// point where rejecting it is still just a failed request.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.name.is_empty() || self.name.len() > MAX_INDEX_NAME_LEN {
+            return Err(format!(
+                "index name must be 1..={MAX_INDEX_NAME_LEN} bytes"
+            ));
+        }
+
+        // The name is interpolated into a filename. Anything outside
+        // this alphabet — a slash, a dot, a NUL — is a path, not a
+        // name.
+        if !self
+            .name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(
+                "index name may contain only letters, digits, '_' and '-'"
+                    .to_string(),
+            );
+        }
+
+        if self.kind.is_empty() {
+            return Err("index kind must not be empty".to_string());
+        }
+
+        if self.field.is_empty() {
+            return Err("index field must not be empty".to_string());
+        }
+
+        check_component("index kind", &self.kind)?;
+        check_component("index field", &self.field)?;
+
+        Ok(())
+    }
 }
 
 impl Indexes {
@@ -85,7 +213,65 @@ impl Indexes {
             edge_out: BTree::open(&index_path("edge_out"))?,
             edge_in: BTree::open(&index_path("edge_in"))?,
             history: BTree::open(&index_path("history"))?,
+            data: HashMap::new(),
         })
+    }
+
+    /// Open (or create) the tree backing one declared index.
+    ///
+    /// Idempotent by name: re-opening a definition that is already
+    /// present replaces the definition and keeps the tree, which is what
+    /// makes replaying a `CreateIndex` record harmless.
+    pub fn open_data(&mut self, def: IndexDef) -> Result<()> {
+        let tree = match self.data.remove(&def.name) {
+            Some(existing) if existing.def == def => existing.tree,
+            Some(_) | None => BTree::open(&data_index_path(&def.name))?,
+        };
+
+        self.data.insert(def.name.clone(), DataIndex { def, tree });
+
+        Ok(())
+    }
+
+    /// Forget one declared index and remove its file.
+    ///
+    /// Dropping an index it does not have is not an error: recovery
+    /// replays a drop against a database that already applied it.
+    pub fn drop_data(&mut self, name: &str) -> Result<()> {
+        self.data.remove(name);
+
+        match std::fs::remove_file(data_index_path(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn data_get(&self, name: &str) -> Option<&DataIndex> {
+        self.data.get(name)
+    }
+
+    /// Every declared index, in name order so listings are stable.
+    pub fn data_all(&self) -> Vec<&DataIndex> {
+        let mut all: Vec<&DataIndex> = self.data.values().collect();
+        all.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+        all
+    }
+
+    /// The indexes a node of this kind must maintain.
+    pub fn data_for_kind<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> impl Iterator<Item = &'a DataIndex> {
+        self.data.values().filter(move |i| i.def.kind == kind)
+    }
+
+    /// The access path serving `order by <field>` on this kind, if one
+    /// was declared. The planner's whole question.
+    pub fn data_find(&self, kind: &str, field: &str) -> Option<&DataIndex> {
+        self.data
+            .values()
+            .find(|i| i.def.kind == kind && i.def.field == field)
     }
 
     /// Publish every index's pending generation.
@@ -102,12 +288,27 @@ impl Indexes {
         self.owner.commit()?;
         self.edge_out.commit()?;
         self.edge_in.commit()?;
-        self.history.commit()
+        self.history.commit()?;
+
+        for index in self.data.values() {
+            index.tree.commit()?;
+        }
+
+        Ok(())
     }
 }
 
 fn index_path(name: &str) -> PathBuf {
     config::data_file(&format!("facetql.idx.{name}"))
+}
+
+fn data_index_path(name: &str) -> PathBuf {
+    index_path(&format!("data.{name}"))
+}
+
+/// The index-definition log — see [`IndexOpRecord`].
+pub fn definitions_path() -> PathBuf {
+    config::data_file("facetql.indexes")
 }
 
 // ---------------------------------------------------------------------
@@ -317,6 +518,224 @@ pub fn check_edge_keys(from: &str, to: &str, kind: &str) -> std::result::Result<
 
     check_key_admissible("outgoing-edge", &edge_out_key(from, kind, to))?;
     check_key_admissible("incoming-edge", &edge_in_key(to, kind, from))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// `data`-field ordering: one definition of "in order"
+// ---------------------------------------------------------------------
+//
+// A sorted read and an index scan have to agree about what "sorted"
+// means, or paging through an index returns rows a re-sort would have
+// put somewhere else. So the byte encoding a key is built from and the
+// comparator the in-memory sort uses are defined here, together, from
+// the same type ranking — rather than in the two places that consume
+// them.
+
+/// Type rank: the outer ordering a `data` value sorts by.
+///
+/// JSON is untyped, so a field can hold a number in one node and a
+/// string in the next. That has to produce *an* order, and it has to be
+/// a total one — a comparator that calls two values of different types
+/// equal is not merely vague, it is non-transitive (`5 == "a"` and
+/// `"a" == 3` while `5 > 3`), and a non-transitive comparator makes
+/// `sort_by` return an arbitrary permutation rather than a wrong-but-
+/// stable one.
+///
+/// Absent sorts last so `order by` puts rows that have the field ahead
+/// of rows that do not, which is the useful default and matches what
+/// this engine did for the single-type case before the ranking existed.
+fn type_rank(value: Option<&Value>) -> u8 {
+    match value {
+        Some(Value::Null) => 0x10,
+        Some(Value::Bool(_)) => 0x20,
+        Some(Value::Number(_)) => 0x30,
+        Some(Value::String(_)) => 0x40,
+        Some(Value::Array(_)) | Some(Value::Object(_)) => 0x50,
+        None => 0xF0,
+    }
+}
+
+/// Total order over `data` values, absent included.
+///
+/// The in-memory counterpart of [`encode_order_value`]: comparing two
+/// values here and comparing their encodings byte-for-byte must give the
+/// same answer, which is why both are driven by [`type_rank`].
+pub fn compare_order_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
+    let rank = type_rank(a).cmp(&type_rank(b));
+
+    if rank != Ordering::Equal {
+        return rank;
+    }
+
+    match (a, b) {
+        (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
+
+        (Some(Value::Number(x)), Some(Value::Number(y))) => {
+            let x = x.as_f64().unwrap_or(0.0);
+            let y = y.as_f64().unwrap_or(0.0);
+            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+        }
+
+        (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
+
+        // Composites order by their serialized form. Not a meaningful
+        // ordering of structure, but a deterministic one — which is all
+        // a tiebreak in a sort has to be.
+        (Some(x @ (Value::Array(_) | Value::Object(_))), Some(y)) => {
+            x.to_string().cmp(&y.to_string())
+        }
+
+        // Equal ranks with no payload to compare: both null, or both
+        // absent.
+        _ => Ordering::Equal,
+    }
+}
+
+/// A `data` value encoded so that byte order is [`compare_order_values`]
+/// order.
+///
+/// Numbers use the standard order-preserving `f64` transform: flip every
+/// bit of a negative, flip only the sign bit of a non-negative. That
+/// maps the IEEE-754 bit pattern onto an unsigned integer whose natural
+/// order is numeric order, so `-3.5 < -1 < 0 < 2 < 10` holds as raw
+/// big-endian bytes.
+fn encode_value_body(value: Option<&Value>, out: &mut Vec<u8>) {
+    out.push(type_rank(value));
+
+    match value {
+        Some(Value::Bool(b)) => out.push(u8::from(*b)),
+
+        Some(Value::Number(n)) => {
+            let f = n.as_f64().unwrap_or(0.0);
+            let bits = f.to_bits();
+
+            let ordered = if f.is_sign_negative() {
+                !bits
+            } else {
+                bits ^ (1 << 63)
+            };
+
+            out.extend_from_slice(&ordered.to_be_bytes());
+        }
+
+        Some(Value::String(s)) => out.extend_from_slice(s.as_bytes()),
+
+        Some(v @ (Value::Array(_) | Value::Object(_))) => {
+            out.extend_from_slice(v.to_string().as_bytes())
+        }
+
+        Some(Value::Null) | None => {}
+    }
+}
+
+/// Append `bytes` in a form that can be followed by more key material
+/// without losing order.
+///
+/// `0x00` is escaped to `0x00 0xFF` and the value is terminated by
+/// `0x00 0x00`. A length prefix — which is how [`component`] separates
+/// the *unordered* components of the other indexes — cannot be used
+/// here: it would sort every short value ahead of every long one, so
+/// `"b"` would sort before `"aa"`. With this encoding the terminator is
+/// the lowest thing that can appear at any position, so a value that is
+/// a prefix of another sorts before it, exactly as string order
+/// requires.
+fn append_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
+    for &b in bytes {
+        if b == 0x00 {
+            out.push(0x00);
+            out.push(0xFF);
+        } else {
+            out.push(b);
+        }
+    }
+
+    out.push(0x00);
+    out.push(0x00);
+}
+
+/// The escaped, order-preserving encoding of one `data` value —
+/// everything in a data-index key before the address.
+///
+/// Also the exact prefix of every entry holding that value, which is
+/// what makes "the rows where this field equals X" a range scan.
+pub fn encode_order_value(value: Option<&Value>) -> Vec<u8> {
+    let mut body = Vec::new();
+    encode_value_body(value, &mut body);
+
+    let mut out = Vec::with_capacity(body.len() + 2);
+    append_escaped(&mut out, &body);
+
+    out
+}
+
+/// `encoded(value) + address → ()`.
+///
+/// Membership only, like the `kind` and `owner` indexes: the record's
+/// location comes from the primary index, so a node moving in the heap —
+/// which every update does — costs nothing here.
+pub fn data_key(value: Option<&Value>, address: &str) -> Vec<u8> {
+    let mut key = encode_order_value(value);
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// Recover the address from a data-index key by skipping past the
+/// encoded value's terminator.
+pub fn address_from_data_key(key: &[u8]) -> Option<&[u8]> {
+    let mut i = 0;
+
+    while i + 1 < key.len() {
+        if key[i] == 0x00 {
+            if key[i + 1] == 0x00 {
+                return Some(&key[i + 2..]);
+            }
+
+            // 0x00 0xFF — an escaped zero inside the value.
+            i += 2;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+/// The keys a node produces in every index declared over its kind.
+///
+/// Checked before the mutation is logged, for the same reason
+/// [`check_node_keys`] is: an index key the tree would refuse is not a
+/// rejected write once the WAL has it, it is a permanently unapplicable
+/// one.
+pub fn check_data_keys<'a>(
+    defs: impl Iterator<Item = &'a IndexDef>,
+    address: &str,
+    data: &str,
+) -> std::result::Result<(), String> {
+    let decoded: Option<Value> = serde_json::from_str(data).ok();
+
+    for def in defs {
+        let value = decoded.as_ref().and_then(|d| d.get(&def.field));
+
+        let encoded = encode_order_value(value);
+
+        if encoded.len() > MAX_INDEX_VALUE_LEN {
+            return Err(format!(
+                "field '{}' is {} bytes encoded, over the \
+                 {MAX_INDEX_VALUE_LEN}-byte maximum for index '{}'",
+                def.field,
+                encoded.len(),
+                def.name
+            ));
+        }
+
+        let mut key = encoded;
+        key.extend_from_slice(address.as_bytes());
+
+        check_key_admissible(&format!("'{}'", def.name), &key)?;
+    }
 
     Ok(())
 }

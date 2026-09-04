@@ -876,6 +876,27 @@ fn apply_recovery_operation(
                 .map_err(storage_error)?;
         }
 
+        WalOperation::CreateIndex(def) => {
+            /*
+             * Re-declaring an index that already exists reopens the same
+             * tree and re-populates it, and every entry the backfill
+             * writes is keyed by (value, address) — so the second pass
+             * lands on the keys the first one wrote. Which is what makes
+             * it safe to replay a create whose effects partly reached
+             * disk: there is no state that "already backfilled" would
+             * have to be remembered to avoid corrupting.
+             */
+            engine
+                .replay_create_index(def)
+                .map_err(storage_error)?;
+        }
+
+        WalOperation::DropIndex(name) => {
+            engine
+                .replay_drop_index(&name)
+                .map_err(storage_error)?;
+        }
+
         // Transaction-control records are consumed by the transaction
         // state machine and never reach this function.
         WalOperation::Begin

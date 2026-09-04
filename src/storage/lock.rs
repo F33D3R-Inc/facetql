@@ -72,7 +72,7 @@ use crate::config;
 /// contents: everything meaningful about it is the kernel-held lock on
 /// the open descriptor, and a file with nothing in it cannot go stale or
 /// disagree with reality.
-const LOCK_FILE: &str = "facetql.lock";
+pub const LOCK_FILE: &str = "facetql.lock";
 
 /// The held lock, kept alive for the process's lifetime.
 ///
