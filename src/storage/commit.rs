@@ -215,30 +215,32 @@ impl StagedCommit {
         Ok(commit.sequence)
     }
 
-    /// Settle a committed frame: release the checkpoint fence and advance
-    /// the durable checkpoint past the COMMIT marker.
+    /// Settle a committed frame: release the checkpoint fence and report
+    /// the COMMIT sequence.
     ///
     /// Call this only after [`StagedCommit::commit`] has returned `Ok`
-    /// **and** every operation in the batch has been reflected in
-    /// physical storage. It moves the durability boundary across the now
-    /// fully-settled frame so recovery won't redundantly replay it (and
-    /// won't duplicate history/edges) on the next restart.
+    /// **and** every operation in the batch has been applied. Releasing
+    /// the fence lets the durability boundary move across this frame
+    /// once the storage layer has flushed it.
     ///
     /// Returns an error if the frame was never committed — settling an
-    /// uncommitted frame would advance the checkpoint past operations
-    /// that recovery is going to discard, losing them. Abort uncommitted
+    /// uncommitted frame would unpin the checkpoint over operations that
+    /// recovery is going to discard, losing them. Abort uncommitted
     /// frames with [`StagedCommit::abort`] instead.
     ///
-    /// A failure to *write* the advanced checkpoint is deliberately not
-    /// an error: by this point the COMMIT record is durable and the batch
-    /// is in physical storage, so the transaction has succeeded and must
-    /// be reported as such. All a stuck checkpoint costs is that the next
-    /// startup replays a frame already reflected on disk — safe, since
-    /// recovery replays a committed frame in full or not at all. Failing
-    /// here instead would tell the caller its transaction failed when the
-    /// data is durably committed, which is the one answer that is simply
-    /// untrue.
-    pub fn settle(self) -> io::Result<()> {
+    /// # Why this does not advance the checkpoint
+    ///
+    /// It used to, and it could when applying an operation meant
+    /// appending an fsync'd record: "applied" and "durable" were the
+    /// same instant. They are not any more. An applied batch is in the
+    /// buffer pool — heap pages and index pages that reach the disk at
+    /// the engine's next flush — and a checkpoint written before that
+    /// flush would claim durability for state a crash still discards,
+    /// which is the one thing a checkpoint must never do. So the
+    /// sequence is handed back instead, and `StorageEngine::checkpoint`
+    /// advances the boundary to it after flushing the heap, the catalog
+    /// and every index.
+    pub fn settle(self) -> io::Result<u64> {
         let commit_sequence = self.commit_sequence.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -246,30 +248,13 @@ impl StagedCommit {
             )
         })?;
 
-        // Release this frame's fence first, then push the checkpoint
-        // across the frame. `settle` bypasses the fence ceiling because
-        // this frame is, by construction, the lowest open one in the
-        // single-writer mutation path.
         checkpoint::release_fence(self.begin_sequence);
-
-        // Best-effort, mirroring the engine's existing standalone
-        // checkpoint policy: the data is already durable in the WAL
-        // (COMMIT is fsync'd) and in physical storage, so a failure to
-        // move the checkpoint only means recovery replays a little extra
-        // — which is safe and idempotent under the frame rule.
-        if let Err(e) = checkpoint::settle(commit_sequence) {
-            eprintln!(
-                "warning: failed to advance checkpoint to {commit_sequence} \
-                 after committing transaction {}: {e}",
-                self.transaction_id
-            );
-        }
 
         // Suppress the drop-guard warning path — the fence is already
         // released above.
         std::mem::forget(self);
 
-        Ok(())
+        Ok(commit_sequence)
     }
 
     /// Abort an open, uncommitted frame.

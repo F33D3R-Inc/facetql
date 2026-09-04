@@ -7,29 +7,29 @@ use std::sync::{Mutex, OnceLock};
 use crate::config;
 
 /// Tracks the highest WAL sequence number that is already durably
-/// reflected in the physical storage files (facetql.data,
-/// facetql.edges, facetql.users, facetql.history, facetql.tombstones).
+/// reflected in physical storage — the record heap, the catalog that
+/// describes it, and all six indexes.
 ///
 /// Why this exists:
 ///
-/// Every mutation writes its WAL record first, then writes the matching
-/// physical record. `StorageEngine::load()` reconstructs state directly
-/// from the physical files, so by the time it runs, every WAL record at
-/// or below the checkpoint has already been applied through the normal
-/// physical-storage path.
+/// Every mutation writes its WAL record first, then applies itself to
+/// the heap and the indexes. Those land in the buffer pool and reach the
+/// disk at the engine's next flush; this file records how far that flush
+/// got. Everything at or below the value here is on stable storage,
+/// which is exactly the prefix of the WAL a restart may skip.
 ///
-/// Without this checkpoint, `recovery::recover()` would replay the
-/// *entire* WAL on every startup — including operations already present
-/// in physical storage. `Insert`/`Delete`/user operations happen to be
-/// idempotent (replaying them just overwrites/removes the same key), but
-/// `Archive` and `InsertEdge` are not: replaying them again duplicates
-/// history entries and edge adjacency lists on every single restart.
+/// Without it, `recovery::recover()` would replay the *entire* WAL on
+/// every startup. Replay is idempotent — every operation is keyed, so
+/// re-applying one lands on the entry it already wrote — so the
+/// checkpoint is a cost control rather than a correctness requirement.
+/// It is still a hard rule that it may never run ahead: a checkpoint
+/// written before the flush would claim durability for state a crash
+/// discards, and recovery would skip exactly the operations needed to
+/// rebuild it.
 ///
-/// The checkpoint is advanced only after a physical write has completed,
-/// so it always trails (or matches) what's actually durable on disk. If
-/// the process crashes between a WAL append and the matching physical
-/// write, the checkpoint stays behind, and recovery correctly replays
-/// that operation from the WAL.
+/// The checkpoint is therefore advanced only by
+/// `StorageEngine::checkpoint`, and only after the heap, the catalog and
+/// every index have been fsync'd.
 ///
 /// # Cooperation with staged (uncommitted) transactions
 ///
@@ -320,31 +320,6 @@ pub fn advance(sequence: u64) -> io::Result<()> {
     }
 
     write_value(target)
-}
-
-/// Force the checkpoint to `sequence` regardless of the active fences,
-/// still respecting monotonicity.
-///
-/// This is the settlement step a committed transaction uses once its
-/// COMMIT is durable *and* every operation is reflected in physical
-/// storage: the caller releases its own fence and then advances past its
-/// COMMIT sequence. It bypasses the fence ceiling because the whole
-/// point is to move the boundary across the frame that just settled —
-/// any *other* still-open frame has a lower BEGIN sequence and would
-/// have blocked this transaction's own commit ordering, so in the
-/// single-writer mutation path there is never an unsettled frame below
-/// `sequence` at this point.
-///
-/// Prefer [`advance`] for ordinary per-operation checkpointing; this
-/// exists specifically for the transaction-commit settlement boundary.
-pub fn settle(sequence: u64) -> io::Result<()> {
-    let current = read()?;
-
-    if sequence <= current {
-        return Ok(());
-    }
-
-    write_value(sequence)
 }
 
 /// Whole-file, crash-safe write of the checkpoint value.

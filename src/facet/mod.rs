@@ -23,7 +23,7 @@ impl FacetStore {
     ///   ↓
     /// StorageEngine
     ///   ↓
-    /// WAL + facetql.data
+    /// WAL + heap + indexes
     pub fn put(
         &self,
         address: impl Into<String>,
@@ -65,7 +65,7 @@ impl FacetStore {
             .read()
             .map_err(|_| "storage engine lock poisoned".to_string())?;
 
-        Ok(engine.get(address).cloned())
+        engine.get(address).map_err(|e| e.to_string())
     }
 
     /// Delete one Facet entity.

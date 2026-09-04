@@ -2,8 +2,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
-use crate::core::edge::{Edge, EdgeId};
-use crate::core::node::Node;
 use crate::core::user::UserRecord;
 use crate::config;
 use crate::crypto;
@@ -40,37 +38,30 @@ use crate::crypto;
 //
 // These constants are `pub` so the WAL/recovery layer can reason about
 // the frame (e.g. to physically truncate a torn trailing record) without
-// re-deriving the byte math, and so sibling logs reuse this envelope
-// instead of inventing their own: `facetql.data`, `.edges`, `.users` and
-// `.history` all go through `append_record` / `read_all_records_framed`
-// here rather than growing a second framing (and a second CRC) that
-// would have to be audited separately for the same torn-tail and
-// corruption cases.
+// re-deriving the byte math, and so every other durable structure reuses
+// this envelope instead of inventing its own. Three do:
 //
-// ─── What the payload of each log is, and why ────────────────────────
+//   * `facetql.users`, still a flat append-only log, through
+//     `append_record` / `read_all_records_framed`;
+//   * every record stored in the heap, framed by `encode_frame` and
+//     verified by `decode_frame` inside the page that holds it;
+//   * the catalog, which is one frame in one file.
 //
-// Each of the three mutable logs stores an OPERATION, not a bare value:
-// [`NodeRecord`], [`EdgeRecord`] and [`UserOpRecord`] below. That is the
-// v2 format change, and it is a correctness fix rather than a tidy-up.
+// A second framing (and a second CRC) would have to be audited
+// separately for the same torn-tail and corruption cases, so there is
+// one.
 //
-// Deletes used to live in a fourth log, `facetql.tombstones`, shared by
-// nodes and users. Two append-only logs carry no shared ordering, so
-// nothing on disk could say whether a delete happened before or after
-// the create it sat next to — and `load()` had no choice but to apply
-// every tombstone last. A tombstone therefore always won:
+// ─── Encryption: two places, deliberately ───────────────────────────
 //
-//     create X → delete X → create X again → restart → X is gone.
+// `append_record` encrypts the payload it frames, because the log it
+// writes to is a flat file with no other protection. A record framed by
+// `encode_frame` and stored in a *page* is not encrypted here: the page
+// it lands in is encrypted as a whole (see `storage::pager`), so
+// encrypting the payload again would buy nothing and cost a second AES
+// pass per record. What the frame contributes inside a page is what it
+// contributes anywhere — a per-record CRC and a format version, so one
+// damaged record is identified as one damaged record.
 //
-// It also made edge deletion unbuildable: a follow/unfollow/follow graph
-// cannot be expressed by a permanent tombstone at all.
-//
-// Folding the delete into the same log as the value it deletes makes
-// **file order within that one log the total order for that entity
-// type**. Replay is then a straight last-write-wins walk — `Put`
-// inserts, `Delete`/`Revoke` removes — with no cross-log reconciliation
-// pass to get wrong, and delete-then-recreate falls out for free in
-// every entity type at once.
-
 /// Marker bytes at the start of every record frame: "FQR1" =
 /// FacetQL Record, frame generation 1. A read that does not find these
 /// bytes where a frame is expected treats the file as corrupt rather
@@ -85,13 +76,10 @@ pub const RECORD_MAGIC: [u8; 4] = *b"FQR1";
 /// says how the bytes behind it are meant to be read, and a payload
 /// change is exactly as unreadable to an old build as a header change.
 ///
-/// v1 → v2: the mutable logs went from storing bare values (`Node`,
-/// `Edge`, `UserRecord`) to storing per-entity operations
-/// ([`NodeRecord`], [`EdgeRecord`], [`UserOpRecord`]), and the separate
-/// `facetql.tombstones` log was retired. A v1 `facetql.data` frame is
-/// structurally valid and would bincode-decode *into something*, which
-/// is precisely why the version must be checked: silently reading a v1
-/// payload as a v2 `NodeRecord` is worse than refusing to read it.
+/// A frame written by an older build is structurally valid and would
+/// bincode-decode *into something*, which is precisely why the version
+/// must be checked: silently reading an old payload as a current one is
+/// worse than refusing to read it.
 ///
 /// A frame carrying any other version is surfaced as an
 /// unsupported-version error naming the format change, never decoded on
@@ -109,50 +97,14 @@ pub const FRAME_HEADER_LEN: usize = 4 + 1 + 4 + 4;
 // One enum per append-only log, each carrying that log's own deletes.
 // They live here, beside the paths of the files that hold them and the
 // version byte that describes them, rather than beside the core types
-// they wrap: `Node`/`Edge`/`UserRecord` are the *domain* shapes and know
-// nothing about being logged, while these are the *storage* shapes and
-// exist only because the log they go in has to be totally ordered.
-// Keeping the three together also keeps them honest — they are one
-// format decision, and a future entity type gets its own variant here
-// rather than reaching for a second tombstone log.
+// it wraps: `UserRecord` is the *domain* shape and knows nothing about
+// being logged, while this is the *storage* shape and exists only
+// because the log it goes in has to be totally ordered.
 //
-// A log's records are replayed in file order and the last one for a key
-// wins. There is nothing else to reconcile, so "when did this happen"
-// never has to be answered by anything other than the file offset.
-
-/// One operation in `facetql.data`, the node log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum NodeRecord {
-    /// Insert or replace the node at `address` (upsert semantics,
-    /// matching `StorageEngine::insert`).
-    Put(Node),
-
-    /// Remove the node at this address.
-    ///
-    /// Carries the address rather than the node: a delete is about
-    /// identity, and re-writing the whole value would make an
-    /// already-append-only log grow by a full record for a removal, as
-    /// well as inviting a reader to resurrect the value it names.
-    Delete(String),
-}
-
-/// One operation in `facetql.edges`, the edge log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EdgeRecord {
-    /// Insert or replace the edge with this identity. Replacement, not
-    /// duplication: `(from, to, kind)` is the key, so re-asserting an
-    /// existing relationship lands on the same edge.
-    Put(Edge),
-
-    /// Remove the edge with this identity.
-    ///
-    /// Carries an [`EdgeId`] and not an [`Edge`] for the same reason
-    /// [`NodeRecord::Delete`] carries an address — and because the owner
-    /// is deliberately not part of an edge's identity, so a delete that
-    /// carried a whole `Edge` would be naming a field the lookup must
-    /// ignore.
-    Delete(EdgeId),
-}
+// The log's records are replayed in file order and the last one for a
+// key wins. There is nothing else to reconcile, so "when did this
+// happen" never has to be answered by anything other than the file
+// offset.
 
 /// One operation in `facetql.users`, the persistent-user log.
 ///
@@ -166,12 +118,11 @@ pub enum UserOpRecord {
 
     /// Revoke the user holding this token hash.
     ///
-    /// Revocation lives in this log now instead of as a `user:`-prefixed
-    /// entry in the shared tombstone log. That prefix existed only to
-    /// keep user hashes from colliding with node addresses in a log that
-    /// should never have held both; with each entity's deletes in its own
-    /// log there are no two key spaces to keep apart, and a revoked token
-    /// can be re-issued and revoked again like any other key.
+    /// Revocation lives in this log rather than in a separate tombstone
+    /// file, which is what lets a revoked token hash be re-issued and
+    /// revoked again: file order in one log is the total order for the
+    /// key, so the last record wins and a revocation cannot outrank a
+    /// later re-creation.
     Revoke(String),
 }
 
@@ -277,16 +228,33 @@ enum FrameOutcome {
 /// bitwise form needs no lookup table and is more than fast enough for
 /// the record sizes this engine writes.
 fn crc32(data: &[u8]) -> u32 {
+    crc32_parts(&[data])
+}
+
+/// The same CRC-32 over several byte ranges as if they were
+/// concatenated.
+///
+/// The page layout (`storage::page`) needs exactly this: a page's
+/// checksum covers the whole page *except* the four bytes holding the
+/// checksum, which is two ranges and no single slice. Copying the two
+/// halves into one buffer just to hash them would allocate a 16 KiB
+/// scratch buffer on every page read and write.
+pub fn crc32_parts(parts: &[&[u8]]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            // Branchless: build a mask of all-ones when the low bit is
-            // set, all-zeros otherwise, then conditionally XOR the poly.
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+
+    for part in parts {
+        for &byte in *part {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                // Branchless: build a mask of all-ones when the low bit
+                // is set, all-zeros otherwise, then conditionally XOR
+                // the poly.
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
         }
     }
+
     !crc
 }
 
@@ -295,13 +263,10 @@ fn crc32(data: &[u8]) -> u32 {
 /// not start.
 ///
 /// It has one job: make sure nobody concludes their disk is failing, and
-/// nobody goes looking for a migration that does not exist. The v1 → v2
-/// change reshaped what every frame in these logs *contains* (bare
-/// values became per-entity operations, and the tombstone log went
-/// away), so there is no in-place upgrade — the honest instruction is to
-/// recreate the data directory. That instruction is only safe to give
-/// because these logs are the whole database: nothing survives
-/// underneath them that recreating the directory would orphan.
+/// nobody goes looking for a migration that does not exist. A record
+/// format change reshapes what every frame *contains*, so there is no
+/// in-place upgrade — the honest instruction is to recreate the data
+/// directory (or restore a backup taken with a matching build).
 ///
 /// The message names the file, both versions and the offset, so an
 /// operator can tell "the entire file is from an older build" (offset 0)
@@ -317,11 +282,7 @@ fn unsupported_version_error(
         format!(
             "{} holds a v{found} record frame at offset {offset}, but this \
              build reads and writes v{RECORD_FORMAT_VERSION}. The on-disk \
-             record format changed: each log now stores per-entity \
-             operations (put/delete) instead of bare values, and the \
-             separate facetql.tombstones log was removed — deletes live in \
-             the log of the thing they delete, so file order is the total \
-             order and a delete no longer outranks a later re-create. \
+             record format changed. \
              There is no in-place upgrade for this: stop the server and \
              recreate the data directory (or restore a backup taken with a \
              matching build). Nothing here is corrupt — refusing to read \
@@ -341,7 +302,7 @@ fn unsupported_version_error(
 /// [`read_all_records_framed`] would have to report as corrupt. The
 /// caller still holds the mutation at this point, so this is a
 /// recoverable error; a written one would not be.
-fn encode_frame(payload: &[u8]) -> std::io::Result<Vec<u8>> {
+pub fn encode_frame(payload: &[u8]) -> std::io::Result<Vec<u8>> {
     if payload.len() > MAX_RECORD_PAYLOAD_LEN {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -376,6 +337,79 @@ fn encode_frame(payload: &[u8]) -> std::io::Result<Vec<u8>> {
     frame.extend_from_slice(&crc32(payload).to_le_bytes());
     frame.extend_from_slice(payload);
     Ok(frame)
+}
+
+/// Verifies one frame that is already in memory and returns the payload
+/// it carries.
+///
+/// The in-memory counterpart of [`read_one_frame`], for the callers that
+/// do not read frames out of a file one seek at a time: a record stored
+/// inside a page (`storage::heap`) and the catalog (`storage::catalog`)
+/// both arrive as a byte slice that is already known to be exactly one
+/// frame long.
+///
+/// Every check the file reader makes is made here — magic, format
+/// version, declared length against the bytes actually present, and the
+/// CRC over the payload — so a record inside a page is verified to the
+/// same standard as one at the end of a log, and a frame that fails is
+/// an error rather than a payload nobody checked.
+pub fn decode_frame(bytes: &[u8]) -> std::io::Result<&[u8]> {
+    if bytes.len() < FRAME_HEADER_LEN {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            format!(
+                "record frame is {} bytes, shorter than the {FRAME_HEADER_LEN}-byte header",
+                bytes.len()
+            ),
+        ));
+    }
+
+    if bytes[0..4] != RECORD_MAGIC {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "record frame magic mismatch",
+        ));
+    }
+
+    if bytes[4] != RECORD_FORMAT_VERSION {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "record frame format version {} is not supported by this \
+                 build (expected {RECORD_FORMAT_VERSION})",
+                bytes[4]
+            ),
+        ));
+    }
+
+    let declared = u32::from_le_bytes(
+        bytes[5..9].try_into().expect("4 bytes"),
+    ) as usize;
+
+    let expected_crc = u32::from_le_bytes(
+        bytes[9..13].try_into().expect("4 bytes"),
+    );
+
+    if bytes.len() != FRAME_HEADER_LEN + declared {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "record frame declares a {declared}-byte payload but carries {}",
+                bytes.len() - FRAME_HEADER_LEN
+            ),
+        ));
+    }
+
+    let payload = &bytes[FRAME_HEADER_LEN..];
+
+    if crc32(payload) != expected_crc {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "record frame checksum mismatch — the record is corrupt",
+        ));
+    }
+
+    Ok(payload)
 }
 
 /// Reads and verifies one frame from `file`, which must already be
@@ -691,53 +725,16 @@ pub fn read_all_records<T: DeserializeOwned>(path: &std::path::Path) -> std::io:
     Ok(records)
 }
 
-/// Node-log convenience wrappers over the generic functions above, kept
-/// so call sites that only deal with nodes (the common case) don't need
-/// to name the storage path or turbofish the type at every call.
-///
-/// They speak [`NodeRecord`], not `Node`: the log's unit is an operation,
-/// and a wrapper that took a bare `Node` would be an inviting way to
-/// append a put while forgetting deletes exist in the same file.
-pub fn append_node_record(record: &NodeRecord) -> std::io::Result<u64> {
-    append_record(&nodes_path(), record)
-}
-
-#[allow(dead_code)]
-pub fn read_node_record_at(offset: u64) -> std::io::Result<NodeRecord> {
-    read_record_at(&nodes_path(), offset)
-}
-
-pub fn read_all() -> std::io::Result<Vec<(u64, NodeRecord)>> {
-    read_all_records(&nodes_path())
-}
-
-/// Full paths under the configured data directory (see `config.rs`) —
-/// these replace what used to be hardcoded "facetql.data" /
-/// "facetql.edges" literals in the repo root.
-/// The node log: a sequence of [`NodeRecord`]s.
-pub fn nodes_path() -> std::path::PathBuf {
-    config::data_file("facetql.data")
-}
-
-/// The edge log: a sequence of [`EdgeRecord`]s.
-pub fn edges_path() -> std::path::PathBuf {
-    config::data_file("facetql.edges")
-}
-
 /// Persistent, admin-manageable user records — see core/user.rs. A
-/// sequence of [`UserOpRecord`]s; `StorageEngine::load()` replays it the
-/// same last-write-wins way as the node and edge logs.
+/// sequence of [`UserOpRecord`]s, replayed last-write-wins at startup.
+///
+/// The last flat log. Nodes, edges and history moved into the record
+/// heap (`storage::heap`), where they are addressed by an index instead
+/// of being replayed in full; users stayed because they are bounded by
+/// the number of identities rather than by the amount of data, are
+/// consulted on every authenticated request, and therefore have to be
+/// resident anyway. Indexing something that is always in memory buys
+/// nothing.
 pub fn users_path() -> std::path::PathBuf {
     config::data_file("facetql.users")
-}
-
-/// Archived previous node states — see core/history.rs.
-///
-/// The one log with no operation enum, because it has no deletes and no
-/// keys: history is a pure, strictly-additive record of what a node used
-/// to be, and nothing ever supersedes an entry. Giving it a `Put`
-/// wrapper would add a variant that no writer could ever produce a
-/// counterpart to.
-pub fn history_path() -> std::path::PathBuf {
-    config::data_file("facetql.history")
 }

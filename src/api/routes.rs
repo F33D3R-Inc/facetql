@@ -4,7 +4,7 @@ use axum::{
     extract::{State, Json, Path, Extension, Query},
     http::StatusCode,
     middleware,
-    response::{IntoResponse, sse::{Event, Sse, KeepAlive}},
+    response::{IntoResponse, Response, sse::{Event, Sse, KeepAlive}},
 };
 use std::sync::Arc;
 use std::convert::Infallible;
@@ -20,6 +20,53 @@ use crate::core::user::{Role, UserRecord};
 use crate::core::history::HistoryEntry;
 use crate::auth::{auth_middleware, hash_token, AuthIdentity};
 use crate::storage::engine::{ClaimError, Expectation, TransactionError, TxOperation};
+
+/// A read that could not reach the storage it needed.
+///
+/// Reads are I/O now. A node lives on disk and getting to it goes
+/// through the primary index, a page read, a decryption and a checksum
+/// check, any of which can fail for reasons that have nothing to do with
+/// the request. Those are 500s and have to be reported as such:
+/// collapsing them into "not found" would tell a client its data is gone
+/// when the truth is that this server could not read it, which is the
+/// difference between "delete your local copy" and "retry, and page
+/// somebody".
+fn storage_failure(error: std::io::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("storage error: {error}"),
+    )
+        .into_response()
+}
+
+/// Are both endpoints of an edge publicly readable?
+///
+/// An edge is only as public as the pair it connects: announcing
+/// "a → b" to everyone reveals that both nodes exist and are related, so
+/// a single private endpoint keeps the whole event owner-scoped. Shared
+/// by `create_edge` and `delete_edge` so the creation and the retraction
+/// of one fact can never reach different subscribers — a listener that
+/// saw the follow but not the unfollow would hold a stale graph forever.
+///
+/// A node that does not exist is not public, which is also the safe
+/// answer: the event stays owner-scoped.
+fn public_endpoints(
+    engine: &crate::storage::engine::StorageEngine,
+    from: &str,
+    to: &str,
+) -> std::io::Result<bool> {
+    for address in [from, to] {
+        let public = engine
+            .get(address)?
+            .is_some_and(|node| matches!(node.visibility, Visibility::Public));
+
+        if !public {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
 
 #[derive(Deserialize)]
 pub struct EdgeSpec {
@@ -256,7 +303,12 @@ async fn create_node(
 
     let mut engine = db.engine.write().expect("storage engine lock poisoned");
 
-    if payload.if_absent && engine.get(&address).is_some() {
+    let existing = match engine.get(&address) {
+        Ok(existing) => existing,
+        Err(e) => return storage_failure(e),
+    };
+
+    if payload.if_absent && existing.is_some() {
         return (
             StatusCode::CONFLICT,
             format!("node already exists: {address}"),
@@ -294,11 +346,12 @@ async fn get_node(
     match engine.get(&address) {
         // Admin bypasses can_read the same way a Postgres superuser
         // bypasses row-level security — deliberate, not a bug.
-        Some(node) if identity.is_admin() || node.can_read(&identity.owner) => {
-            (StatusCode::OK, Json(node.clone())).into_response()
+        Ok(Some(node)) if identity.is_admin() || node.can_read(&identity.owner) => {
+            (StatusCode::OK, Json(node)).into_response()
         }
-        Some(_) => (StatusCode::FORBIDDEN, "not authorized to read this node").into_response(),
-        None => (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Ok(Some(_)) => (StatusCode::FORBIDDEN, "not authorized to read this node").into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Err(e) => storage_failure(e),
     }
 }
 
@@ -317,12 +370,18 @@ async fn get_node_history(
 ) -> impl IntoResponse {
     let engine = db.engine.read().expect("storage engine lock poisoned");
     match engine.get(&address) {
-        Some(node) if identity.is_admin() || node.can_read(&identity.owner) => {
-            let history: Vec<HistoryEntry> = engine.history_for(&address).to_vec();
-            (StatusCode::OK, Json(history)).into_response()
+        Ok(Some(node)) if identity.is_admin() || node.can_read(&identity.owner) => {
+            match engine.history_for(&address) {
+                Ok(history) => {
+                    let history: Vec<HistoryEntry> = history;
+                    (StatusCode::OK, Json(history)).into_response()
+                }
+                Err(e) => storage_failure(e),
+            }
         }
-        Some(_) => (StatusCode::FORBIDDEN, "not authorized to read this node's history").into_response(),
-        None => (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Ok(Some(_)) => (StatusCode::FORBIDDEN, "not authorized to read this node's history").into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Err(e) => storage_failure(e),
     }
 }
 
@@ -335,8 +394,9 @@ async fn update_node(
     let mut engine = db.engine.write().expect("storage engine lock poisoned");
 
     let existing = match engine.get(&address) {
-        Some(n) => n.clone(),
-        None => return (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Ok(Some(n)) => n,
+        Ok(None) => return (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Err(e) => return storage_failure(e),
     };
 
     if !identity.is_admin() && !existing.can_write(&identity.owner) {
@@ -372,8 +432,9 @@ async fn delete_node(
     let mut engine = db.engine.write().expect("storage engine lock poisoned");
 
     let existing = match engine.get(&address) {
-        Some(n) => n.clone(),
-        None => return (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Ok(Some(n)) => n,
+        Ok(None) => return (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Err(e) => return storage_failure(e),
     };
 
     if !identity.is_admin() && !existing.can_write(&identity.owner) {
@@ -404,10 +465,11 @@ async fn claim_node(
 
     // Resolved under the same lock as the claim itself, so the audience
     // matches the node the claim actually applied to.
-    let audience = engine
-        .get(&address)
-        .map(Audience::for_node)
-        .unwrap_or_else(|| Audience::Owner(identity.owner.clone()));
+    let audience = match engine.get(&address) {
+        Ok(Some(node)) => Audience::for_node(&node),
+        Ok(None) => Audience::Owner(identity.owner.clone()),
+        Err(e) => return storage_failure(e),
+    };
 
     match engine.claim(&address, &identity.owner) {
         Ok(()) => {
@@ -431,8 +493,13 @@ async fn list_owned(
     Extension(identity): Extension<AuthIdentity>,
 ) -> impl IntoResponse {
     let engine = db.engine.read().expect("storage engine lock poisoned");
-    let owned: Vec<Node> = engine.nodes_by_owner(&identity.owner).into_iter().cloned().collect();
-    (StatusCode::OK, Json(owned)).into_response()
+    match engine.nodes_by_owner(&identity.owner) {
+        Ok(owned) => {
+            let owned: Vec<Node> = owned;
+            (StatusCode::OK, Json(owned)).into_response()
+        }
+        Err(e) => storage_failure(e),
+    }
 }
 
 async fn query_nodes(
@@ -454,13 +521,19 @@ async fn query_nodes(
         Some(identity.owner.as_str())
     };
 
-    let results: Vec<Node> = engine
-        .query(params.kind.as_deref(), params.owner.as_deref(), requester, limit, offset)
-        .into_iter()
-        .cloned()
-        .collect();
-
-    (StatusCode::OK, Json(results)).into_response()
+    match engine.query(
+        params.kind.as_deref(),
+        params.owner.as_deref(),
+        requester,
+        limit,
+        offset,
+    ) {
+        Ok(results) => {
+            let results: Vec<Node> = results;
+            (StatusCode::OK, Json(results)).into_response()
+        }
+        Err(e) => storage_failure(e),
+    }
 }
 
 /// `POST /nodes/query` — predicate-pushdown query.
@@ -524,11 +597,10 @@ async fn create_edge(
     // An edge is only as public as the pair it connects: announcing
     // "a → b" to everyone reveals that both nodes exist and are related,
     // so a single private endpoint keeps the whole event owner-scoped.
-    let endpoints_public = [&payload.from, &payload.to].iter().all(|address| {
-        engine
-            .get(address)
-            .is_some_and(|node| matches!(node.visibility, Visibility::Public))
-    });
+    let endpoints_public = match public_endpoints(&engine, &payload.from, &payload.to) {
+        Ok(public) => public,
+        Err(e) => return storage_failure(e),
+    };
 
     let audience = if endpoints_public {
         Audience::Everyone
@@ -589,8 +661,9 @@ async fn delete_edge(
     let mut engine = db.engine.write().expect("storage engine lock poisoned");
 
     let existing = match engine.find_edge(&id) {
-        Some(e) => e.clone(),
-        None => return (StatusCode::NOT_FOUND, "edge not found").into_response(),
+        Ok(Some(edge)) => edge,
+        Ok(None) => return (StatusCode::NOT_FOUND, "edge not found").into_response(),
+        Err(e) => return storage_failure(e),
     };
 
     if !identity.is_admin() && !existing.can_write(&identity.owner) {
@@ -611,11 +684,10 @@ async fn delete_edge(
     // were told about the edge_created are that owner's. Admins receive
     // Audience::Owner events regardless (see Audience::admits), so
     // nothing is hidden from the caller either way.
-    let endpoints_public = [&payload.from, &payload.to].iter().all(|address| {
-        engine
-            .get(address)
-            .is_some_and(|node| matches!(node.visibility, Visibility::Public))
-    });
+    let endpoints_public = match public_endpoints(&engine, &payload.from, &payload.to) {
+        Ok(public) => public,
+        Err(e) => return storage_failure(e),
+    };
 
     let audience = if endpoints_public {
         Audience::Everyone
@@ -643,11 +715,15 @@ async fn get_edges_out(
 ) -> impl IntoResponse {
     let engine = db.engine.read().expect("storage engine lock poisoned");
     match engine.get(&address) {
-        Some(node) if identity.is_admin() || node.can_read(&identity.owner) => {
-            (StatusCode::OK, Json(engine.edges_from(&address).to_vec())).into_response()
+        Ok(Some(node)) if identity.is_admin() || node.can_read(&identity.owner) => {
+            match engine.edges_from(&address) {
+                Ok(edges) => (StatusCode::OK, Json(edges)).into_response(),
+                Err(e) => storage_failure(e),
+            }
         }
-        Some(_) => (StatusCode::FORBIDDEN, "not authorized to read this node's edges").into_response(),
-        None => (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Ok(Some(_)) => (StatusCode::FORBIDDEN, "not authorized to read this node's edges").into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Err(e) => storage_failure(e),
     }
 }
 
@@ -690,7 +766,7 @@ pub enum TxOpRequest {
     },
     /// Native bulk clear: remove every node of `kind` the caller may
     /// write, as one all-or-nothing step in the transaction (WAL +
-    /// tombstones per node, exactly like `delete_node`). Wire tag is
+    /// removals per node, exactly like `delete_node`). Wire tag is
     /// `clear_kind` (snake_case of the variant). Non-admin clears only
     /// its own nodes of that kind; admin clears all of that kind —
     /// authorization is resolved here and enforced in the engine.
@@ -700,7 +776,7 @@ pub enum TxOpRequest {
     /// Native predicated bulk delete — `clear_kind`'s superset. Removes
     /// every node of `kind` the caller may write AND (when `where` is
     /// present) whose `data` satisfies the predicate, as one
-    /// all-or-nothing step (WAL + tombstones per node, exactly like
+    /// all-or-nothing step (WAL + removals per node, exactly like
     /// `delete_node`). Wire tag is `delete_where` (snake_case of the
     /// variant); the predicate field is JSON key `where` (`Expr`, the
     /// same type `POST /nodes/query` takes) and is optional — omitting
@@ -809,7 +885,8 @@ async fn execute_transaction(
                 let id = EdgeId::new(from, to, kind);
                 if !identity.is_admin() {
                     match engine.find_edge(&id) {
-                        Some(e) if !e.can_write(&identity.owner) => {
+                        Err(e) => return storage_failure(e),
+                        Ok(Some(e)) if !e.can_write(&identity.owner) => {
                             return (
                                 StatusCode::FORBIDDEN,
                                 format!(
@@ -819,7 +896,7 @@ async fn execute_transaction(
                             )
                                 .into_response();
                         }
-                        None => {
+                        Ok(None) => {
                             return (
                                 StatusCode::NOT_FOUND,
                                 format!(
@@ -845,14 +922,15 @@ async fn execute_transaction(
             TxOpRequest::DeleteNode { address } => {
                 if !identity.is_admin() {
                     match engine.get(&address) {
-                        Some(n) if !n.can_write(&identity.owner) => {
+                        Err(e) => return storage_failure(e),
+                        Ok(Some(n)) if !n.can_write(&identity.owner) => {
                             return (
                                 StatusCode::FORBIDDEN,
                                 format!("not authorized to delete {address}"),
                             )
                                 .into_response();
                         }
-                        None => {
+                        Ok(None) => {
                             return (
                                 StatusCode::NOT_FOUND,
                                 format!("delete target not found: {address}"),
@@ -873,16 +951,23 @@ async fn execute_transaction(
                 // here — under the same write lock the engine will use
                 // — and let the engine enforce it when selecting rows.
                 let is_admin = identity.is_admin();
-                // Record the exact addresses this clear will tombstone
+                // Record the exact addresses this clear will remove
                 // for the committed event, using the same rule the
                 // engine applies. The write lock is held throughout, so
                 // this snapshot matches what execute_transaction removes.
-                for node in engine.nodes.values() {
-                    if node.kind == kind
-                        && (is_admin || node.can_write(&identity.owner))
-                    {
-                        touched_addresses.push(node.address.clone());
-                    }
+                // The engine's own selector, driven by the kind index,
+                // rather than a walk of every node in the database —
+                // and the same rule `execute_transaction` applies, so
+                // the reported addresses cannot drift from the removed
+                // ones. A clear is a `delete_where` with no predicate.
+                match engine.delete_where_targets(
+                    &kind,
+                    None,
+                    &identity.owner,
+                    is_admin,
+                ) {
+                    Ok(addresses) => touched_addresses.extend(addresses),
+                    Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
                 }
                 ops.push(TxOperation::ClearKind {
                     kind,
@@ -901,7 +986,7 @@ async fn execute_transaction(
                 // enforced in the engine when it selects rows.
                 let is_admin = identity.is_admin();
                 // Record the exact addresses this delete_where will
-                // tombstone for the committed event, using the same
+                // remove for the committed event, using the same
                 // selection (kind + auth + predicate) the engine
                 // applies. This reuses the engine's single
                 // `predicate::eval`-backed selector, so an
@@ -1007,11 +1092,15 @@ async fn get_edges_in(
 ) -> impl IntoResponse {
     let engine = db.engine.read().expect("storage engine lock poisoned");
     match engine.get(&address) {
-        Some(node) if identity.is_admin() || node.can_read(&identity.owner) => {
-            (StatusCode::OK, Json(engine.edges_to(&address).to_vec())).into_response()
+        Ok(Some(node)) if identity.is_admin() || node.can_read(&identity.owner) => {
+            match engine.edges_to(&address) {
+                Ok(edges) => (StatusCode::OK, Json(edges)).into_response(),
+                Err(e) => storage_failure(e),
+            }
         }
-        Some(_) => (StatusCode::FORBIDDEN, "not authorized to read this node's edges").into_response(),
-        None => (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Ok(Some(_)) => (StatusCode::FORBIDDEN, "not authorized to read this node's edges").into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Err(e) => storage_failure(e),
     }
 }
 
@@ -1123,7 +1212,10 @@ async fn stats(
         return (StatusCode::FORBIDDEN, "admin only").into_response();
     }
     let engine = db.engine.read().expect("storage engine lock poisoned");
-    (StatusCode::OK, Json(engine.stats())).into_response()
+    match engine.stats() {
+        Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+        Err(e) => storage_failure(e),
+    }
 }
 
 // ── admin: user management ─────────────────────────────────────────────
@@ -1261,12 +1353,16 @@ mod stats_route_tests {
     //! `tower::ServiceExt::oneshot`, so they exercise auth-gating and JSON
     //! shape end-to-end, not just the handler in isolation.
     //!
-    //! State is built entirely in memory: nodes and users are placed
-    //! directly into the engine's public maps, so nothing touches the WAL,
-    //! binary files, or tombstones — no data-dir setup needed. Auth uses
-    //! *persistent* user tokens (resolved via `find_user_by_hash`), not the
-    //! env `ENOCHIAN_TOKENS` bootstrap, so the tests don't depend on
-    //! process-wide env state.
+    //! State is built through the engine's public API against a real
+    //! data directory, because there is no longer an in-memory map to
+    //! place nodes into — the database is the heap and the indexes on
+    //! disk. The data directory is process-wide (`config` resolves it
+    //! through a `OnceLock`), so every test module in this binary shares
+    //! one and these assertions are written to be true regardless of
+    //! what else is in it: unique kinds and addresses, and `>=` on the
+    //! global counters. Auth uses *persistent* user tokens (resolved via
+    //! `find_user_by_hash`), not the env `ENOCHIAN_TOKENS` bootstrap, so
+    //! the tests don't depend on process-wide env state.
     use super::*;
     use crate::core::coordinate::Coordinate;
     use crate::core::user::{Role, UserRecord};
@@ -1280,21 +1376,30 @@ mod stats_route_tests {
     const ADMIN_TOKEN: &str = "stats-admin-token";
     const USER_TOKEN: &str = "stats-user-token";
 
-    /// A router whose engine holds 3 nodes (2 `Post`, 1 `Profile`) plus an
-    /// admin and a non-admin persistent user.
-    fn router() -> axum::Router {
-        let mut engine = StorageEngine::new();
+    const POST_KIND: &str = "StatsRoutePost";
+    const PROFILE_KIND: &str = "StatsRouteProfile";
 
-        for (addr, kind) in [("p:1", "Post"), ("p:2", "Post"), ("pr:1", "Profile")] {
-            engine.nodes.insert(
-                addr.to_string(),
-                Node::new(
+    use crate::storage::engine::test_support::disk_guard;
+
+    /// A router over an engine holding 2 `StatsRoutePost` nodes and 1
+    /// `StatsRouteProfile`, plus an admin and a non-admin persistent
+    /// user.
+    fn router() -> axum::Router {
+        let mut engine = StorageEngine::open().expect("open storage engine");
+
+        for (addr, kind) in [
+            ("stats:p1", POST_KIND),
+            ("stats:p2", POST_KIND),
+            ("stats:pr1", PROFILE_KIND),
+        ] {
+            engine
+                .insert(Node::new(
                     Coordinate::new(0, 0, 0, 0),
                     addr.to_string(),
                     kind.to_string(),
                     "admin".to_string(),
-                ),
-            );
+                ))
+                .expect("insert node");
         }
 
         engine.users.insert(
@@ -1311,6 +1416,17 @@ mod stats_route_tests {
         create_router(db)
     }
 
+    /// The count this response reports for one kind.
+    fn kind_count(json: &serde_json::Value, kind: &str) -> u64 {
+        json["kinds"]
+            .as_array()
+            .expect("kinds is an array")
+            .iter()
+            .find(|entry| entry["kind"] == kind)
+            .and_then(|entry| entry["count"].as_u64())
+            .unwrap_or(0)
+    }
+
     fn stats_request(token: &str) -> Request<Body> {
         Request::builder()
             .method("GET")
@@ -1324,6 +1440,8 @@ mod stats_route_tests {
     /// breakdown the wire contract specifies.
     #[tokio::test]
     async fn admin_gets_stats_with_expected_counts() {
+        let _guard = disk_guard();
+
         let resp = router()
             .oneshot(stats_request(ADMIN_TOKEN))
             .await
@@ -1336,24 +1454,38 @@ mod stats_route_tests {
             .expect("read body");
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
 
-        assert_eq!(json["node_count"], 3);
-        assert_eq!(json["edge_count"], 0);
+        // This module's own kinds are counted exactly; the global
+        // totals are bounds, because the data directory is shared with
+        // every other test in this binary.
+        assert_eq!(kind_count(&json, POST_KIND), 2);
+        assert_eq!(kind_count(&json, PROFILE_KIND), 1);
+
+        assert!(json["node_count"].as_u64().expect("node_count") >= 3);
         assert_eq!(json["user_count"], 2);
-        assert_eq!(json["history_entries"], 0);
-        // Sorted ascending by kind: Post (2) before Profile (1).
-        assert_eq!(json["kinds"][0]["kind"], "Post");
-        assert_eq!(json["kinds"][0]["count"], 2);
-        assert_eq!(json["kinds"][1]["kind"], "Profile");
-        assert_eq!(json["kinds"][1]["count"], 1);
-        // The counters are present; this memory-built engine ran no
-        // counted get/insert, so both are still 0.
-        assert_eq!(json["reads_total"], 0);
-        assert_eq!(json["writes_total"], 0);
+
+        // The whole wire shape is present, including the physical
+        // storage block.
+        for field in [
+            "node_count",
+            "edge_count",
+            "user_count",
+            "history_entries",
+            "kinds",
+            "reads_total",
+            "writes_total",
+            "storage",
+        ] {
+            assert!(!json[field].is_null(), "{field} missing from /stats");
+        }
+
+        assert!(json["storage"]["page_size"].as_u64().expect("page_size") > 0);
     }
 
     /// Non-admin token → 403, and no stats body is leaked.
     #[tokio::test]
     async fn non_admin_is_forbidden() {
+        let _guard = disk_guard();
+
         let resp = router()
             .oneshot(stats_request(USER_TOKEN))
             .await
@@ -1366,6 +1498,8 @@ mod stats_route_tests {
     /// on the protected router), never reaching the handler.
     #[tokio::test]
     async fn missing_token_is_unauthorized() {
+        let _guard = disk_guard();
+
         let req = Request::builder()
             .method("GET")
             .uri("/stats")

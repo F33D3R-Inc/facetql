@@ -9,7 +9,7 @@ use tokio_postgres::Row;
 /// FacetQL's on-disk files are only safe for a single process to write
 /// to — the RwLock that makes every write atomic only coordinates
 /// *within* one running process. A separate import process writing
-/// straight to `facetql.data` while `facetql start` is also running
+/// straight to the heap while `facetql start` is also running
 /// would race on the same files with no coordination at all. Going
 /// through the API sidesteps that entirely: the importer is just
 /// another client, the same way `pg_restore` talks to a running

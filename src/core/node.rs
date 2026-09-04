@@ -34,11 +34,11 @@ pub struct Node {
     /// checked with string matching: a job-queue "is this already claimed"
     /// check needs to be exact and type-safe, not dependent on `data`
     /// happening to contain valid JSON with a particular shape.
-    /// NOTE: this is another breaking change to the on-disk format, same
-    /// as when `kind` was added — bincode is a fixed binary layout, so
+    /// NOTE: adding a field here is a breaking change to the on-disk
+    /// format — bincode is a fixed binary layout, so
     /// `#[serde(default)]`-style "missing field is fine" behavior does
-    /// NOT apply here the way it would for JSON. A pre-this-change
-    /// `facetql.data` will fail to deserialize.
+    /// NOT apply the way it would for JSON. Records written by a build
+    /// with a different `Node` shape will fail to deserialize.
     pub claimed_by: Option<String>,
     pub visibility: Visibility,
 }

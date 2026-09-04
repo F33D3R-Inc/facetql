@@ -225,15 +225,36 @@ async fn main() {
     }
 }
 
-/// Every file this checkpoint's storage layer writes. Kept as one list
-/// so backup/restore stay in sync automatically if a future checkpoint
-/// adds another data file — update this list, both commands pick it up.
-const DATA_FILES: &[&str] = &[
-    "facetql.data",
-    "facetql.wal",
-    "facetql.edges",
-    "facetql.users",
-];
+/// Every durable file the storage layer writes, discovered rather than
+/// listed.
+///
+/// It used to be a fixed list of four names, which stopped working the
+/// moment the heap became a set of segments: `facetql.heap.000000.seg`,
+/// `facetql.heap.000001.seg` and so on are created and retired as the
+/// database grows and compacts, so no constant can name them. Backing up
+/// what the directory actually holds is also the safer failure mode — a
+/// future file that nobody remembered to add to a list would silently
+/// not be backed up, and its absence would only be discovered during a
+/// restore.
+///
+/// In-progress temp files (`*.tmp`) are skipped: they are the
+/// write-then-rename halves of a catalog or checkpoint update, and a
+/// copy of one is either redundant or garbage.
+fn data_files() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(config::data_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.ends_with(".tmp"))
+        .collect();
+
+    // Sorted so a backup lists its files in a stable order run to run.
+    names.sort();
+
+    names
+}
 
 fn run_backup(output_dir: PathBuf) {
     std::fs::create_dir_all(&output_dir)
@@ -241,8 +262,8 @@ fn run_backup(output_dir: PathBuf) {
 
     let mut copied = 0;
 
-    for filename in DATA_FILES {
-        let src = config::data_file(filename);
+    for filename in data_files() {
+        let src = config::data_file(&filename);
 
         if src.exists() {
             let dst = output_dir.join(filename);
@@ -267,11 +288,7 @@ fn run_backup(output_dir: PathBuf) {
 }
 
 fn run_restore(input_dir: PathBuf) {
-    let existing: Vec<&str> = DATA_FILES
-        .iter()
-        .filter(|f| config::data_file(f).exists())
-        .copied()
-        .collect();
+    let existing: Vec<String> = data_files();
 
     if !existing.is_empty() {
         eprintln!(
@@ -290,11 +307,21 @@ fn run_restore(input_dir: PathBuf) {
 
     let mut restored = 0;
 
-    for filename in DATA_FILES {
-        let src = input_dir.join(filename);
+    // Restore reads the *backup's* directory, for the same reason backup
+    // reads the live one: the file set is not knowable in advance.
+    let backed_up: Vec<String> = std::fs::read_dir(&input_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    for filename in backed_up {
+        let src = input_dir.join(&filename);
 
         if src.exists() {
-            let dst = config::data_file(filename);
+            let dst = config::data_file(&filename);
 
             std::fs::copy(&src, &dst)
                 .unwrap_or_else(|e| {
@@ -470,7 +497,7 @@ fn report_startup_failure(error: DatabaseError) -> ! {
             eprintln!("  Next steps:");
             eprintln!("    1. Back up the whole directory first: facetql backup <dir>. The");
             eprintln!("       WAL is the only record of writes not yet folded into");
-            eprintln!("       facetql.data.");
+            eprintln!("       the heap and the indexes.");
             eprintln!("    2. Confirm facetql.wal belongs to this data directory and to this");
             eprintln!("       build of FacetQL.");
             eprintln!("    3. Restore a known-good copy into an empty data directory:");

@@ -1,7 +1,14 @@
 pub mod engine;
 pub mod binary;
+pub mod btree;
+pub mod cache;
+pub mod catalog;
 pub mod checkpoint;
+pub mod heap;
 pub mod index;
+pub mod location;
+pub mod page;
+pub mod pager;
 pub mod wal;
 pub mod recovery;
 pub mod transaction;

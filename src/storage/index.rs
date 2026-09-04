@@ -1,201 +1,208 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+//! The engine's durable access paths.
+//!
+//! Every index here is a real on-disk B+tree (`storage::btree`), not a
+//! map that happens to be written out. That distinction is the whole
+//! point of this module: an index that lives in RAM makes the size of
+//! the database the size of the process, and an index that is rebuilt by
+//! scanning every record at startup makes opening the database cost as
+//! much as reading it.
+//!
+//! ```text
+//!             logical question                    index
+//!   ---------------------------------------   -------------
+//!   where is the node at this address?        primary
+//!   which nodes have this kind?               kind
+//!   which nodes does this owner own?          owner
+//!   what does this node point at?             edge_out
+//!   what points at this node?                 edge_in
+//!   what did this node used to be?            history
+//! ```
+//!
+//! # Key encoding
+//!
+//! Composite keys are built from length-prefixed components
+//! ([`component`]) rather than by joining with a separator byte. A
+//! separator has to assume the values it separates cannot contain it,
+//! and `kind`, `owner` and `address` are caller-supplied strings that
+//! can contain anything at all — an address containing the separator
+//! would land in another key's range and silently corrupt a scan. A
+//! length prefix cannot be spoofed by content.
+//!
+//! Every composite key starts with the whole component that a scan
+//! filters on, so "every node of this kind" is a prefix range and costs
+//! only the entries it returns.
+//!
+//! # The discipline this depends on
+//!
+//! An index is a derived structure, so it is only as correct as the
+//! paths that maintain it. These are authoritative — a query answers
+//! from them without consulting the heap first — which means a mutation
+//! that updates the record and forgets an index does not produce a slow
+//! query, it produces a wrong answer. That is why every mutation goes
+//! through `StorageEngine::apply_committed` and nothing else writes
+//! records or index entries.
 
-use crate::core::node::Node;
+use std::io::Result;
+use std::path::PathBuf;
 
-/// The engine's in-memory indexes.
-///
-/// Two different jobs live here:
-///
-/// * `addresses` maps an address to the byte offset of that node's most
-///   recently written record frame in `facetql.data`. Reads don't need it
-///   yet — the engine keeps every node in memory — but it is what a
-///   future out-of-core read path seeks with. The exact meaning of that
-///   offset, and what is still missing before a read can be served from
-///   it, is spelled out on [`Index::insert`] and [`Index::get`].
-///
-/// * `by_kind` / `by_owner` are the **secondary indexes** a filtered
-///   query wants. Without them every `GET /nodes?kind=Post` and every
-///   `POST /nodes/query` walks the entire node map, so the cost of
-///   reading one user's posts grows with the size of the whole database
-///   — the behaviour that stops a graph like this from scaling past a
-///   toy dataset. With them, a `kind`- or `owner`-filtered read visits
-///   only the rows that could match.
-///
-///   NOT YET WIRED UP: nothing calls [`Index::track`] /
-///   [`Index::untrack`] today, so both maps are permanently empty and
-///   the query path still scans `StorageEngine::nodes`. This matters to
-///   whoever wires them up, because an empty index is not a slow index —
-///   it is a *wrong* one: [`Index::by_kind`] returning `None` reads as
-///   "no node has that kind", so a query served from it today would
-///   answer "nothing found" for a database full of matches.
-///
-/// The index is a derived structure, so it is only as good as its
-/// discipline: it must be updated by *every* path that makes a node live
-/// or removes one. An index that can be bypassed is worse than no index,
-/// because the query silently returns the wrong answer instead of being
-/// slow. `StorageEngine::nodes` is currently `pub` and mutated directly
-/// from several paths, which is precisely why the maps below cannot be
-/// switched on where they stand: making them authoritative means first
-/// funnelling every live-node mutation through a single pair of
-/// insert/remove methods on the engine, so no path can update `nodes`
-/// without updating these.
-pub struct Index {
-    pub addresses: HashMap<String, u64>,
+use crate::config;
+use crate::storage::btree::BTree;
 
-    /// kind → the addresses of every live node of that kind.
-    by_kind: HashMap<String, HashSet<String>>,
+/// The six durable access paths, opened together.
+pub struct Indexes {
+    /// `address → RecordLocation` of the node's current record. The one
+    /// index a point read cannot be served without.
+    pub primary: BTree,
 
-    /// owner → the addresses of every live node that owner owns.
-    by_owner: HashMap<String, HashSet<String>>,
+    /// `kind + address → ()`. Membership only: the location comes from
+    /// the primary index, so a node that moves (every update moves it)
+    /// costs one write here instead of one per secondary index.
+    pub kind: BTree,
+
+    /// `owner + address → ()`.
+    pub owner: BTree,
+
+    /// `from + kind + to → RecordLocation` of the edge record.
+    pub edge_out: BTree,
+
+    /// `to + kind + from → RecordLocation` of the same edge, indexed for
+    /// the reverse traversal.
+    pub edge_in: BTree,
+
+    /// `address + version → RecordLocation` of one archived state.
+    /// Ordered by version, so "this node's history, oldest first" is a
+    /// prefix scan and reading one node's history never touches
+    /// another's.
+    pub history: BTree,
 }
 
-impl Index {
-    pub fn new() -> Self {
-        Self {
-            addresses: HashMap::new(),
-            by_kind: HashMap::new(),
-            by_owner: HashMap::new(),
-        }
+impl Indexes {
+    pub fn open() -> Result<Indexes> {
+        Ok(Indexes {
+            primary: BTree::open(&index_path("primary"))?,
+            kind: BTree::open(&index_path("kind"))?,
+            owner: BTree::open(&index_path("owner"))?,
+            edge_out: BTree::open(&index_path("edge_out"))?,
+            edge_in: BTree::open(&index_path("edge_in"))?,
+            history: BTree::open(&index_path("history"))?,
+        })
     }
 
-    /// Record where `address`'s current record lives in `facetql.data`.
+    /// Publish every index's pending generation.
     ///
-    /// # What `position` means, exactly
-    ///
-    /// `position` is a **frame-start offset**: the byte offset of the
-    /// first byte of the record frame's header (its `RECORD_MAGIC`), not
-    /// of the payload inside it and not of the record after it. That is
-    /// precisely the value `binary::append_record` returns — it captures
-    /// the file length *before* writing the frame — and precisely what
-    /// `binary::read_record_at` expects to seek to, since that function
-    /// starts by parsing a 13-byte header at the offset it is given.
-    /// Every call site that populates this map passes an offset straight
-    /// through from `append_record`, except `StorageEngine::load()`,
-    /// which passes the offsets `binary::read_all_records` reports —
-    /// the same frame starts, observed on replay instead of on write. So
-    /// the invariant holds by construction on every path, and it is the
-    /// *only* offset convention
-    /// that reads back: an offset pointing one byte into a frame is not a
-    /// slightly-wrong seek, it is a magic-byte mismatch reported as
-    /// corruption.
-    ///
-    /// # Overwrite semantics
-    ///
-    /// `facetql.data` is append-only, so updating a node writes a *new*
-    /// frame and leaves the old one in place. Inserting here overwrites
-    /// the previous offset, which is what makes this map mean "where the
-    /// **current** value is" rather than "where this address was first
-    /// seen". The superseded frames stay on disk — that is what makes a
-    /// node's history recoverable by an operator — and are simply no
-    /// longer reachable through this map.
-    ///
-    /// Ordering requirement: call this only *after* `append_record`
-    /// returns, never before. `append_record` fsyncs before returning, so
-    /// an offset recorded after it is an offset that is durable; an
-    /// offset recorded before it could name bytes a crash then discards.
-    pub fn insert(&mut self, address: String, position: u64) {
-        self.addresses.insert(address, position);
+    /// Called from the engine's checkpoint, after the heap and catalog
+    /// are durable and before the WAL checkpoint advances. A crash
+    /// partway through leaves some indexes at the new generation and
+    /// some at the old one — which is safe, and is why the WAL
+    /// checkpoint moves last: recovery replays every operation above it
+    /// against all six, and each apply is idempotent.
+    pub fn commit(&self) -> Result<()> {
+        self.primary.commit()?;
+        self.kind.commit()?;
+        self.owner.commit()?;
+        self.edge_out.commit()?;
+        self.edge_in.commit()?;
+        self.history.commit()
+    }
+}
+
+fn index_path(name: &str) -> PathBuf {
+    config::data_file(&format!("facetql.idx.{name}"))
+}
+
+// ---------------------------------------------------------------------
+// Key encoding
+// ---------------------------------------------------------------------
+
+/// One length-prefixed key component: `len(u16, big-endian) || bytes`.
+///
+/// Big-endian so the length itself sorts numerically, which keeps the
+/// key space tidy; the property that actually matters is that a
+/// component's bytes can never be confused with the start of the next
+/// one.
+pub fn component(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+
+    let mut out = Vec::with_capacity(2 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(bytes);
+
+    out
+}
+
+/// Split a key into its leading component and the rest.
+pub fn split_component(key: &[u8]) -> Option<(&[u8], &[u8])> {
+    if key.len() < 2 {
+        return None;
     }
 
-    /// The frame-start offset of `address`'s current record, if the
-    /// engine has one.
-    ///
-    /// Not yet used: reads are served from `StorageEngine::nodes`, the
-    /// in-memory map `load()` rebuilds from disk at boot. The reader this
-    /// offset is meant for already exists — `binary::read_record_at`,
-    /// which re-verifies the frame (magic, version, length, CRC) and
-    /// decrypts before handing back a `Node`, so a point-read through
-    /// this map is no less safe than a full replay.
-    ///
-    /// # What would have to be true to serve point-reads from here
-    ///
-    /// This is deliberately spelled out because the map *looks* ready and
-    /// is not. Three things are missing, and none of them are in this
-    /// module:
-    ///
-    /// 1. **Deletes must prune it.** The delete path removes the address
-    ///    from `StorageEngine::nodes` and appends a tombstone, but leaves
-    ///    the entry here — and `load()` likewise inserts an offset for
-    ///    every node record it replays, then filters tombstoned addresses
-    ///    out of `nodes` only. A point-read served from this map today
-    ///    would therefore resurrect deleted nodes: the offset still names
-    ///    a perfectly valid, checksum-clean frame on disk. Either this
-    ///    map gets a `remove` that every delete path calls, or the read
-    ///    path has to consult the tombstone set as well.
-    ///
-    /// 2. **It must survive the reads it would serve.** Entries are only
-    ///    created by `insert` above; nothing rebuilds them lazily. That
-    ///    is fine while `load()` walks the whole file at boot (it fills
-    ///    the map as a side effect), but an out-of-core engine that
-    ///    *doesn't* replay everything at startup needs this map itself to
-    ///    be durable, which means a persistent index file with its own
-    ///    crash semantics — not a `HashMap` rebuilt from a full scan.
-    ///
-    /// 3. **The offsets must be recoverable after a torn tail.** A crash
-    ///    mid-append can leave a partial frame that `read_all_records`
-    ///    drops; any offset recorded for it must never reach this map.
-    ///    The ordering rule on [`Index::insert`] (record only after
-    ///    `append_record` returns) is what guarantees that, and it has to
-    ///    keep holding on every future write path.
-    #[allow(dead_code)]
-    pub fn get(&self, address: &str) -> Option<u64> {
-        self.addresses.get(address).copied()
+    let len = u16::from_be_bytes([key[0], key[1]]) as usize;
+
+    if key.len() < 2 + len {
+        return None;
     }
 
-    /// Record a node in the secondary indexes.
-    pub fn track(&mut self, node: &Node) {
-        self.by_kind
-            .entry(node.kind.clone())
-            .or_default()
-            .insert(node.address.clone());
+    Some((&key[2..2 + len], &key[2 + len..]))
+}
 
-        self.by_owner
-            .entry(node.owner.clone())
-            .or_default()
-            .insert(node.address.clone());
-    }
+/// `kind` index prefix: every node of that kind.
+pub fn kind_prefix(kind: &str) -> Vec<u8> {
+    component(kind)
+}
 
-    /// Remove a node from the secondary indexes.
-    ///
-    /// Emptied buckets are dropped rather than left behind: `owner` is
-    /// unbounded (one per identity that ever wrote), so keeping empty
-    /// sets would leak a slot per departed user forever.
-    pub fn untrack(&mut self, node: &Node) {
-        if let Some(addresses) = self.by_kind.get_mut(&node.kind) {
-            addresses.remove(&node.address);
-            if addresses.is_empty() {
-                self.by_kind.remove(&node.kind);
-            }
-        }
+pub fn kind_key(kind: &str, address: &str) -> Vec<u8> {
+    let mut key = component(kind);
+    key.extend_from_slice(address.as_bytes());
+    key
+}
 
-        if let Some(addresses) = self.by_owner.get_mut(&node.owner) {
-            addresses.remove(&node.address);
-            if addresses.is_empty() {
-                self.by_owner.remove(&node.owner);
-            }
-        }
-    }
+/// `owner` index prefix: every node that owner owns.
+pub fn owner_prefix(owner: &str) -> Vec<u8> {
+    component(owner)
+}
 
-    /// Addresses of every live node of `kind`, or `None` when no node
-    /// has that kind. `None` and an empty set mean the same thing to a
-    /// caller; the distinction just avoids allocating one.
-    pub fn by_kind(&self, kind: &str) -> Option<&HashSet<String>> {
-        self.by_kind.get(kind)
-    }
+pub fn owner_key(owner: &str, address: &str) -> Vec<u8> {
+    let mut key = component(owner);
+    key.extend_from_slice(address.as_bytes());
+    key
+}
 
-    /// Addresses of every live node owned by `owner`.
-    pub fn by_owner(&self, owner: &str) -> Option<&HashSet<String>> {
-        self.by_owner.get(owner)
-    }
+/// Outgoing-edge prefix: every edge leaving `from`.
+pub fn edge_out_prefix(from: &str) -> Vec<u8> {
+    component(from)
+}
 
-    /// Live node count per kind, sorted by kind.
-    ///
-    /// The index already groups nodes this way, so `GET /stats` reads it
-    /// straight off rather than re-walking every node to count them.
-    pub fn kind_counts(&self) -> BTreeMap<String, u64> {
-        self.by_kind
-            .iter()
-            .map(|(kind, addresses)| (kind.clone(), addresses.len() as u64))
-            .collect()
-    }
+pub fn edge_out_key(from: &str, kind: &str, to: &str) -> Vec<u8> {
+    let mut key = component(from);
+    key.extend_from_slice(&component(kind));
+    key.extend_from_slice(to.as_bytes());
+    key
+}
+
+/// Incoming-edge prefix: every edge arriving at `to`.
+pub fn edge_in_prefix(to: &str) -> Vec<u8> {
+    component(to)
+}
+
+pub fn edge_in_key(to: &str, kind: &str, from: &str) -> Vec<u8> {
+    let mut key = component(to);
+    key.extend_from_slice(&component(kind));
+    key.extend_from_slice(from.as_bytes());
+    key
+}
+
+/// History prefix: every archived state of one node.
+pub fn history_prefix(address: &str) -> Vec<u8> {
+    component(address)
+}
+
+/// One archived state, keyed by the version that produced it.
+///
+/// The version is big-endian so byte order is numeric order, which makes
+/// a prefix scan return a node's history oldest-first without sorting
+/// anything.
+pub fn history_key(address: &str, version: u64) -> Vec<u8> {
+    let mut key = component(address);
+    key.extend_from_slice(&version.to_be_bytes());
+    key
 }

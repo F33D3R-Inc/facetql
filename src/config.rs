@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Where facetql.data / facetql.wal / facetql.edges /
-/// facetql.tombstones actually live.
+/// Where the database actually lives: the catalog, the heap segments,
+/// the index files, the WAL, the checkpoint and the user log.
 ///
 /// Every prior checkpoint wrote these to the current working directory,
 /// which is fine for `cargo run` from inside the repo and not fine for

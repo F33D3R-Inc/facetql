@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 use std::io;
 
-use crate::core::edge::Edge;
-use crate::core::history::HistoryEntry;
-use crate::core::node::Node;
 use crate::storage::checkpoint;
 use crate::storage::engine::StorageEngine;
 use crate::storage::wal;
@@ -150,15 +147,14 @@ pub fn recover(engine: &mut StorageEngine) -> io::Result<()> {
     );
 
     /*
-     * Records already reflected in physical storage (facetql.data,
-     * facetql.edges, facetql.users, facetql.history) don't need to be
-     * replayed. Only records past the last confirmed-durable checkpoint
-     * represent operations that might not have made it to physical
-     * storage before a crash.
+     * Records already reflected in the heap and the indexes don't need
+     * to be replayed. Only records past the last confirmed-durable
+     * checkpoint represent operations that might not have reached the
+     * disk before a crash.
      *
      * The checkpoint is an OPTIMIZATION, not a correctness barrier. It
-     * is advanced *after* the physical write and on a best-effort basis,
-     * so a record whose physical write did land can still fall on the
+     * advances only after a flush, and a flush covers many mutations, so
+     * a record whose effects did reach the disk routinely falls on the
      * replay side of this filter. Correctness therefore rests on replay
      * being idempotent (see `apply_recovery_operation`), never on the
      * checkpoint being exact.
@@ -215,7 +211,21 @@ pub fn recover(engine: &mut StorageEngine) -> io::Result<()> {
      * Uncommitted and aborted frames are never buffered and never
      * applied.
      */
-    replay_in_sequence_order(engine, records, &committed)
+    replay_in_sequence_order(engine, records, &committed)?;
+
+    /*
+     * ---------------------------------------------------------------
+     * Settle what was just replayed.
+     * ---------------------------------------------------------------
+     *
+     * Replay put everything back in the buffer pool; this pushes it to
+     * the disk and moves the durability checkpoint across it. Without
+     * it, the same records would be replayed again on the next start,
+     * and again after that — the WAL would never stop being redone, and
+     * every redo would leave another superseded copy of each record in
+     * the heap.
+     */
+    engine.checkpoint()
 }
 
 /// Buffered mutations of one in-flight transaction, keyed by
@@ -273,6 +283,8 @@ fn replay_in_sequence_order(
                         engine,
                         operation,
                     )?;
+
+                    engine.note_recovered(sequence);
                 }
             }
 
@@ -331,6 +343,8 @@ fn replay_in_sequence_order(
                         operation,
                     )?;
                 }
+
+                engine.note_recovered(sequence);
             }
 
             operation => {
@@ -754,22 +768,20 @@ fn validate_sequence(
 /// recovery actually depends on; the checkpoint only reduces how much
 /// work it takes.
 ///
-/// The reason is the checkpoint's own ordering: it is advanced after the
-/// physical write completes, and on a best-effort basis, so a record
-/// whose physical write did land can still be replayed after a crash —
-/// and `StorageEngine::load()` has already read that landed write back
-/// out of facetql.history / facetql.edges into memory.
+/// The reason is the checkpoint's own ordering: it is advanced only
+/// after a flush, so every operation applied since the last flush is
+/// replayed even though some of it did reach the disk.
 ///
-/// Insert and Delete are naturally idempotent (a map insert and a map
-/// remove both converge). Archive and InsertEdge are NOT: they push onto
-/// a `Vec`, so a re-applied record appends a second, identical history
-/// entry or edge — permanently, and again on every subsequent restart.
-/// They are de-duplicated here, on the recovery side of the boundary,
-/// against the state `load()` produced.
-///
-/// InsertUser and RevokeUser are map operations and converge like Insert
-/// and Delete. DeleteEdge converges too: it removes by identity from
-/// both adjacency lists, so a second application removes nothing.
+/// Every operation is now idempotent **by key**, which is what the
+/// durable indexes bought: an insert repoints one primary-index entry,
+/// a delete removes one, an edge is keyed by its identity, and a history
+/// entry is keyed by `(address, version)` with the version carried in
+/// the record itself. Re-applying any of them lands on the entry it
+/// already wrote. The cost of a redundant replay is a superseded record
+/// in the heap, which compaction reclaims — not a duplicate that
+/// survives forever and grows with every restart, which is what the
+/// previous `Vec`-backed history and adjacency lists produced and why
+/// replay used to need explicit de-duplication.
 fn apply_recovery_operation(
     engine: &mut StorageEngine,
     operation: WalOperation,
@@ -777,16 +789,14 @@ fn apply_recovery_operation(
     match operation {
         WalOperation::Archive(entry) => {
             /*
-             * Identity of a history entry is (address, archived_at_unix,
-             * node): the same node archived twice at different instants
-             * is two real entries, so the timestamp is part of the key
-             * and only a byte-for-byte repeat of the same archival is a
-             * duplicate.
+             * No existence check: the history index is keyed
+             * (address, version), and the version travels with the entry
+             * through the WAL, so a replayed archive re-derives the key
+             * it already wrote and lands on itself. This used to require
+             * scanning a node's whole history for a byte-for-byte match
+             * before every replay, because history was a `Vec` that a
+             * second apply would simply push onto again.
              */
-            if history_contains(engine, &entry) {
-                return Ok(());
-            }
-
             engine
                 .replay_archive(entry)
                 .map_err(storage_error)?;
@@ -806,15 +816,10 @@ fn apply_recovery_operation(
 
         WalOperation::InsertEdge(edge) => {
             /*
-             * An edge is fully described by (from, to, kind, owner);
-             * there is no separate edge identity to compare, so a second
-             * edge with all four equal is indistinguishable from the
-             * first and adds nothing but a duplicate traversal result.
+             * Keyed by (from, kind, to) in both edge indexes, so a
+             * re-applied insert replaces its own entry rather than
+             * adding a second copy of the relationship.
              */
-            if edge_exists(engine, &edge) {
-                return Ok(());
-            }
-
             engine
                 .replay_insert_edge(edge)
                 .map_err(storage_error)?;
@@ -822,13 +827,10 @@ fn apply_recovery_operation(
 
         WalOperation::DeleteEdge(id) => {
             /*
-             * No existence check and no de-duplication needed: removal
-             * from both adjacency lists converges the same way `Delete`
-             * converges for a node. Replaying this against an edge that
-             * `load()` already resolved away — or that an earlier replay
-             * removed — finds nothing to remove and is a no-op, not an
-             * error. That is the idempotence the checkpoint's
-             * best-effort advance depends on.
+             * No existence check needed: removing a key from both edge
+             * indexes converges the same way `Delete` converges for a
+             * node. Replaying this against an edge already gone finds
+             * nothing to remove and is a no-op, not an error.
              */
             engine
                 .replay_delete_edge(&id)
@@ -860,77 +862,6 @@ fn apply_recovery_operation(
     }
 
     Ok(())
-}
-
-/// Is this exact history entry already present for its address?
-///
-/// Read-only against `StorageEngine::history`, which is `pub`, so
-/// recovery can answer this without engine.rs growing a
-/// recovery-specific method.
-fn history_contains(
-    engine: &StorageEngine,
-    entry: &HistoryEntry,
-) -> bool {
-    engine
-        .history
-        .get(&entry.address)
-        .is_some_and(|existing| {
-            existing.iter().any(|candidate| {
-                candidate.address == entry.address
-                    && candidate.archived_at_unix
-                        == entry.archived_at_unix
-                    && nodes_equal(
-                        &candidate.node,
-                        &entry.node,
-                    )
-            })
-        })
-}
-
-/// Is this exact edge already present in the outgoing adjacency list?
-///
-/// Checking `edges_out` alone is sufficient: `StorageEngine` indexes
-/// every edge into `edges_out` and `edges_in` together, so the two are
-/// never out of step and one is a faithful witness for the other.
-fn edge_exists(
-    engine: &StorageEngine,
-    edge: &Edge,
-) -> bool {
-    engine
-        .edges_out
-        .get(&edge.from)
-        .is_some_and(|existing| {
-            existing.iter().any(|candidate| {
-                candidate.from == edge.from
-                    && candidate.to == edge.to
-                    && candidate.kind == edge.kind
-                    && candidate.owner == edge.owner
-            })
-        })
-}
-
-/// Structural equality of two nodes.
-///
-/// Compared field by field rather than with a derived `PartialEq`:
-/// `Node` lives in core/node.rs, which recovery does not own, and a
-/// derive there is a wider change than this one call site justifies.
-///
-/// Every field participates. A history entry records the *whole*
-/// previous node, so two archives that differ only in, say, `owner` or
-/// `visibility` are genuinely different snapshots and must not collapse
-/// into one.
-fn nodes_equal(
-    left: &Node,
-    right: &Node,
-) -> bool {
-    left.address == right.address
-        && left.coordinate == right.coordinate
-        && left.value == right.value
-        && left.kind == right.kind
-        && left.data == right.data
-        && left.owner == right.owner
-        && left.claimed_by == right.claimed_by
-        && left.visibility == right.visibility
 }
 
 fn storage_error(

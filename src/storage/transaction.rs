@@ -54,12 +54,13 @@ pub enum Operation {
 
     /// Delete the node at this address.
     ///
-    /// Lowers to a `NodeRecord::Delete` appended to `facetql.data`
-    /// itself, not to a separate tombstone log. That is what makes
-    /// create → delete → create resolve correctly on the next load: the
-    /// delete and the creates share one file, so file order settles
-    /// which of them is last and there is no second log whose entries
-    /// have to be applied at some arbitrary point.
+    /// Lowers to the removal of the address from the primary index and
+    /// the secondary ones. That removal *is* the delete: nothing
+    /// resolves the address afterwards, so no read path can reach the
+    /// record even though its bytes stay in the heap until compaction
+    /// reclaims them. There is no tombstone to outrank a later
+    /// re-create, which is what makes create → delete → create resolve
+    /// correctly with nothing to reconcile.
     Delete(String),
 
     /// Insert or replace a directional edge (upsert on `(from, to,
@@ -68,11 +69,9 @@ pub enum Operation {
 
     /// Delete the edge with this identity.
     ///
-    /// The edge counterpart of [`Operation::Delete`], and possible for
-    /// the same reason: `facetql.edges` carries its own deletes, so
-    /// follow → unfollow → follow again survives a restart. A permanent
-    /// tombstone could never have expressed that sequence at all, which
-    /// is why there was no edge delete before this.
+    /// The edge counterpart of [`Operation::Delete`]: the identity is
+    /// removed from both edge indexes, so follow → unfollow → follow
+    /// again is three ordinary index writes and survives a restart.
     DeleteEdge(EdgeId),
 
     /// Insert or replace a persistent user.
@@ -148,20 +147,29 @@ impl Transaction {
     /// 2. Stage every operation's WAL record under the transaction id
     ///    (all durable) — **before** anything is applied to state.
     /// 3. Write the durable `COMMIT` marker — the atomic commit point.
-    /// 4. Apply each operation to memory + physical storage via `apply`.
-    /// 5. Settle: release the fence and advance the checkpoint past the
-    ///    `COMMIT`, now that physical storage reflects the whole batch.
+    /// 4. Apply each operation to physical storage + indexes via
+    ///    `apply`.
+    /// 5. Settle: release the checkpoint fence and hand the caller the
+    ///    `COMMIT` sequence.
     ///
     /// `apply` is supplied by the engine and must apply one resolved
-    /// [`Operation`] to in-memory and physical state **without** writing
-    /// its own WAL record and **without** advancing the checkpoint — the
-    /// frame has already durably logged the intent, and double-logging or
+    /// [`Operation`] to physical state **without** writing its own WAL
+    /// record and **without** advancing the checkpoint — the frame has
+    /// already durably logged the intent, and double-logging or
     /// early-checkpointing would break the atomicity this path
     /// guarantees. `StorageEngine::apply_committed` is that primitive,
-    /// and it is the only thing callers pass here; the engine's
-    /// `replay_*` methods are not a substitute (they are memory-only, so
-    /// a frame applied through them would never reach the binary files
-    /// and the checkpoint could not honestly advance past it).
+    /// and it is the only thing callers pass here.
+    ///
+    /// # Who moves the checkpoint
+    ///
+    /// Not this. Applying a batch puts it in the buffer pool, which is
+    /// not the same as putting it on the disk, and the checkpoint may
+    /// only ever name a sequence whose effects are genuinely durable.
+    /// So this returns the `COMMIT` sequence and the engine advances the
+    /// checkpoint to it later, at the flush that makes the heap and the
+    /// indexes durable (`StorageEngine::checkpoint`). Returning it —
+    /// rather than advancing it here — is what keeps that decision with
+    /// the layer that knows what has actually been written.
     ///
     /// ## Failure handling
     ///
@@ -176,16 +184,17 @@ impl Transaction {
     ///   is left below the frame and recovery replays the committed batch
     ///   from the WAL on the next start, reconstructing the state `apply`
     ///   failed to write. The error is returned so the caller learns the
-    ///   in-memory apply did not complete.
+    ///   apply did not complete.
     ///
-    /// An empty transaction is a no-op: it opens no frame and writes no
-    /// records.
-    pub fn commit<F>(self, mut apply: F) -> io::Result<()>
+    /// An empty transaction is a no-op: it opens no frame, writes no
+    /// records, and returns sequence 0 — a value below every real
+    /// sequence, so it can never move the checkpoint forward.
+    pub fn commit<F>(self, mut apply: F) -> io::Result<u64>
     where
         F: FnMut(&Operation) -> Result<(), String>,
     {
         if self.operations.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let mut frame = StagedCommit::open()?;
@@ -207,11 +216,9 @@ impl Transaction {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
 
-        // Step 5: physical storage now reflects the batch — advance the
-        // durability boundary across the settled frame.
-        frame.settle()?;
-
-        Ok(())
+        // Step 5: the batch is applied — release the fence and report
+        // how far the checkpoint may eventually move.
+        frame.settle()
     }
 }
 
@@ -245,6 +252,6 @@ impl Default for Transaction {
 // is a transaction by construction.
 //
 // Both routes pass the same apply closure,
-// `StorageEngine::apply_committed`, which writes memory + physical
-// storage, writes no WAL, and never touches the checkpoint.
+// `StorageEngine::apply_committed`, which writes physical storage and
+// the indexes, writes no WAL, and never touches the checkpoint.
 // ---------------------------------------------------------------------
