@@ -12,7 +12,7 @@ mod facet;
 mod cli;
 
 use api::routes::create_router;
-use database::Database;
+use database::{Database, DatabaseError};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -232,7 +232,6 @@ const DATA_FILES: &[&str] = &[
     "facetql.data",
     "facetql.wal",
     "facetql.edges",
-    "facetql.tombstones",
     "facetql.users",
 ];
 
@@ -369,34 +368,166 @@ async fn run_import(source: ImportSource) {
     }
 }
 
+/// Render a startup failure for whoever is reading the terminal or the
+/// journal, then exit non-zero.
+///
+/// The single line this replaces was true but unusable: it said the same
+/// thing for a directory that does not exist, a master key that does not
+/// match, and a file that has rotted — when the operator's response to
+/// those three is entirely different. What matters most here is that the
+/// storage layer's own message is reproduced verbatim on the `Detail`
+/// line: it names the file and the byte offset, and no summary of ours
+/// can improve on it.
+///
+/// This function only ever exits. There is deliberately no flag, env var
+/// or branch that starts the server anyway — serving from state that is
+/// not known to be durable and valid is worse than being down.
+fn report_startup_failure(error: DatabaseError) -> ! {
+    let data_dir = config::data_dir().display().to_string();
+
+    eprintln!();
+    eprintln!("FacetQL failed to start — the database was not opened.");
+    eprintln!();
+    eprintln!("  Data directory: {data_dir}");
+    eprintln!("  Detail:         {}", error.detail());
+    eprintln!();
+
+    /*
+     * One eprintln! per rendered line, wrapped by hand. The alternative
+     * — long literals split with line continuations — reads fine in the
+     * editor and silently misaligns in the terminal, which is exactly
+     * the failure this whole block exists to avoid.
+     */
+    match &error {
+        DatabaseError::Storage { phase, .. } => {
+            eprintln!("  What failed:    reaching the data files, while {phase}.");
+            eprintln!("  Likely cause:   the data directory is missing, is owned by another");
+            eprintln!("                  user, or its filesystem is full, read-only, or not");
+            eprintln!("                  mounted. Nothing has been read yet, so nothing is");
+            eprintln!("                  yet known to be wrong with the data itself.");
+            eprintln!();
+            eprintln!("  Next steps:");
+            eprintln!("    1. Check the directory and its permissions:");
+            eprintln!("       ls -ld {data_dir}");
+            eprintln!("    2. Create it if it is genuinely absent:");
+            eprintln!("       facetql init --data-dir {data_dir}");
+            eprintln!("    3. If you meant a different directory, pass --data-dir or set");
+            eprintln!("       ENOCHIAN_DATA_DIR, then start again.");
+        }
+
+        /*
+         * The wrong-key explanation comes first on purpose. The two
+         * causes are indistinguishable to the code, but not in the
+         * field: a mismatched key is far more common than bit-rot, and
+         * it is the one an operator can rule out in seconds without
+         * touching a single byte of data.
+         */
+        DatabaseError::Integrity { authentication: true, .. } => {
+            eprintln!("  What failed:    a stored record did not authenticate.");
+            eprintln!("  Likely cause:   in order of likelihood —");
+            eprintln!("                  1. the server was started with the wrong");
+            eprintln!("                     ENOCHIAN_MASTER_KEY. Leaving it unset silently");
+            eprintln!("                     uses the all-zero dev key, so an unset key looks");
+            eprintln!("                     exactly like a wrong one;");
+            eprintln!("                  2. failing that, the file named above is corrupt.");
+            eprintln!();
+            eprintln!("  Next steps:");
+            eprintln!("    1. Check ENOCHIAN_MASTER_KEY is the same 64-hex-character key");
+            eprintln!("       this data was written with, then start again. A wrong key is");
+            eprintln!("       not destructive — nothing has been modified.");
+            eprintln!("    2. If the key is right, copy the files aside before anything");
+            eprintln!("       else: facetql backup <dir>");
+            eprintln!("    3. Then restore a known-good copy into an empty data directory:");
+            eprintln!("       facetql restore <dir>");
+        }
+
+        DatabaseError::Integrity { authentication: false, .. } => {
+            eprintln!("  What failed:    a stored record failed verification — framing,");
+            eprintln!("                  checksum, or deserialization.");
+            eprintln!("  Likely cause:   the file named above is damaged: bit-rot, an");
+            eprintln!("                  interrupted write, or a partial copy. A wrong");
+            eprintln!("                  ENOCHIAN_MASTER_KEY can also present this way, when");
+            eprintln!("                  a record decodes but then does not parse.");
+            eprintln!();
+            eprintln!("  Next steps:");
+            eprintln!("    1. Copy the current files aside before touching anything:");
+            eprintln!("       facetql backup <dir>");
+            eprintln!("    2. Confirm ENOCHIAN_MASTER_KEY matches the key this data was");
+            eprintln!("       written with.");
+            eprintln!("    3. Restore a known-good copy into an empty data directory:");
+            eprintln!("       facetql restore <dir>");
+        }
+
+        DatabaseError::WalRecovery { .. } => {
+            eprintln!("  What failed:    replaying the write-ahead log. The frames verified,");
+            eprintln!("                  but the history they describe is not a legal one.");
+            eprintln!("  Likely cause:   facetql.wal was written by a different build or");
+            eprintln!("                  format, or was copied in from another data");
+            eprintln!("                  directory, or a write was interrupted in a way that");
+            eprintln!("                  left the log inconsistent. Replaying it would invent");
+            eprintln!("                  a state that never existed, so recovery stops.");
+            eprintln!();
+            eprintln!("  Next steps:");
+            eprintln!("    1. Back up the whole directory first: facetql backup <dir>. The");
+            eprintln!("       WAL is the only record of writes not yet folded into");
+            eprintln!("       facetql.data.");
+            eprintln!("    2. Confirm facetql.wal belongs to this data directory and to this");
+            eprintln!("       build of FacetQL.");
+            eprintln!("    3. Restore a known-good copy into an empty data directory:");
+            eprintln!("       facetql restore <dir>");
+        }
+    }
+
+    eprintln!();
+    eprintln!("  FacetQL will not start until this is resolved, and there is no flag");
+    eprintln!("  to make it. Serving state that is not known to be durable and valid");
+    eprintln!("  would be worse than being down.");
+    eprintln!();
+
+    /*
+     * Exit codes, continuing the policy in src/cli/error.rs
+     * (2 = usage error, 1 = runtime failure, 3 = operator declined)
+     * rather than competing with it:
+     *
+     *   1  storage/IO   — the files could not be reached at all
+     *   4  integrity    — bytes were read and failed to verify
+     *                     (wrong master key, or corruption)
+     *   5  WAL recovery — bytes verified, the logged history is illegal
+     *
+     * 2 and 3 keep their CLI meanings so one code means one thing across
+     * the whole binary. Split this way because a supervisor can act on
+     * the difference: 1 is worth retrying once a mount comes back, while
+     * 4 and 5 never resolve on their own and need an operator.
+     */
+    std::process::exit(error.exit_code())
+}
+
 async fn run_server(
     port: u16,
     tls_identity: Option<PathBuf>,
     tls_identity_password: Option<String>,
 ) {
-    config::ensure_data_dir()
-        .expect("failed to create data directory");
-
     /*
      * Database initialization includes:
      *
-     *   1. Loading persistent storage files.
-     *   2. Recovering the authenticated WAL.
-     *   3. Rejecting corrupted or invalid recovery state.
+     *   1. Creating the data directory if it does not exist.
+     *   2. Loading persistent storage files.
+     *   3. Recovering the authenticated WAL.
+     *   4. Rejecting corrupted or invalid recovery state.
      *
      * A database that cannot recover safely must never start serving
      * requests.
+     *
+     * Step 1 used to be a separate `ensure_data_dir().expect(...)` here.
+     * It was removed rather than kept: Database::new() does it anyway,
+     * and doing it first meant the one failure most likely to be a plain
+     * permissions problem was the one failure that came out as a panic
+     * instead of a diagnosis.
      */
     let db = match Database::new() {
         Ok(db) => std::sync::Arc::new(db),
 
-        Err(error) => {
-            eprintln!(
-                "FacetQL database initialization failed: {error}"
-            );
-
-            std::process::exit(1);
-        }
+        Err(error) => report_startup_failure(error),
     };
 
     let app = create_router(db);

@@ -4,14 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Serialize, Deserialize};
 
-use crate::core::edge::Edge;
+use crate::core::edge::{Edge, EdgeId};
 use crate::core::history::HistoryEntry;
 use crate::core::node::Node;
 use crate::core::predicate::{self, Expr};
 use crate::core::user::UserRecord;
-use crate::storage::binary;
+use crate::storage::binary::{self, EdgeRecord, NodeRecord, UserOpRecord};
 use crate::storage::index::Index;
-use crate::storage::tombstone;
 use crate::storage::transaction::{Operation, Transaction};
 use crate::storage::wal;
 
@@ -67,13 +66,28 @@ pub struct StorageEngine {
     /// Process-lifetime operation counters, the rate source behind
     /// `GET /stats` (and any future health/observability surface — NOTES
     /// EPIC 08). `reads_total` counts calls to `get`/`query`/`query_where`;
-    /// `writes_total` counts each applied mutation — in `insert`/`delete`/
-    /// `insert_edge` on the standalone path, and in `apply_committed` on
-    /// the transaction path, so a transaction contributes one increment
-    /// per node it actually mutates (a `ClearKind`/`DeleteWhere` of N
-    /// nodes counts as N writes, the truthful workload signal). Counting
-    /// lives at the apply step in both paths, so a batch that fails
-    /// validation and writes nothing counts nothing.
+    /// `writes_total` counts each applied mutation, and it is counted in
+    /// exactly one place: `apply_committed`, the single apply step every
+    /// mutation now passes through — the framed transaction path and the
+    /// standalone single-record path alike (see `apply_atomic`). One
+    /// counting site is the point: while `insert`/`delete`/`insert_edge`
+    /// each counted for themselves *and* `apply_committed` counted for
+    /// the transaction path, the number a mutation contributed depended
+    /// on which of the two carried it, so moving a path from one to the
+    /// other would silently change the statistic. Now a mutation
+    /// contributes one increment per node it actually mutates (a
+    /// `ClearKind`/`DeleteWhere` of N nodes counts as N writes, the
+    /// truthful workload signal) whichever path carried it. Counting at
+    /// the apply step also means a mutation that fails validation, or a
+    /// frame that never reaches its `COMMIT`, writes nothing and counts
+    /// nothing.
+    ///
+    /// An `Archive` is deliberately not counted: it is the history half
+    /// of the overwrite or delete that produced it rather than a
+    /// mutation anyone asked for, and counting it would double every
+    /// upsert. User records (`InsertUser`/`RevokeUser`) are likewise
+    /// uncounted, preserving what `insert_user`/`revoke_user` have
+    /// always done — identity administration is not data workload.
     ///
     /// These are deliberately NOT persisted: they start at 0 every time
     /// the process starts and are never checkpointed or replayed. That is
@@ -102,6 +116,13 @@ impl StorageEngine {
     ///
     /// Real multi-operation transaction IDs are introduced by the
     /// transaction coordinator.
+    ///
+    /// Its one caller is [`Self::apply_atomic`]'s single-record branch,
+    /// and it must stay that way: a mutation that decides for itself to
+    /// append here is a mutation that has stepped outside the
+    /// frame-vs-standalone rule, and a record appended alongside a
+    /// framed operation is replayed twice by recovery — once in the
+    /// frame, once as a standalone record.
     ///
     /// Returns the WAL sequence number assigned to this record so the
     /// caller can advance the durability checkpoint once the matching
@@ -147,6 +168,117 @@ impl StorageEngine {
             eprintln!(
                 "warning: failed to advance WAL checkpoint to {sequence}: {e}"
             );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Durable apply: the frame-vs-standalone rule
+    // ---------------------------------------------------------------------
+
+    /// Apply one logical mutation — the ordered list of resolved
+    /// [`Operation`]s it lowers to — durably and atomically.
+    ///
+    /// **The rule this function exists to hold, and the one a future
+    /// reader must not accidentally violate:**
+    ///
+    /// > **Two or more durable records ⇒ frame.
+    /// > Exactly one ⇒ standalone.**
+    ///
+    /// Every mutation primitive routes through here so that rule is
+    /// decided in one place instead of being re-decided — and eventually
+    /// mis-decided — at each call site.
+    ///
+    /// ## Why two records must be framed
+    ///
+    /// A mutation that emits two independent standalone records is not
+    /// atomic no matter how carefully its halves are ordered:
+    ///
+    /// ```text
+    /// WAL Archive(tx 0)   ← durable
+    /// history record      ← durable
+    /// checkpoint advanced ← the archive is now "settled"
+    ///        ✗ crash
+    /// WAL Insert(tx 0)    ← never written
+    /// ```
+    ///
+    /// Recovery starts above the checkpoint, so it never revisits the
+    /// archive — and there is no insert record to replay. The node keeps
+    /// its old value while history claims that value was superseded: a
+    /// durable half-mutation no later run can repair. Staging both
+    /// records under one `BEGIN … COMMIT` frame removes the in-between,
+    /// because recovery replays a frame only when it sees the `COMMIT`,
+    /// so the pair lands together or not at all.
+    ///
+    /// ## Why one record must not be
+    ///
+    /// A single-record mutation is already atomic — one fsync'd WAL
+    /// record, then one physical write — so a frame would buy nothing
+    /// while costing two extra fsync'd control records (`BEGIN` and
+    /// `COMMIT`) and a checkpoint fence on the single-writer mutation
+    /// path. The cheap path stays cheap.
+    ///
+    /// ## Who writes what
+    ///
+    /// Both branches converge on [`Self::apply_committed`] for the apply
+    /// itself, so memory, physical storage and `writes_total` are
+    /// touched by exactly one body of code regardless of route. The
+    /// standalone branch owns the WAL record and the checkpoint advance
+    /// that `apply_committed` deliberately does not do; the framed
+    /// branch leaves both to [`Transaction::commit`]. Neither a caller
+    /// nor `apply_committed` may add its own: a framed operation that
+    /// also appended a standalone record would be replayed twice by
+    /// recovery — once inside the frame, once outside it — and a framed
+    /// operation that advanced the checkpoint itself would re-open the
+    /// very window the frame closes.
+    fn apply_atomic(
+        &mut self,
+        operations: Vec<Operation>,
+    ) -> Result<(), String> {
+        match operations.len() {
+            // Nothing resolved to nothing: no record, no frame, no
+            // checkpoint movement. An empty mutation is a no-op, not a
+            // WAL entry.
+            0 => Ok(()),
+
+            // -----------------------------------------------------
+            // Exactly one durable record: standalone (tx id 0).
+            // -----------------------------------------------------
+            //
+            // WAL intent → physical + memory → checkpoint. The
+            // checkpoint moves last, once `apply_committed` has put the
+            // record in physical storage, so it never claims durability
+            // that recovery could not back up.
+            // -----------------------------------------------------
+            1 => {
+                let operation = &operations[0];
+
+                let sequence = self.append_wal(0, operation.to_wal())?;
+
+                self.apply_committed(operation)?;
+
+                Self::advance_checkpoint(sequence);
+
+                Ok(())
+            }
+
+            // -----------------------------------------------------
+            // Two or more: one implicit single-statement transaction.
+            // -----------------------------------------------------
+            //
+            // The same machinery `execute_transaction` uses for a wire
+            // batch; the only difference is that a mutation primitive
+            // resolved this operation list instead of
+            // `lower_transaction` lowering it from a request. Same
+            // frame, same recovery rule, same atomicity.
+            // -----------------------------------------------------
+            _ => Transaction::from_operations(operations)
+                .commit(|operation| self.apply_committed(operation))
+                // `Transaction::commit` speaks `io::Result`; the
+                // mutation API speaks `Result<_, String>`. Carry the
+                // message across rather than collapsing it into a
+                // generic failure — it is the only account the caller
+                // gets of what went wrong.
+                .map_err(|e| e.to_string()),
         }
     }
 
@@ -203,6 +335,29 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Memory-only edge removal, the recovery counterpart of
+    /// [`Self::delete_edge`].
+    ///
+    /// Removes the edge from **both** adjacency maps: they are two views
+    /// of one set, and a recovery that pruned only `edges_out` would
+    /// leave `edges_to` answering with a relationship that no longer
+    /// exists — a difference nothing later would ever reconcile, because
+    /// nothing rebuilds the maps against each other.
+    ///
+    /// Naturally idempotent, which recovery depends on: replaying a
+    /// `DeleteEdge` against an edge that `load()` already resolved away
+    /// (or that an earlier replay removed) finds nothing to retain and
+    /// returns `Ok`, exactly as `replay_delete` does for a node that is
+    /// already gone. Idempotence is what lets the checkpoint stay an
+    /// optimization rather than a correctness barrier.
+    pub(crate) fn replay_delete_edge(
+        &mut self,
+        id: &EdgeId,
+    ) -> Result<(), String> {
+        self.unindex_edge(id);
+        Ok(())
+    }
+
     pub(crate) fn replay_insert_user(
         &mut self,
         record: UserRecord,
@@ -238,14 +393,33 @@ impl StorageEngine {
 
     /// Rebuilds engine state from durable storage.
     ///
-    /// facetql.data
-    /// facetql.edges
-    /// facetql.users
-    /// facetql.history
-    /// facetql.tombstones
+    /// facetql.data     — a log of `NodeRecord`s
+    /// facetql.edges    — a log of `EdgeRecord`s
+    /// facetql.users    — a log of `UserOpRecord`s
+    /// facetql.history  — a log of `HistoryEntry`s (append-only, no deletes)
     ///
-    /// are loaded in append order. Later records for the same key replace
-    /// the current in-memory value.
+    /// Each is a **straight replay in file order**: a `Put` inserts or
+    /// overwrites its key, a `Delete`/`Revoke` removes it, and the last
+    /// record for a key wins. That is the whole algorithm — there is no
+    /// second pass and no other log to reconcile against.
+    ///
+    /// ## Why that is the fix, and not just a simplification
+    ///
+    /// This used to end with a fifth pass over `facetql.tombstones`,
+    /// removing every tombstoned address *after* the data log had been
+    /// replayed. Two append-only logs share no ordering, so nothing on
+    /// disk could say whether a delete happened before or after a
+    /// neighbouring create — and applying the tombstones last meant a
+    /// tombstone always won, whenever it was written:
+    ///
+    ///     create X → delete X → create X again → restart → X is gone.
+    ///
+    /// That is silent data loss on a perfectly ordinary sequence, and it
+    /// applied to users too (revocations were `user:`-prefixed entries in
+    /// the same log). Moving each entity's deletes into that entity's own
+    /// log makes file order the total order for that entity type, so
+    /// last-write-wins is decided by the same thing that decides it for
+    /// every other write: position in the file.
     ///
     /// WAL recovery is deliberately separate from this physical-storage
     /// reconstruction. The recovery layer can subsequently apply committed
@@ -258,33 +432,107 @@ impl StorageEngine {
         // Nodes
         // -------------------------------------------------------------
 
-        for (offset, node) in binary::read_all()? {
-            engine.index.insert(node.address.clone(), offset);
-            engine.nodes.insert(node.address.clone(), node);
+        for (offset, record) in binary::read_all()? {
+            match record {
+                NodeRecord::Put(node) => {
+                    engine.index.insert(node.address.clone(), offset);
+                    engine.nodes.insert(node.address.clone(), node);
+                }
+
+                // The address is gone as of this point in the log. A
+                // later `Put` for the same address re-creates it — that
+                // is the whole point of carrying deletes here.
+                NodeRecord::Delete(address) => {
+                    engine.nodes.remove(&address);
+                }
+            }
         }
 
         // -------------------------------------------------------------
         // Edges
         // -------------------------------------------------------------
+        //
+        // Resolved to the live set FIRST, then indexed — deliberately not
+        // pushed into the adjacency lists as the log is walked. The
+        // adjacency lists are `Vec`s, so a blind walk would leave a
+        // deleted edge sitting in `edges_out`/`edges_in` unless every
+        // `Delete` also scanned and spliced both vectors, and any edge
+        // re-created after a delete would have to be de-duplicated
+        // against the copy still in there.
+        //
+        // `order` records the position of each `Put` so the rebuilt
+        // adjacency lists are deterministic rather than dependent on
+        // `HashMap` iteration order: walking it in reverse and emitting
+        // each surviving edge the first time it is seen places every
+        // edge at its most recent `Put` — i.e. exactly the file order of
+        // the record that won.
+        // -------------------------------------------------------------
 
-        for (_offset, edge) in
-            binary::read_all_records::<Edge>(&binary::edges_path())?
+        let mut order: Vec<EdgeId> = Vec::new();
+        let mut live: HashMap<EdgeId, Edge> = HashMap::new();
+
+        for (_offset, record) in
+            binary::read_all_records::<EdgeRecord>(&binary::edges_path())?
         {
+            match record {
+                EdgeRecord::Put(edge) => {
+                    order.push(edge.id());
+                    live.insert(edge.id(), edge);
+                }
+
+                EdgeRecord::Delete(id) => {
+                    live.remove(&id);
+                }
+            }
+        }
+
+        let mut resolved = Vec::with_capacity(live.len());
+
+        for id in order.into_iter().rev() {
+            // `remove` both fetches and consumes, so an edge that was
+            // written more than once is emitted once, at its last `Put`.
+            if let Some(edge) = live.remove(&id) {
+                resolved.push(edge);
+            }
+        }
+
+        for edge in resolved.into_iter().rev() {
             engine.index_edge(edge);
         }
 
         // -------------------------------------------------------------
         // Users
         // -------------------------------------------------------------
+        //
+        // Revocations live here now rather than as `user:`-prefixed
+        // entries in a shared tombstone log. With one log per entity
+        // there are no two key spaces to keep from colliding, so the
+        // prefix is gone too — and a revoked token hash can be re-issued
+        // and revoked again, which the old permanent tombstone made
+        // impossible.
+        // -------------------------------------------------------------
 
-        for (_offset, user) in
-            binary::read_all_records::<UserRecord>(&binary::users_path())?
+        for (_offset, record) in
+            binary::read_all_records::<UserOpRecord>(&binary::users_path())?
         {
-            engine.users.insert(user.token_hash.clone(), user);
+            match record {
+                UserOpRecord::Put(user) => {
+                    engine.users.insert(user.token_hash.clone(), user);
+                }
+
+                UserOpRecord::Revoke(token_hash) => {
+                    engine.users.remove(&token_hash);
+                }
+            }
         }
 
         // -------------------------------------------------------------
         // History
+        // -------------------------------------------------------------
+        //
+        // No operation enum: history is strictly additive. Nothing ever
+        // supersedes or removes an archived state, so file order is
+        // already the only order it has.
         // -------------------------------------------------------------
 
         for (_offset, entry) in
@@ -295,26 +543,6 @@ impl StorageEngine {
                 .entry(entry.address.clone())
                 .or_default()
                 .push(entry);
-        }
-
-        // -------------------------------------------------------------
-        // Tombstones
-        // -------------------------------------------------------------
-        //
-        // User tombstones are namespaced with "user:" so a user token hash
-        // can never collide with a node address.
-        // -------------------------------------------------------------
-
-        for key in tombstone::read_tombstones()? {
-            match key.strip_prefix("user:") {
-                Some(token_hash) => {
-                    engine.users.remove(token_hash);
-                }
-
-                None => {
-                    engine.nodes.remove(&key);
-                }
-            }
         }
 
         Ok(engine)
@@ -331,86 +559,64 @@ impl StorageEngine {
     /// Insert or replace a node.
     ///
     /// If a node already exists at the address, its current state is
-    /// archived before the new state is written.
+    /// archived before the new state is written. Upsert semantics are
+    /// unchanged, including the absence of an ownership check here — a
+    /// cross-owner overwrite is rejected on the transaction path, which
+    /// is where the batch's owner context exists.
     ///
-    /// WAL ordering:
+    /// Durability follows the rule in [`Self::apply_atomic`], and an
+    /// overwrite is the canonical two-record case:
     ///
-    /// archive intent
-    ///     ↓
-    /// history durable
-    ///     ↓
-    /// insert intent
+    /// create (one record — standalone):
+    ///
+    /// WAL Insert(tx 0)
     ///     ↓
     /// node durable
     ///     ↓
-    /// memory update
+    /// memory
+    ///     ↓
+    /// checkpoint
     ///
-    /// Standalone operations use transaction_id = 0.
+    /// overwrite (two records — framed):
+    ///
+    /// BEGIN(tx)
+    ///     ↓
+    /// WAL Archive(tx) → WAL Insert(tx)   ← both durable, nothing visible
+    ///     ↓
+    /// COMMIT(tx)                         ← the atomic commit point
+    ///     ↓
+    /// history durable → node durable → memory
+    ///     ↓
+    /// checkpoint past COMMIT
+    ///
+    /// Before the frame, the archive was written, made durable *and*
+    /// checkpointed before the insert record even existed, so a crash in
+    /// between left history claiming a value had been superseded by a
+    /// value that never landed — and the already-advanced checkpoint put
+    /// that state permanently out of recovery's reach. The archive and
+    /// the insert it precedes are one mutation, so they land as one.
     pub fn insert(&mut self, node: Node) -> Result<(), String> {
+        let mut operations = Vec::with_capacity(2);
+
         // -------------------------------------------------------------
         // Archive the previous value.
         // -------------------------------------------------------------
+        //
+        // Staged immediately ahead of the insert that supersedes it —
+        // the same ordering `lower_transaction` produces for an
+        // overwrite — so recovery rebuilds history identically whichever
+        // path wrote the frame.
+        // -------------------------------------------------------------
 
         if let Some(previous) = self.nodes.get(&node.address) {
-            let entry = HistoryEntry::now(previous.clone());
-
-            let archive_sequence = self.append_wal(
-                0,
-                wal::WalOperation::Archive(entry.clone()),
-            )?;
-
-            binary::append_record(
-                &binary::history_path(),
-                &entry,
-            )
-                .map_err(|e| e.to_string())?;
-
-            Self::advance_checkpoint(archive_sequence);
-
-            self.history
-                .entry(node.address.clone())
-                .or_default()
-                .push(entry);
+            operations.push(Operation::Archive(
+                HistoryEntry::now(previous.clone()),
+            ));
         }
 
-        // -------------------------------------------------------------
-        // WAL the new value before making it visible in memory.
-        // -------------------------------------------------------------
+        operations.push(Operation::Insert(node));
 
-        let insert_sequence = self.append_wal(
-            0,
-            wal::WalOperation::Insert(node.clone()),
-        )?;
-
-        // -------------------------------------------------------------
-        // Persist node.
-        // -------------------------------------------------------------
-
-        let offset = binary::append_node(&node)
-            .map_err(|e| e.to_string())?;
-
-        Self::advance_checkpoint(insert_sequence);
-
-        // -------------------------------------------------------------
-        // Update indexes and live state.
-        // -------------------------------------------------------------
-
-        self.index.insert(
-            node.address.clone(),
-            offset,
-        );
-
-        self.nodes.insert(
-            node.address.clone(),
-            node,
-        );
-
-        // Count the applied write. See the `writes_total` field doc for
-        // why this lives at the mutation primitive (so a transaction op
-        // is counted once, here, when it actually applies).
-        self.writes_total.fetch_add(1, Ordering::Relaxed);
-
-        Ok(())
+        self.apply_atomic(operations)
     }
 
     /// Every archived previous state for `address`, oldest first.
@@ -444,6 +650,19 @@ impl StorageEngine {
     /// primitive. The database layer currently serializes mutations through
     /// its write lock, so the check and update occur within one mutation
     /// operation.
+    ///
+    /// The write half is a read-modify-write, and its target exists by
+    /// definition (a missing node has already returned `NotFound`), so
+    /// the `insert` below always archives and therefore always resolves to
+    /// the two-record `Archive` + `Insert` frame (see
+    /// [`Self::apply_atomic`]). A claim is where a torn mutation would
+    /// hurt most: a crash between the archive and the insert used to
+    /// leave the node *unclaimed* while history recorded that it had
+    /// been superseded, so the slot looked free to the next worker and
+    /// the archive looked like a claim that had been taken away. The
+    /// frame closes that window. Nothing else about the claim contract
+    /// changes — the `ClaimError` variants and the "already claimed by
+    /// X" text are the caller's API and are untouched.
     pub fn claim(
         &mut self,
         address: &str,
@@ -483,55 +702,43 @@ impl StorageEngine {
     /// transition that doesn't archive, the final state is the one state
     /// nobody can ever look up again — `GET /node/:address/history`
     /// would show every version except the one that mattered when
-    /// somebody asks what was deleted. Same WAL ordering as `insert`:
-    /// archive intent → history durable → delete intent → tombstone
-    /// durable → memory.
+    /// somebody asks what was deleted.
+    ///
+    /// That archive makes a live delete a two-record mutation, so it
+    /// goes through a frame under the rule in [`Self::apply_atomic`]:
+    ///
+    /// BEGIN(tx) → WAL Archive(tx) → WAL Delete(tx) → COMMIT(tx)
+    ///     ↓
+    /// history durable → tombstone durable → memory
+    ///     ↓
+    /// checkpoint past COMMIT
+    ///
+    /// A crash can no longer leave the history entry durable with the
+    /// node still live, which is what the old archive-then-checkpoint,
+    /// delete-then-checkpoint pair allowed.
+    ///
+    /// Deleting an address that holds nothing archives nothing, so it is
+    /// a single `Delete` record and stays on the cheaper standalone
+    /// path. The tombstone is still written in that case, deliberately:
+    /// deleting an absent address is idempotent rather than an error, so
+    /// a repeated delete is harmless and a delete of something a
+    /// concurrent writer already removed still ends with the address
+    /// durably gone.
     pub fn delete(
         &mut self,
         address: &str,
     ) -> Result<(), String> {
+        let mut operations = Vec::with_capacity(2);
+
         if let Some(existing) = self.nodes.get(address) {
-            let entry = HistoryEntry::now(existing.clone());
-
-            let archive_sequence = self.append_wal(
-                0,
-                wal::WalOperation::Archive(entry.clone()),
-            )?;
-
-            binary::append_record(
-                &binary::history_path(),
-                &entry,
-            )
-                .map_err(|e| e.to_string())?;
-
-            Self::advance_checkpoint(archive_sequence);
-
-            self.history
-                .entry(address.to_string())
-                .or_default()
-                .push(entry);
+            operations.push(Operation::Archive(
+                HistoryEntry::now(existing.clone()),
+            ));
         }
 
-        let sequence = self.append_wal(
-            0,
-            wal::WalOperation::Delete(
-                address.to_string(),
-            ),
-        )?;
+        operations.push(Operation::Delete(address.to_string()));
 
-        tombstone::append_tombstone(address)
-            .map_err(|e| e.to_string())?;
-
-        Self::advance_checkpoint(sequence);
-
-        self.nodes.remove(address);
-
-        // Count the applied write (see `writes_total` field doc). A bulk
-        // ClearKind/DeleteWhere flows through here once per node removed,
-        // so N cleared nodes count as N writes.
-        self.writes_total.fetch_add(1, Ordering::Relaxed);
-
-        Ok(())
+        self.apply_atomic(operations)
     }
 
     /// Does one node fall inside a bulk-delete selection?
@@ -708,9 +915,28 @@ impl StorageEngine {
     // Edges
     // ---------------------------------------------------------------------
 
-    /// Creates a relationship between two existing nodes.
+    /// Creates — or replaces — a relationship between two existing
+    /// nodes.
     ///
     /// Both endpoints must exist before the edge is written.
+    ///
+    /// **Upsert on identity.** `(from, to, kind)` is what an edge is
+    /// (see [`EdgeId`]), so re-asserting an existing relationship lands
+    /// on the same edge rather than beside it. It used to push a second
+    /// copy into both adjacency lists, and `edges_from` then returned
+    /// the same relationship twice — a traversal double-counted it, and
+    /// a delete could only ever have removed one of the copies.
+    ///
+    /// Replacing an edge owned by someone else is rejected, mirroring
+    /// the cross-owner rejection `insert` does for nodes on the
+    /// transaction path: the owner is who may *retract* the edge, so
+    /// silently overwriting it would hand that right to whoever asserted
+    /// the relationship most recently.
+    ///
+    /// One durable record, so this stays standalone under the rule in
+    /// [`Self::apply_atomic`]: the WAL record and the edges-file append
+    /// are already a single atomic mutation, and framing them would add
+    /// two control records and a checkpoint fence to buy nothing.
     pub fn insert_edge(
         &mut self,
         edge: Edge,
@@ -729,42 +955,127 @@ impl StorageEngine {
             ));
         }
 
-        let sequence = self.append_wal(
-            0,
-            wal::WalOperation::InsertEdge(
-                edge.clone(),
-            ),
-        )?;
+        if let Some(existing) = self.find_edge(&edge.id()) {
+            if existing.owner != edge.owner {
+                return Err(format!(
+                    "edge {} -[{}]-> {} is owned by {}",
+                    edge.from,
+                    edge.kind,
+                    edge.to,
+                    existing.owner
+                ));
+            }
+        }
 
-        binary::append_record(
-            &binary::edges_path(),
-            &edge,
-        )
-            .map_err(|e| e.to_string())?;
-
-        Self::advance_checkpoint(sequence);
-
-        self.index_edge(edge);
-
-        // Count the applied write (see `writes_total` field doc).
-        self.writes_total.fetch_add(1, Ordering::Relaxed);
-
-        Ok(())
+        self.apply_atomic(vec![Operation::InsertEdge(edge)])
     }
 
+    /// The live edge with this identity, or `None`.
+    ///
+    /// Looks in `edges_out` only: every edge is indexed into `edges_out`
+    /// and `edges_in` together and removed from both together, so one is
+    /// a faithful witness for the other.
+    ///
+    /// Compares the three identity fields directly instead of building an
+    /// [`EdgeId`] per candidate — `Edge::id()` clones three `String`s,
+    /// which is wasted work inside a scan.
+    pub fn find_edge(
+        &self,
+        id: &EdgeId,
+    ) -> Option<&Edge> {
+        self.edges_out
+            .get(&id.from)?
+            .iter()
+            .find(|edge| edge_has_id(edge, id))
+    }
+
+    /// Removes one edge.
+    ///
+    /// Errors when there is no such edge, so a caller (and the
+    /// `DELETE /edge` route above it) can tell "removed" from "was never
+    /// there" instead of reporting success for a relationship that never
+    /// existed. Authorization is the caller's: this is the storage
+    /// primitive, and the ownership check lives where the requester's
+    /// identity does — the route, or `TxOperation::DeleteEdge`.
+    ///
+    /// Goes through [`Self::apply_atomic`] like every other mutation,
+    /// and must keep doing so. Hand-rolling the WAL append or the
+    /// checkpoint advance here would put a second copy of the
+    /// frame-vs-standalone rule in the codebase, and the copy that is
+    /// only exercised by one route is the one that silently rots.
+    pub fn delete_edge(
+        &mut self,
+        id: &EdgeId,
+    ) -> Result<(), String> {
+        if self.find_edge(id).is_none() {
+            return Err(format!(
+                "edge not found: {} -[{}]-> {}",
+                id.from,
+                id.kind,
+                id.to
+            ));
+        }
+
+        self.apply_atomic(vec![Operation::DeleteEdge(id.clone())])
+    }
+
+    /// Places `edge` in both adjacency maps, **replacing** any edge that
+    /// already has its identity rather than appending a duplicate.
+    ///
+    /// This is the single place both maps are written, so replace-by-
+    /// identity has to happen here or not at all: the live path, the
+    /// `load()` rebuild and WAL replay all arrive through this function,
+    /// and a duplicate introduced by any one of them is permanent —
+    /// nothing scans the vectors afterwards to notice two copies of the
+    /// same relationship.
     fn index_edge(
         &mut self,
         edge: Edge,
     ) {
-        self.edges_out
-            .entry(edge.from.clone())
-            .or_default()
-            .push(edge.clone());
+        let id = edge.id();
 
-        self.edges_in
-            .entry(edge.to.clone())
-            .or_default()
-            .push(edge);
+        let outgoing = self.edges_out.entry(edge.from.clone()).or_default();
+
+        match outgoing.iter_mut().find(|e| edge_has_id(e, &id)) {
+            Some(slot) => *slot = edge.clone(),
+            None => outgoing.push(edge.clone()),
+        }
+
+        let incoming = self.edges_in.entry(edge.to.clone()).or_default();
+
+        match incoming.iter_mut().find(|e| edge_has_id(e, &id)) {
+            Some(slot) => *slot = edge,
+            None => incoming.push(edge),
+        }
+    }
+
+    /// Removes the edge with this identity from both adjacency maps.
+    ///
+    /// The mirror of [`Self::index_edge`], and likewise the only place
+    /// edges leave the maps. Empty vectors are dropped rather than left
+    /// behind: `edges_out`'s keys would otherwise accumulate one entry
+    /// per node that ever had an outgoing edge, and `stats()` sums the
+    /// vectors it holds, so a map full of empty ones is pure overhead
+    /// with no reader.
+    fn unindex_edge(
+        &mut self,
+        id: &EdgeId,
+    ) {
+        if let Some(outgoing) = self.edges_out.get_mut(&id.from) {
+            outgoing.retain(|edge| !edge_has_id(edge, id));
+
+            if outgoing.is_empty() {
+                self.edges_out.remove(&id.from);
+            }
+        }
+
+        if let Some(incoming) = self.edges_in.get_mut(&id.to) {
+            incoming.retain(|edge| !edge_has_id(edge, id));
+
+            if incoming.is_empty() {
+                self.edges_in.remove(&id.to);
+            }
+        }
     }
 
     pub fn edges_from(
@@ -987,19 +1298,39 @@ impl StorageEngine {
     // Insert with edges
     // ---------------------------------------------------------------------
 
-    /// Creates a node and one or more outgoing edges.
+    /// Creates a node and one or more outgoing edges as one crash-atomic
+    /// mutation.
     ///
-    /// This remains best-effort until the full transaction coordinator is
-    /// implemented.
+    /// The node and every edge are resolved and validated first, then
+    /// staged into a single `BEGIN … COMMIT` frame (see
+    /// [`Self::apply_atomic`]), so the whole shape — the node, the
+    /// history entry if it replaced something, and all N edges — becomes
+    /// visible together or not at all.
     ///
-    /// If an edge fails:
+    /// This used to be explicitly best-effort: the node was inserted and
+    /// checkpointed, then each edge was inserted and checkpointed, and a
+    /// failing edge triggered a compensating `delete` of the node just
+    /// created. That left three ways to end up with wreckage — a crash
+    /// between the node and an edge, a crash between two edges, and a
+    /// crash during the compensation itself — and compensation is not
+    /// rollback: it wrote *more* durable records (a tombstone, another
+    /// history entry) to approximate undoing records already on disk.
+    /// Validating up front and committing once removes both the
+    /// compensation and the windows it was papering over.
     ///
-    /// * the newly created node is tombstoned;
-    /// * already-created edges remain;
-    /// * the caller receives the successfully-created edges.
+    /// Endpoint validation runs against this call's own staged view: an
+    /// edge may point at any live node, or at the node being created
+    /// here — which is not live yet but is staged ahead of every edge in
+    /// the frame, exactly as the transaction path's `staged_node` view
+    /// resolves an intra-batch reference. The error text is unchanged
+    /// from the per-edge path, since it is the caller-visible contract.
     ///
-    /// FQL-003/FQL-004 will replace this behavior with real atomic
-    /// transactions.
+    /// The error tuple keeps its shape, but its `Vec<Edge>` is now
+    /// always empty: once the batch is atomic there is no such thing as
+    /// "edges created before the failure" — a failure means nothing was
+    /// created. An empty list is the truthful answer, where the old
+    /// partial list described durable wreckage the caller then had to
+    /// clean up.
     pub fn insert_with_edges(
         &mut self,
         node: Node,
@@ -1008,10 +1339,20 @@ impl StorageEngine {
         let address = node.address.clone();
         let owner = node.owner.clone();
 
-        self.insert(node)
-            .map_err(|e| (e, Vec::new()))?;
+        let mut operations = Vec::with_capacity(2 + edge_targets.len());
 
-        let mut created = Vec::new();
+        // An overwrite archives what it replaces, exactly as `insert`
+        // does — carried inside this frame rather than settled ahead of
+        // it as its own record.
+        if let Some(previous) = self.nodes.get(&address) {
+            operations.push(Operation::Archive(
+                HistoryEntry::now(previous.clone()),
+            ));
+        }
+
+        operations.push(Operation::Insert(node));
+
+        let mut created = Vec::with_capacity(edge_targets.len());
 
         for (to, kind) in edge_targets {
             let edge = Edge::new(
@@ -1021,21 +1362,38 @@ impl StorageEngine {
                 owner.clone(),
             );
 
-            match self.insert_edge(edge.clone()) {
-                Ok(()) => {
-                    created.push(edge);
-                }
-
-                Err(e) => {
-                    let _ = self.delete(&address);
-
-                    return Err((
-                        e,
-                        created,
-                    ));
-                }
+            // `from` is the node this call creates, so it counts as
+            // present even though it is not in `self.nodes` yet: it is
+            // staged ahead of every edge in the frame. The check is
+            // written out rather than assumed, so the staged rule stays
+            // visible if the edge source ever stops being the new node.
+            if edge.from != address && !self.nodes.contains_key(&edge.from) {
+                return Err((
+                    format!(
+                        "edge 'from' address not found: {}",
+                        edge.from
+                    ),
+                    Vec::new(),
+                ));
             }
+
+            if edge.to != address && !self.nodes.contains_key(&edge.to) {
+                return Err((
+                    format!(
+                        "edge 'to' address not found: {}",
+                        edge.to
+                    ),
+                    Vec::new(),
+                ));
+            }
+
+            operations.push(Operation::InsertEdge(edge.clone()));
+
+            created.push(edge);
         }
+
+        self.apply_atomic(operations)
+            .map_err(|e| (e, Vec::new()))?;
 
         Ok(created)
     }
@@ -1048,57 +1406,30 @@ impl StorageEngine {
     ///
     /// Only the token hash is persisted. Plaintext tokens are never stored
     /// in the engine.
+    ///
+    /// One durable record — the WAL record plus the users-file append —
+    /// so this stays standalone under the rule in
+    /// [`Self::apply_atomic`].
     pub fn insert_user(
         &mut self,
         record: UserRecord,
     ) -> Result<(), String> {
-        let sequence = self.append_wal(
-            0,
-            wal::WalOperation::InsertUser(
-                record.clone(),
-            ),
-        )?;
-
-        binary::append_record(
-            &binary::users_path(),
-            &record,
-        )
-            .map_err(|e| e.to_string())?;
-
-        Self::advance_checkpoint(sequence);
-
-        self.users.insert(
-            record.token_hash.clone(),
-            record,
-        );
-
-        Ok(())
+        self.apply_atomic(vec![Operation::InsertUser(record)])
     }
 
     /// Revokes a user by token hash.
     ///
     /// User tombstones are namespaced with "user:".
+    ///
+    /// One durable record — the WAL record plus the tombstone — so this
+    /// stays standalone too. See [`Self::apply_atomic`].
     pub fn revoke_user(
         &mut self,
         token_hash: &str,
     ) -> Result<(), String> {
-        let sequence = self.append_wal(
-            0,
-            wal::WalOperation::RevokeUser(
-                token_hash.to_string(),
-            ),
-        )?;
-
-        tombstone::append_tombstone(
-            &format!("user:{token_hash}"),
-        )
-            .map_err(|e| e.to_string())?;
-
-        Self::advance_checkpoint(sequence);
-
-        self.users.remove(token_hash);
-
-        Ok(())
+        self.apply_atomic(vec![Operation::RevokeUser(
+            token_hash.to_string(),
+        )])
     }
 
     pub fn find_user_by_hash(
@@ -1235,6 +1566,15 @@ impl StorageEngine {
         // address absent from the overlay is untouched so far and
         // resolves against `self.nodes`.
         let mut staged: HashMap<String, Option<Node>> = HashMap::new();
+
+        // The same overlay for edges, keyed by identity. Edges need
+        // their own because they have their own key space: an edge is
+        // addressed by `(from, to, kind)`, not by a node address, so the
+        // node overlay could not represent one. Without it a batch that
+        // deleted an edge and then re-asserted it (or deleted it twice)
+        // would be judged against live state and get the wrong answer
+        // both times.
+        let mut staged_edges: HashMap<EdgeId, Option<Edge>> = HashMap::new();
 
         for op in ops {
             match op {
@@ -1413,7 +1753,48 @@ impl StorageEngine {
                         )));
                     }
 
+                    // Recorded in the edge overlay so a later op in
+                    // this batch — a `delete_edge` of it, or a second
+                    // insert of the same identity — resolves against
+                    // what the batch has done rather than against live
+                    // state it has already moved past.
+                    staged_edges.insert(edge.id(), Some(edge.clone()));
+
                     lowered.push(Operation::InsertEdge(edge));
+                }
+
+                TxOperation::DeleteEdge { id, owner, is_admin } => {
+                    // Already removed earlier in this same batch:
+                    // nothing left to delete. Idempotent rather than an
+                    // error, exactly as `DeleteNode` is.
+                    if matches!(staged_edges.get(&id), Some(None)) {
+                        continue;
+                    }
+
+                    let edge = match staged_edge(&staged_edges, self, &id) {
+                        Some(edge) => edge,
+                        None => {
+                            return Err(TransactionError::Invalid(format!(
+                                "transaction failed, nothing applied: \
+                                 delete target not found: edge {} -[{}]-> {}",
+                                id.from, id.kind, id.to
+                            )))
+                        }
+                    };
+
+                    // An admin bypasses the per-edge owner check the
+                    // same way it bypasses a node's `can_write`.
+                    if !(is_admin || edge.can_write(&owner)) {
+                        return Err(TransactionError::Invalid(format!(
+                            "transaction failed, nothing applied: \
+                             not authorized to delete edge {} -[{}]-> {}",
+                            id.from, id.kind, id.to
+                        )));
+                    }
+
+                    staged_edges.insert(id.clone(), None);
+
+                    lowered.push(Operation::DeleteEdge(id));
                 }
             }
         }
@@ -1464,19 +1845,31 @@ impl StorageEngine {
     /// Apply one already-committed mutation to memory and physical
     /// storage.
     ///
-    /// This is the apply half of the crash-safe path, and it is
-    /// deliberately narrower than the standalone mutation primitives:
+    /// This is the apply half of **every** mutation path — the framed
+    /// one and the standalone one both reach state through here, via
+    /// [`Self::apply_atomic`] — and it is deliberately narrower than a
+    /// mutation primitive:
     ///
-    /// * It writes **no WAL record**. The frame already logged this
-    ///   operation's intent under its transaction ID; writing again here
-    ///   would double-log it and (worse) log it a second time as a
-    ///   standalone record that recovery would replay outside the frame.
+    /// * It writes **no WAL record**. On the framed path the frame has
+    ///   already logged this operation's intent under its transaction
+    ///   ID, so writing again here would double-log it and (worse) log
+    ///   it a second time as a standalone record that recovery would
+    ///   replay outside the frame. On the standalone path `apply_atomic`
+    ///   has already written the one record, before calling this.
     ///
-    /// * It **does not advance the checkpoint**. The checkpoint may only
-    ///   move once the whole frame is in physical storage; the frame
-    ///   itself settles it. Advancing per-operation would let a crash
-    ///   mid-apply leave a checkpoint that claims durability for part of
-    ///   a batch, which is exactly the hole the frame closes.
+    /// * It **does not advance the checkpoint**. In a frame the
+    ///   checkpoint may only move once the whole frame is in physical
+    ///   storage, and the frame settles it; advancing per-operation
+    ///   would let a crash mid-apply leave a checkpoint that claims
+    ///   durability for part of a batch, which is exactly the hole the
+    ///   frame closes. On the standalone path `apply_atomic` advances it
+    ///   afterwards, once this call has put the record in physical
+    ///   storage.
+    ///
+    /// * It is the **only** place `writes_total` is incremented, which
+    ///   is what keeps the counter path-independent (see that field's
+    ///   doc). An `Archive` is not counted: it is the history half of
+    ///   the mutation that carries it, not a mutation of its own.
     ///
     /// It is the counterpart to the `replay_*` methods, which apply to
     /// memory only. Those are correct for recovery, which is replaying a
@@ -1502,8 +1895,9 @@ impl StorageEngine {
             }
 
             Operation::Insert(node) => {
-                let offset = binary::append_node(node)
-                    .map_err(|e| e.to_string())?;
+                let offset =
+                    binary::append_node_record(&NodeRecord::Put(node.clone()))
+                        .map_err(|e| e.to_string())?;
 
                 self.index.insert(
                     node.address.clone(),
@@ -1518,8 +1912,14 @@ impl StorageEngine {
                 self.writes_total.fetch_add(1, Ordering::Relaxed);
             }
 
+            // The delete goes into the node log itself, immediately
+            // after (in file order) whatever `Put` it removes. That
+            // ordering IS the durable record of which happened last, so
+            // a later re-create simply appends another `Put` and wins.
             Operation::Delete(address) => {
-                tombstone::append_tombstone(address)
+                binary::append_node_record(
+                    &NodeRecord::Delete(address.clone()),
+                )
                     .map_err(|e| e.to_string())?;
 
                 self.nodes.remove(address);
@@ -1530,7 +1930,7 @@ impl StorageEngine {
             Operation::InsertEdge(edge) => {
                 binary::append_record(
                     &binary::edges_path(),
-                    edge,
+                    &EdgeRecord::Put(edge.clone()),
                 )
                     .map_err(|e| e.to_string())?;
 
@@ -1539,10 +1939,22 @@ impl StorageEngine {
                 self.writes_total.fetch_add(1, Ordering::Relaxed);
             }
 
+            Operation::DeleteEdge(id) => {
+                binary::append_record(
+                    &binary::edges_path(),
+                    &EdgeRecord::Delete(id.clone()),
+                )
+                    .map_err(|e| e.to_string())?;
+
+                self.unindex_edge(id);
+
+                self.writes_total.fetch_add(1, Ordering::Relaxed);
+            }
+
             Operation::InsertUser(record) => {
                 binary::append_record(
                     &binary::users_path(),
-                    record,
+                    &UserOpRecord::Put(record.clone()),
                 )
                     .map_err(|e| e.to_string())?;
 
@@ -1553,8 +1965,9 @@ impl StorageEngine {
             }
 
             Operation::RevokeUser(token_hash) => {
-                tombstone::append_tombstone(
-                    &format!("user:{token_hash}"),
+                binary::append_record(
+                    &binary::users_path(),
+                    &UserOpRecord::Revoke(token_hash.clone()),
                 )
                     .map_err(|e| e.to_string())?;
 
@@ -1564,6 +1977,34 @@ impl StorageEngine {
 
         Ok(())
     }
+}
+
+/// Resolve an edge identity against a transaction's staged edge overlay,
+/// falling back to the engine's live adjacency lists.
+///
+/// The edge counterpart of [`staged_node`], with the same three states:
+/// `Some(edge)` in the overlay is an edge the batch wrote, `Some(None)`
+/// one it removed, and an absent key means the batch has not touched
+/// that identity, so live state answers.
+fn staged_edge<'a>(
+    staged: &'a HashMap<EdgeId, Option<Edge>>,
+    engine: &'a StorageEngine,
+    id: &EdgeId,
+) -> Option<&'a Edge> {
+    match staged.get(id) {
+        Some(slot) => slot.as_ref(),
+        None => engine.find_edge(id),
+    }
+}
+
+/// Does this edge carry that identity?
+///
+/// Field-by-field rather than `edge.id() == *id`, which would clone
+/// three `String`s for every candidate in a linear scan. `owner` is
+/// deliberately absent — see [`EdgeId`] for why it is not part of what
+/// an edge is.
+fn edge_has_id(edge: &Edge, id: &EdgeId) -> bool {
+    edge.from == id.from && edge.to == id.to && edge.kind == id.kind
 }
 
 /// Resolve an address against a transaction's staged overlay, falling
@@ -1777,6 +2218,26 @@ pub enum TxOperation {
     InsertNode(Node),
     DeleteNode(String),
     InsertEdge(Edge),
+
+    /// Remove one edge by its identity `(from, to, kind)`, as part of
+    /// the batch.
+    ///
+    /// Authorization is carried on the op — resolved by the handler
+    /// under the write lock, exactly as `ClearKind`/`DeleteWhere`/
+    /// `SetIf` carry it: a non-admin may delete only an edge it owns,
+    /// an admin any edge. The check runs against the batch's staged
+    /// view, so it judges the edge the batch will actually meet.
+    ///
+    /// Deleting an edge that is not there is an invalid batch, matching
+    /// `DeleteNode` — with the same exception: if *this* batch already
+    /// deleted it, the op is a no-op rather than an error, because
+    /// "remove it, twice" is a coherent request and the end state is
+    /// the one asked for.
+    DeleteEdge {
+        id: EdgeId,
+        owner: String,
+        is_admin: bool,
+    },
 
     /// Remove every live node of `kind` the caller is allowed to write,
     /// as one native, all-or-nothing step inside the transaction. Each

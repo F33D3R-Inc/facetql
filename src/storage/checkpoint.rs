@@ -112,6 +112,59 @@ fn ceiling() -> u64 {
     }
 }
 
+/// Largest checkpoint file this reader will even look at, in bytes.
+///
+/// The file holds one ASCII u64 and nothing else, so 20 digits is the
+/// widest legitimate content (`u64::MAX` is 18446744073709551615) and a
+/// trailing newline is the only decoration a hand-edit is likely to add.
+/// 64 bytes is generous room for that while making "this is not a
+/// checkpoint file at all" — a log, a JSON blob, another file renamed
+/// over it — a cheap, allocation-free rejection instead of something the
+/// reader slurps into memory and then tries to parse.
+const MAX_CHECKPOINT_FILE_LEN: u64 = 64;
+
+/// Read the durable checkpoint: the highest WAL sequence already
+/// reflected in physical storage.
+///
+/// # Why this fails closed
+///
+/// The checkpoint is a durability high-water mark, and recovery replays
+/// exactly the WAL records with `sequence > checkpoint`. That makes the
+/// two directions of error wildly asymmetric:
+///
+/// * Reading a value that is **too low** costs a little redundant
+///   replay. `Insert`/`Delete`/user ops are idempotent; `Archive` and
+///   `InsertEdge` are not, so it is not free — but it is bounded,
+///   visible, and never loses a write.
+/// * Reading a value that is **too high** silently *skips* recovery of
+///   real, durable-in-the-WAL records. Those mutations are simply gone,
+///   with no error anywhere, and the database looks healthy while
+///   missing writes an operator was told had committed.
+///
+/// Guessing is therefore not acceptable. Anything that is not
+/// unambiguously an ASCII u64 — a non-numeric body, a partial or padded
+/// number, a stray sign, an overlong file, non-UTF-8 bytes, or a
+/// whitespace-only body — is a hard `InvalidData` error naming the file
+/// and quoting the offending content, so a human decides what happened
+/// instead of the process inventing a number. In particular, note that
+/// falling back to `0` is NOT the safe default it looks like: `0` means
+/// "replay the entire WAL", which re-applies every non-idempotent
+/// `Archive`/`InsertEdge` ever recorded and duplicates history entries
+/// and edges.
+///
+/// # The one benign case
+///
+/// A **zero-length** file is treated as `0` with a warning. That is the
+/// exact residue of an interrupted create — the temp file existed and
+/// was renamed (or was created directly by an older build) before any
+/// bytes were written — and it is indistinguishable from "no checkpoint
+/// has ever been written", which the missing-file branch above already
+/// treats as `0`. Refusing to start on a state that carries no
+/// information, and that a fresh install can legitimately reach, would
+/// be a self-inflicted outage. It is warned about rather than silent
+/// because if it appears on a *populated* data directory it means a
+/// checkpoint write was interrupted, and the extra WAL replay that
+/// follows is worth an operator knowing about.
 pub fn read() -> io::Result<u64> {
     let path = config::data_file("facetql.checkpoint");
 
@@ -119,20 +172,119 @@ pub fn read() -> io::Result<u64> {
         return Ok(0);
     }
 
-    let raw = fs::read_to_string(&path)?;
+    let len = fs::metadata(&path)?.len();
 
-    let trimmed = raw.trim();
+    if len == 0 {
+        eprintln!(
+            "warning: {} is zero-length — treating the checkpoint as 0 and \
+             replaying the WAL from the beginning. This is what an \
+             interrupted checkpoint write leaves behind; it is safe (replay \
+             is redundant, never lossy) but on a non-empty data directory it \
+             means a checkpoint update did not complete.",
+            path.display()
+        );
 
-    if trimmed.is_empty() {
         return Ok(0);
     }
 
+    if len > MAX_CHECKPOINT_FILE_LEN {
+        return Err(corrupt(
+            &path,
+            &format!(
+                "file is {len} bytes; a checkpoint is a single ASCII u64 and \
+                 cannot exceed {MAX_CHECKPOINT_FILE_LEN} bytes"
+            ),
+        ));
+    }
+
+    let raw = fs::read(&path)?;
+
+    let text = match std::str::from_utf8(&raw) {
+        Ok(text) => text,
+
+        Err(e) => {
+            return Err(corrupt(
+                &path,
+                &format!(
+                    "content is not valid UTF-8 ({e}): {}",
+                    quote(&raw)
+                ),
+            ));
+        }
+    };
+
+    let trimmed = text.trim();
+
+    // Whitespace-only is NOT the zero-length case. Zero bytes carries no
+    // information; whitespace means something wrote bytes here that are
+    // not a number, so the file's history is unknown and the previous
+    // value has already been lost. Fail closed.
+    if trimmed.is_empty() {
+        return Err(corrupt(
+            &path,
+            &format!(
+                "content is whitespace only: {} — this is not an \
+                 interrupted create (that leaves a zero-length file), so the \
+                 previous checkpoint value has been overwritten by something \
+                 that is not a number",
+                quote(&raw)
+            ),
+        ));
+    }
+
+    // Reject anything that is not purely digits *before* parsing.
+    // `u64::from_str` already refuses most of this, but doing it here
+    // means the error message quotes what was actually on disk instead
+    // of "invalid digit found in string", and it makes the accepted
+    // grammar explicit: digits only, no sign, no radix prefix, no
+    // separators, no trailing units.
+    if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(corrupt(
+            &path,
+            &format!(
+                "content is not a plain decimal integer: {}",
+                quote(&raw)
+            ),
+        ));
+    }
+
     trimmed.parse::<u64>().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("corrupt checkpoint file: {e}"),
+        corrupt(
+            &path,
+            &format!(
+                "content does not fit in a u64 ({e}): {}",
+                quote(&raw)
+            ),
         )
     })
+}
+
+/// Operator-facing error for an unreadable checkpoint.
+///
+/// Names the file and says what to do about it, because the recipient of
+/// this message is someone whose database just refused to start and who
+/// has to choose between "restore the file" and "delete it and accept a
+/// full WAL replay" — a choice they can only make if they know which
+/// file and what was in it.
+fn corrupt(path: &std::path::Path, detail: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "corrupt checkpoint file {}: {detail}. Refusing to guess: a \
+             checkpoint that reads too high silently skips WAL recovery of \
+             durable records. Restore the file from a backup, or delete it \
+             to replay the whole WAL (safe, but re-applies non-idempotent \
+             archive/edge operations).",
+            path.display()
+        ),
+    )
+}
+
+/// Renders raw checkpoint bytes for an error message: lossy-decoded,
+/// escaped so control characters cannot mangle a terminal or a log line.
+/// The file is length-capped above, so this can never be large.
+fn quote(raw: &[u8]) -> String {
+    format!("{:?}", String::from_utf8_lossy(raw))
 }
 
 /// Advance the checkpoint to `sequence`, if it's newer than what's
@@ -152,9 +304,11 @@ pub fn read() -> io::Result<u64> {
 ///    both physically durable *and* not part of a still-staging batch.
 ///
 /// Writes are whole-file overwrites (the value is a single small
-/// integer) via a temp file + `sync_data()` + atomic rename, so a
-/// checkpoint update is itself crash-safe: readers either see the old
-/// value or the new one, never a torn write.
+/// integer) via a temp file + `sync_all()` + atomic rename + a
+/// `sync_all()` of the parent directory, so a checkpoint update is itself
+/// crash-safe: readers either see the old value or the new one, never a
+/// torn write, and the rename cannot be undone by a crash. See
+/// [`write_value`] for why each of those steps is required.
 pub fn advance(sequence: u64) -> io::Result<()> {
     let current = read()?;
 
@@ -195,6 +349,50 @@ pub fn settle(sequence: u64) -> io::Result<()> {
 
 /// Whole-file, crash-safe write of the checkpoint value.
 ///
+/// The sequence is: write a temp file → `sync_all` it → atomically
+/// `rename` it over `facetql.checkpoint` → `sync_all` the *directory*.
+/// Each of those four steps is load-bearing:
+///
+/// 1. **Temp file, not in-place truncate-and-write.** A reader must see
+///    either the whole old value or the whole new one. Rewriting in
+///    place can be observed (and can crash) mid-write, leaving a partial
+///    number — and a partial number is a *plausible* number, e.g. `1234`
+///    truncated to `12`, which reads as a checkpoint that went
+///    backwards.
+///
+/// 2. **`sync_all` on the temp file before the rename**, not
+///    `sync_data`. `sync_data` may flush the bytes without flushing the
+///    inode's size. Rename the file in that state, crash, and the
+///    directory entry points at an inode whose length is 0 — the classic
+///    "empty file after atomic rename". A zero-length checkpoint is
+///    recoverable here (see [`read`]) but only by replaying the entire
+///    WAL, which is exactly the cost this file exists to avoid.
+///
+/// 3. **`rename`**, which is atomic with respect to readers: the name
+///    `facetql.checkpoint` resolves to the old inode or the new one,
+///    never to a half-written file.
+///
+/// 4. **`sync_all` on the parent directory.** This is the step that is
+///    almost always missing, so: `rename` does not modify the file, it
+///    modifies the *directory* that names it. Syncing the file — however
+///    thoroughly — flushes the file's own data and inode and says
+///    nothing about the directory block holding the new name→inode
+///    mapping. That mapping can still be sitting in the page cache when
+///    the machine loses power, and the filesystem is entitled to replay
+///    the directory to its previous state: fully-synced new contents, a
+///    successful `rename()` that returned `Ok`, and after reboot the name
+///    still points at the OLD inode. The checkpoint silently rolls back
+///    to an earlier value.
+///
+///    A rolled-back checkpoint is "merely" redundant WAL replay, but the
+///    same durability hole would be data loss if it were `advance` in the
+///    other direction, and the comment is here so this call is not
+///    deleted later as a pointless extra fsync. It is not: without it,
+///    `advance` returning `Ok` does not mean the new value survives a
+///    crash. `sync_all` on a directory handle is the portable way to say
+///    "make the name change durable"; opening a directory read-only for
+///    this is standard and does not conflict with other writers.
+///
 /// The temp file name is unique per write, not a fixed
 /// `facetql.checkpoint.tmp`. Two writers sharing one temp path race
 /// destructively: the second `File::create` truncates the first's temp
@@ -217,7 +415,9 @@ fn write_value(sequence: u64) -> io::Result<()> {
     {
         let mut file = fs::File::create(&tmp_path)?;
         file.write_all(sequence.to_string().as_bytes())?;
-        file.sync_data()?;
+        // sync_all, not sync_data: the file's *length* has to be durable
+        // before the rename publishes this inode under the real name.
+        file.sync_all()?;
     }
 
     // On failure the temp file would otherwise be left behind in the
@@ -227,5 +427,40 @@ fn write_value(sequence: u64) -> io::Result<()> {
         return Err(e);
     }
 
+    // Make the rename itself durable. See step 4 above — without this
+    // the directory entry can survive a crash still pointing at the old
+    // inode, silently rolling the checkpoint back.
+    sync_parent_dir(&path)?;
+
+    Ok(())
+}
+
+/// `fsync` the directory containing `path`, making a just-completed
+/// `rename`/`create`/`unlink` of that name durable.
+///
+/// A directory entry is filesystem metadata living in the *parent*, so
+/// no amount of syncing the file itself covers it — this is the only
+/// call that does. It is done through a read-only handle on the
+/// directory, which is the conventional (and on Linux, the only) way to
+/// obtain a descriptor to fsync.
+///
+/// Errors propagate: a caller that cannot confirm the rename is durable
+/// must not report success, because the entire point of the checkpoint
+/// protocol is that "advance returned Ok" is a durability claim.
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Non-Unix builds: opening a directory as a file is not permitted on
+/// Windows, where `MoveFileEx` with `MOVEFILE_WRITE_THROUGH` (or the
+/// filesystem's own metadata journaling) is the equivalent guarantee and
+/// there is no directory handle to sync through `std`. Treated as a
+/// no-op rather than an error so the checkpoint path still works there;
+/// the Unix builds this engine targets get the real fsync above.
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }

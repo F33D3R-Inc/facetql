@@ -22,24 +22,68 @@ pub struct Edge {
     pub owner: String,
 }
 
+/// The address of an edge: the triple `(from, to, kind)`.
+///
+/// A node has an obvious identity — its `address` — and an edge did not,
+/// which is exactly why there was no way to delete one. This is that
+/// missing address, and it is what `DELETE /edge`, the `delete_edge`
+/// transaction op and the engine's `find_edge`/`delete_edge` all
+/// address an edge by.
+///
+/// # Why `owner` is not part of it
+///
+/// An edge is a *statement that a relationship of a given type exists
+/// between two nodes*. "A follows B" is one fact about the graph, not
+/// one fact per person who asserts it. If `owner` were part of the
+/// identity, two owners could each hold their own "A follows B" and
+/// both would be live at once: `edges_from("A")` would return the same
+/// relationship twice, a traversal would double-count it, and
+/// unfollowing would delete one copy and leave the other — the
+/// relationship would still be there afterwards. Making identity
+/// owner-free makes the second insert land on the same edge instead of
+/// beside it, so the graph holds one copy of each fact.
+///
+/// Ownership is therefore an *authorization* attribute, not an identity
+/// one: it records who may remove the edge (see [`Edge::can_write`]),
+/// not what the edge is. That is the same split nodes have — a node's
+/// `owner` decides who may write it, while its `address` decides which
+/// node it is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EdgeId {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+}
+
+impl EdgeId {
+    pub fn new(from: String, to: String, kind: String) -> Self {
+        Self { from, to, kind }
+    }
+}
+
 impl Edge {
     pub fn new(from: String, to: String, kind: String, owner: String) -> Self {
         Self { from, to, kind, owner }
     }
 
-    /// Same ownership model as Node::can_write for v0.1 — only the
-    /// creator of the edge may remove it. Revisit once verification
-    /// flows need a *different* party (e.g. the org that granted a
-    /// capability) to be able to revoke it than the party who requested
-    /// it — that's an ACL-list problem, same caveat as Node.
+    /// The identity of this edge, with `owner` deliberately dropped —
+    /// see [`EdgeId`] for why the owner is not part of what an edge is.
+    pub fn id(&self) -> EdgeId {
+        EdgeId::new(self.from.clone(), self.to.clone(), self.kind.clone())
+    }
+
+    /// Same ownership model as Node::can_write — only the creator of the
+    /// edge may remove it. Called on the delete paths (`DELETE /edge`
+    /// and the `delete_edge` transaction op), where an admin bypasses
+    /// this the same way it bypasses a node's `can_write`.
     ///
-    /// Not yet called anywhere — there's no DELETE /edge route in this
-    /// pass. Edge deletion needs its own tombstone identity scheme
-    /// (edges have no single address the way nodes do — likely
-    /// (from, to, kind)) and is deliberately left for the next slice
-    /// rather than rushed in alongside node delete. Wire this in then;
-    /// don't skip it.
-    #[allow(dead_code)]
+    /// Revisit once verification flows need a *different* party (e.g.
+    /// the org that granted a capability) to be able to revoke an edge
+    /// than the party who requested it — that's an ACL-list problem,
+    /// same caveat as Node. Note the asymmetry this leaves today:
+    /// because [`EdgeId`] excludes the owner, whoever creates
+    /// "A follows B" first owns the single copy of that fact, and only
+    /// they (or an admin) can retract it.
     pub fn can_write(&self, requester: &str) -> bool {
         self.owner == requester
     }

@@ -21,14 +21,14 @@
 //! the individual WAL-level effects a validated batch produces, after
 //! `clear_kind`/`delete_where` have been expanded to concrete deletes.
 //! It maps one-to-one onto [`wal::WalOperation`] mutation records. The
-//! §4b transaction *wire* contract (`insert_node` / `delete_node` /
-//! `insert_edge` / `clear_kind` / `delete_where`) is unchanged and lives
-//! in the engine's `TxOperation`; this is the internal shape the engine
-//! lowers a validated batch into before staging it.
+//! transaction *wire* contract (`insert_node` / `delete_node` /
+//! `insert_edge` / `delete_edge` / `clear_kind` / `delete_where` /
+//! `set_if`) lives in the engine's `TxOperation`; this is the internal
+//! shape the engine lowers a validated batch into before staging it.
 
 use std::io;
 
-use crate::core::edge::Edge;
+use crate::core::edge::{Edge, EdgeId};
 use crate::core::history::HistoryEntry;
 use crate::core::node::Node;
 use crate::core::user::UserRecord;
@@ -52,11 +52,28 @@ pub enum Operation {
     /// `StorageEngine::insert`).
     Insert(Node),
 
-    /// Delete (tombstone) the node at this address.
+    /// Delete the node at this address.
+    ///
+    /// Lowers to a `NodeRecord::Delete` appended to `facetql.data`
+    /// itself, not to a separate tombstone log. That is what makes
+    /// create → delete → create resolve correctly on the next load: the
+    /// delete and the creates share one file, so file order settles
+    /// which of them is last and there is no second log whose entries
+    /// have to be applied at some arbitrary point.
     Delete(String),
 
-    /// Insert a directional edge.
+    /// Insert or replace a directional edge (upsert on `(from, to,
+    /// kind)`, matching `StorageEngine::insert_edge`).
     InsertEdge(Edge),
+
+    /// Delete the edge with this identity.
+    ///
+    /// The edge counterpart of [`Operation::Delete`], and possible for
+    /// the same reason: `facetql.edges` carries its own deletes, so
+    /// follow → unfollow → follow again survives a restart. A permanent
+    /// tombstone could never have expressed that sequence at all, which
+    /// is why there was no edge delete before this.
+    DeleteEdge(EdgeId),
 
     /// Insert or replace a persistent user.
     InsertUser(UserRecord),
@@ -77,6 +94,7 @@ impl Operation {
             Operation::Insert(node) => WalOperation::Insert(node.clone()),
             Operation::Delete(address) => WalOperation::Delete(address.clone()),
             Operation::InsertEdge(edge) => WalOperation::InsertEdge(edge.clone()),
+            Operation::DeleteEdge(id) => WalOperation::DeleteEdge(id.clone()),
             Operation::InsertUser(user) => WalOperation::InsertUser(user.clone()),
             Operation::RevokeUser(hash) => WalOperation::RevokeUser(hash.clone()),
         }
@@ -118,8 +136,12 @@ impl Transaction {
 
     /// Stage, commit, and apply this transaction atomically.
     ///
-    /// This is the crash-safe apply path the engine's
-    /// `execute_transaction` should route Pass 3 through. Sequence:
+    /// This is the crash-safe apply path for every mutation that
+    /// produces two or more durable records: the engine's
+    /// `execute_transaction` routes its validated batch through here,
+    /// and its single-statement primitives route through here too, via
+    /// `apply_atomic`, as implicit one-statement transactions.
+    /// Sequence:
     ///
     /// 1. Open a [`StagedCommit`] frame (durable `BEGIN`, checkpoint
     ///    fenced).
@@ -135,9 +157,11 @@ impl Transaction {
     /// its own WAL record and **without** advancing the checkpoint — the
     /// frame has already durably logged the intent, and double-logging or
     /// early-checkpointing would break the atomicity this path
-    /// guarantees. (See the `ENGINE HOOK` note at the bottom of this
-    /// file for the primitive this requires; today's `insert`/`delete`/
-    /// `insert_edge` self-WAL and cannot be used here.)
+    /// guarantees. `StorageEngine::apply_committed` is that primitive,
+    /// and it is the only thing callers pass here; the engine's
+    /// `replay_*` methods are not a substitute (they are memory-only, so
+    /// a frame applied through them would never reach the binary files
+    /// and the checkpoint could not honestly advance past it).
     ///
     /// ## Failure handling
     ///
@@ -198,38 +222,29 @@ impl Default for Transaction {
 }
 
 // ---------------------------------------------------------------------
-// ENGINE HOOK REQUIRED (cross-file — cannot be added from these three
-// files; noted here and in the final report for the engine agent).
+// THE RULE THIS MACHINERY EXISTS FOR
 //
-// `Transaction::commit`'s `apply` closure needs an engine primitive that
-// applies one resolved `Operation` to in-memory + physical storage
-// WITHOUT appending a WAL record and WITHOUT advancing the checkpoint,
-// because this frame has already logged the intent under BEGIN…COMMIT
-// and manages the checkpoint itself.
+// Two or more durable records ⇒ frame. Exactly one ⇒ standalone.
 //
-// Today the engine only exposes:
-//   * `insert` / `delete` / `insert_edge` — these self-append a
-//     standalone (tx_id 0) WAL record AND advance the checkpoint
-//     per-op, so they cannot be used inside a frame (double WAL +
-//     premature checkpoint would defeat atomicity).
-//   * `replay_insert` / `replay_delete` / `replay_insert_edge` /
-//     `replay_archive` / `replay_insert_user` / `replay_revoke_user` —
-//     these apply to MEMORY ONLY and intentionally skip physical
-//     storage, so a frame applied through them would never reach the
-//     binary files; the checkpoint could then never advance past it
-//     without data loss.
+// A mutation that lands as a single fsync'd WAL record plus its one
+// physical write is already atomic, and framing it would only add a
+// BEGIN, a COMMIT and a checkpoint fence. A mutation that lands as two
+// or more records is not atomic on its own, however carefully its
+// halves are ordered: a crash between them leaves half of it durable —
+// and once the checkpoint has advanced over that half, permanently
+// beyond recovery's reach. Those go through `Transaction::commit`.
 //
-// Needed (additive, engine-owned): an apply-only primitive per
-// operation that writes BOTH memory and physical storage but no WAL and
-// no checkpoint — e.g.
+// The rule is decided in one place: the engine's `apply_atomic`, which
+// every single-statement mutation primitive routes through. It sends a
+// lone operation down the cheap standalone (tx id 0) path and anything
+// longer here, as an implicit single-statement transaction — an
+// `insert`/`delete` of an address that already holds a value (archive
+// + insert/delete), `claim` (which is exactly such an insert), and
+// `insert_with_edges` (node + N edges). `execute_transaction` reaches
+// `Transaction::commit` directly instead, because a lowered wire batch
+// is a transaction by construction.
 //
-//     pub(crate) fn apply_committed(
-//         &mut self,
-//         op: &crate::storage::transaction::Operation,
-//     ) -> Result<(), String>;
-//
-// and `execute_transaction` Pass 3 rewritten to: lower the validated
-// batch into `Vec<Operation>` (expanding clear_kind/delete_where to the
-// concrete Archive+Delete/Insert effects it already computes), build a
-// `Transaction`, and call `tx.commit(|op| self.apply_committed(op))`.
+// Both routes pass the same apply closure,
+// `StorageEngine::apply_committed`, which writes memory + physical
+// storage, writes no WAL, and never touches the checkpoint.
 // ---------------------------------------------------------------------

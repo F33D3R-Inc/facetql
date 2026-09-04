@@ -58,7 +58,8 @@
 //! ## Ordering contract for the caller
 //!
 //! The caller (the transaction coordinator in `transaction.rs`, driven
-//! by the engine's `execute_transaction`) must observe this order:
+//! by the engine's `execute_transaction` and by every mutation the
+//! engine's `apply_atomic` routes here) must observe this order:
 //!
 //! 1. [`StagedCommit::open`] — after validation succeeds.
 //! 2. [`StagedCommit::stage`] once per resolved mutation, **before**
@@ -66,8 +67,10 @@
 //! 3. [`StagedCommit::commit`] — the atomic durability point.
 //! 4. Apply every operation to memory + physical storage. This step is
 //!    the engine's, using a **non-WAL, non-self-checkpointing** apply
-//!    primitive (see the module note at the bottom of `transaction.rs`
-//!    about the engine hook this requires).
+//!    primitive: `StorageEngine::apply_committed`, which writes memory
+//!    and the physical record but deliberately appends no WAL record and
+//!    does not advance the checkpoint — the frame has already logged the
+//!    intent, and the checkpoint is this module's to move at step 5.
 //! 5. [`StagedCommit::settle`] — releases the checkpoint fence and
 //!    advances the durable checkpoint past COMMIT, now that physical
 //!    storage reflects the whole batch.
@@ -294,20 +297,54 @@ impl StagedCommit {
 }
 
 impl Drop for StagedCommit {
-    /// Safety net: if a frame is dropped without an explicit
+    /// Safety net for a frame dropped without an explicit
     /// [`StagedCommit::settle`] or [`StagedCommit::abort`] (e.g. an early
-    /// `?` unwinds the caller), release the checkpoint fence so it can't
-    /// pin the durable checkpoint forever. The frame has no durable
-    /// COMMIT in that path, so recovery discards it — dropping only needs
-    /// to undo the in-process fence.
+    /// `?` unwinds the caller). What it does depends on whether COMMIT
+    /// reached disk, because that decides what recovery will do with the
+    /// frame:
+    ///
+    /// * **No durable COMMIT** — recovery discards the frame, so the
+    ///   fence has nothing left to protect and is released (plus a
+    ///   best-effort ABORT marker).
+    ///
+    /// * **COMMIT durable, never settled** — recovery will *replay* the
+    ///   frame, and the fence is the only thing keeping the checkpoint
+    ///   from moving past it. It is deliberately NOT released. See the
+    ///   body.
     fn drop(&mut self) {
-        checkpoint::release_fence(self.begin_sequence);
-
-        // Best-effort ABORT so the intent is explicit in the log as well
-        // as implicit from the missing COMMIT. Ignored on failure — the
-        // missing COMMIT alone already guarantees recovery discards the
-        // frame.
+        /*
+         * SEAM: a frame that COMMITted durably but was dropped before
+         * `settle` must KEEP its fence.
+         *
+         * `Transaction::commit` drops the frame without settling when
+         * step 4 (apply to memory + physical storage) fails *after*
+         * COMMIT is durable. The batch is committed — recovery will
+         * replay it — but physical storage does not reflect it. If the
+         * fence were released here, the very next single-op mutation
+         * would call `checkpoint::advance` with its own (higher)
+         * sequence, the ceiling would be unbounded, and the checkpoint
+         * would move past this frame's COMMIT. Recovery filters on
+         * `sequence > checkpoint`, so the committed batch would be
+         * skipped on the next start and lost outright — the one outcome
+         * a WAL exists to prevent.
+         *
+         * Keeping the fence pins the checkpoint below this frame's
+         * BEGIN for the rest of the process's life. That is deliberate:
+         * the cost is redundant (idempotent) WAL replay on the next
+         * start, and the alternative is silent data loss. The process
+         * has already returned an I/O error to the caller, so it is
+         * not in a healthy state to begin with.
+         *
+         * Only an uncommitted frame is safe to unpin, because recovery
+         * discards it outright.
+         */
         if self.commit_sequence.is_none() {
+            checkpoint::release_fence(self.begin_sequence);
+
+            // Best-effort ABORT so the intent is explicit in the log as
+            // well as implicit from the missing COMMIT. Ignored on
+            // failure — the missing COMMIT alone already guarantees
+            // recovery discards the frame.
             let _ = wal::abort(self.transaction_id);
         }
     }

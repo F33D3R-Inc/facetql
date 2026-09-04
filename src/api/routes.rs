@@ -13,7 +13,7 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::database::{Audience, Database};
 use crate::core::node::{Node, Visibility};
-use crate::core::edge::Edge;
+use crate::core::edge::{Edge, EdgeId};
 use crate::core::coordinate::Coordinate;
 use crate::core::predicate::Expr;
 use crate::core::user::{Role, UserRecord};
@@ -58,6 +58,31 @@ pub struct UpdateNodeRequest {
 
 #[derive(Deserialize)]
 pub struct CreateEdgeRequest {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+}
+
+/// Body for `DELETE /edge` — the edge to remove, named by the same
+/// three fields `POST /edge` creates it with.
+///
+/// Deliberately a body rather than a path like `/edge/:from/:to/:kind`.
+/// `from`, `to` and `kind` are arbitrary client-supplied strings: an
+/// address or a relationship label may contain a `/` (F33D3R's own
+/// addresses are `kind:id`-shaped today, but nothing enforces that and
+/// a label like "HAS/OWNS" is legal), and a path segment cannot carry
+/// one without an escaping convention both sides must agree on and
+/// never get wrong. A JSON body has no such question. `DELETE` with a
+/// body is unusual but permitted, and it buys wire symmetry: the same
+/// three field names create and remove an edge, so a client that can
+/// name an edge to create it can name it to delete it.
+///
+/// Note the caller does NOT supply `owner` — it isn't part of an edge's
+/// identity (see [`EdgeId`]), and the owner that matters here is the
+/// one stored on the edge, which is what authorization is checked
+/// against.
+#[derive(Deserialize)]
+pub struct DeleteEdgeRequest {
     pub from: String,
     pub to: String,
     pub kind: String,
@@ -142,6 +167,41 @@ fn cors_layer() -> CorsLayer {
         .allow_headers(tower_http::cors::Any)
 }
 
+/// The full HTTP surface, in one place.
+///
+/// Everything except `GET /` sits behind [`auth_middleware`], so every
+/// handler below can rely on an `AuthIdentity` extension being present
+/// and on an unauthenticated request having been refused before it got
+/// here.
+///
+/// | Method + path | Handler |
+/// |---|---|
+/// | `GET /` | `home` (unauthenticated liveness ping) |
+/// | `POST /node` | `create_node` |
+/// | `GET /node/:address` | `get_node` |
+/// | `GET /node/:address/history` | `get_node_history` |
+/// | `PUT /node/:address` | `update_node` |
+/// | `DELETE /node/:address` | `delete_node` |
+/// | `GET /node/:address/owned` | `list_owned` |
+/// | `POST /node/:address/claim` | `claim_node` |
+/// | `GET /nodes` | `query_nodes` |
+/// | `POST /nodes/query` | `query_nodes_where` |
+/// | `POST /edge` | `create_edge` |
+/// | `DELETE /edge` | `delete_edge` (body-addressed, see [`DeleteEdgeRequest`]) |
+/// | `POST /transaction` | `execute_transaction` |
+/// | `GET /node/:address/edges/out` | `get_edges_out` |
+/// | `GET /node/:address/edges/in` | `get_edges_in` |
+/// | `GET /events` | `subscribe_events` (SSE) |
+/// | `POST /publish` | `publish_event` |
+/// | `POST /admin/users` | `create_user` |
+/// | `GET /admin/users` | `list_users` |
+/// | `DELETE /admin/users/:owner` | `revoke_user` |
+/// | `GET /stats` | `stats` |
+///
+/// `/edge` is the one path that takes its target in a `DELETE` body
+/// rather than in the path — an edge's identity is three arbitrary
+/// strings, not one path-safe address; [`DeleteEdgeRequest`] explains
+/// why that beats escaping them into a URL.
 pub fn create_router(db: Arc<Database>) -> Router {
     let protected = Router::new()
         .route("/node", post(create_node))
@@ -154,6 +214,7 @@ pub fn create_router(db: Arc<Database>) -> Router {
         .route("/nodes", get(query_nodes))
         .route("/nodes/query", post(query_nodes_where))
         .route("/edge", post(create_edge))
+        .route("/edge", delete(delete_edge))
         .route("/transaction", post(execute_transaction))
         .route("/node/:address/edges/out", get(get_edges_out))
         .route("/node/:address/edges/in", get(get_edges_in))
@@ -488,6 +549,93 @@ async fn create_edge(
     }
 }
 
+/// `DELETE /edge` — retract a relationship.
+///
+/// The counterpart to `create_edge`, and the piece that turns every
+/// relationship in the graph from a one-way door into something a
+/// client can undo: follow/unfollow, like/unlike, block/unblock,
+/// mute/unmute are all "insert this edge" / "remove this edge".
+///
+/// The edge is named in the request body ([`DeleteEdgeRequest`]) by the
+/// same `from`/`to`/`kind` triple that created it — see that struct for
+/// why the target isn't in the path.
+///
+/// # Authorization
+///
+/// `identity.is_admin() || edge.can_write(&identity.owner)`, i.e. the
+/// edge's own owner or an admin, exactly mirroring `delete_node`'s rule
+/// for nodes. **403** when the edge exists but this caller may not
+/// remove it, **404** when no such edge exists. Note the 403/404 split
+/// does leak the existence of an edge between two nodes to a caller who
+/// cannot delete it — the same trade `delete_node` already makes, kept
+/// identical here rather than made subtly different for edges.
+///
+/// # One lock, three steps
+///
+/// The existence check, the authorization check and the delete all
+/// happen inside a single write lock, as in `delete_node`. Taking a
+/// read lock to resolve the owner and then re-acquiring a write lock to
+/// delete would open a TOCTOU window: between the two, another request
+/// could remove that edge and a third insert a *different* owner's edge
+/// with the same identity (the owner is not part of [`EdgeId`]), and
+/// this handler would then delete an edge it never authorized against.
+async fn delete_edge(
+    State(db): State<Arc<Database>>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(payload): Json<DeleteEdgeRequest>,
+) -> impl IntoResponse {
+    let id = EdgeId::new(payload.from.clone(), payload.to.clone(), payload.kind.clone());
+
+    let mut engine = db.engine.write().expect("storage engine lock poisoned");
+
+    let existing = match engine.find_edge(&id) {
+        Some(e) => e.clone(),
+        None => return (StatusCode::NOT_FOUND, "edge not found").into_response(),
+    };
+
+    if !identity.is_admin() && !existing.can_write(&identity.owner) {
+        return (StatusCode::FORBIDDEN, "not authorized to delete this edge").into_response();
+    }
+
+    // Same audience rule `create_edge` uses for `edge_created`, resolved
+    // under the same lock as the delete: an edge is only as public as
+    // the pair it connects, so "a → b was removed" goes to everyone only
+    // when both endpoints are public — a single private endpoint would
+    // otherwise reveal that the node exists and was related to the
+    // other. Creation and retraction of the same fact must reach the
+    // same subscribers, or a listener that saw the follow would never
+    // see the unfollow and would hold a stale graph forever.
+    //
+    // The owner-scoped fallback names the EDGE's owner, not the caller:
+    // an admin may delete someone else's edge, and the subscribers who
+    // were told about the edge_created are that owner's. Admins receive
+    // Audience::Owner events regardless (see Audience::admits), so
+    // nothing is hidden from the caller either way.
+    let endpoints_public = [&payload.from, &payload.to].iter().all(|address| {
+        engine
+            .get(address)
+            .is_some_and(|node| matches!(node.visibility, Visibility::Public))
+    });
+
+    let audience = if endpoints_public {
+        Audience::Everyone
+    } else {
+        Audience::Owner(existing.owner.clone())
+    };
+
+    match engine.delete_edge(&id) {
+        Ok(()) => {
+            drop(engine);
+            db.publish(
+                audience,
+                serde_json::json!({"event": "edge_deleted", "from": payload.from, "to": payload.to, "kind": payload.kind}).to_string(),
+            );
+            (StatusCode::NO_CONTENT, "").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 async fn get_edges_out(
     State(db): State<Arc<Database>>,
     Path(address): Path<String>,
@@ -519,6 +667,20 @@ pub enum TxOpRequest {
         public: Option<bool>,
     },
     InsertEdge {
+        from: String,
+        to: String,
+        kind: String,
+    },
+    /// Retract one edge as part of the batch — the transactional form of
+    /// `DELETE /edge`, and the op that lets an unfollow/unblock happen
+    /// atomically alongside the node writes that accompany it. Wire tag
+    /// is `delete_edge` (snake_case of the variant), and the edge is
+    /// named by the same `from`/`to`/`kind` triple `insert_edge` uses —
+    /// that triple IS the edge's identity (`EdgeId`); `owner` is not
+    /// part of it and is never taken from the body. Authorization (the
+    /// edge's owner, or admin) is resolved here, under the same write
+    /// lock the engine will use, and stamped onto the op.
+    DeleteEdge {
         from: String,
         to: String,
         kind: String,
@@ -594,8 +756,23 @@ pub struct TransactionRequest {
 /// exactly what guarantee this does and doesn't provide. Ownership
 /// checks for deletes happen here, before the batch reaches the engine,
 /// using the same lock the whole handler holds — no window for another
-/// request to change a node's ownership between this check and the
-/// engine applying the batch.
+/// request to change a node's or edge's ownership between this check
+/// and the engine applying the batch.
+///
+/// The body is `{"operations": [...]}`, each element tagged by `type`
+/// (see [`TxOpRequest`] for each one's fields and semantics):
+///
+/// * `insert_node` — create or overwrite a node.
+/// * `insert_edge` — create an edge.
+/// * `delete_edge` — retract one edge, named by `from`/`to`/`kind`.
+/// * `delete_node` — remove one node by address.
+/// * `clear_kind` — remove every node of a kind the caller may write.
+/// * `delete_where` — `clear_kind` plus a `where` predicate.
+/// * `set_if` — compare-and-set on one field of one node.
+///
+/// `owner` and `is_admin` are stamped onto every op from the
+/// authenticated identity and its role, never read from the request
+/// body: a batch cannot ask to act as somebody else.
 async fn execute_transaction(
     State(db): State<Arc<Database>>,
     Extension(identity): Extension<AuthIdentity>,
@@ -620,6 +797,50 @@ async fn execute_transaction(
             }
             TxOpRequest::InsertEdge { from, to, kind } => {
                 ops.push(TxOperation::InsertEdge(Edge::new(from, to, kind, identity.owner.clone())));
+            }
+            TxOpRequest::DeleteEdge { from, to, kind } => {
+                // Targeted like delete_node, not best-effort like
+                // clear_kind: naming one edge that doesn't exist, or one
+                // this caller may not retract, is a mistake worth
+                // reporting rather than silently skipping. Resolved
+                // under the write lock this handler already holds, so
+                // nothing can change the edge's ownership between the
+                // check and the engine applying the batch.
+                let id = EdgeId::new(from, to, kind);
+                if !identity.is_admin() {
+                    match engine.find_edge(&id) {
+                        Some(e) if !e.can_write(&identity.owner) => {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                format!(
+                                    "not authorized to delete edge {} -{}-> {}",
+                                    id.from, id.kind, id.to
+                                ),
+                            )
+                                .into_response();
+                        }
+                        None => {
+                            return (
+                                StatusCode::NOT_FOUND,
+                                format!(
+                                    "delete target not found: edge {} -{}-> {}",
+                                    id.from, id.kind, id.to
+                                ),
+                            )
+                                .into_response();
+                        }
+                        _ => {}
+                    }
+                }
+                // An edge is not a node: it has no address, so it adds
+                // nothing to `touched_addresses` — the committed event
+                // lists the node addresses a batch wrote, exactly as
+                // insert_edge leaves it alone too.
+                ops.push(TxOperation::DeleteEdge {
+                    id,
+                    owner: identity.owner.clone(),
+                    is_admin: identity.is_admin(),
+                });
             }
             TxOpRequest::DeleteNode { address } => {
                 if !identity.is_admin() {
@@ -799,26 +1020,51 @@ pub struct PublishRequest {
     pub payload: String,
 }
 
-/// Publishes an arbitrary application-level message to every `/events`
-/// subscriber, exactly like the messages FacetQL already sends itself
-/// for node/edge/user changes — this is the one FacetQL didn't have
-/// until now: a way for something OTHER than FacetQL's own internal
-/// writes to put a message on the same live feed. Specifically what
+/// Publishes an arbitrary application-level message onto the `/events`
+/// feed, alongside the messages FacetQL already sends itself for
+/// node/edge/user changes — a way for something OTHER than FacetQL's own
+/// internal writes to put a message on the live feed. Specifically what
 /// Facet's `Store.Notify(payload string) error` needs: Postgres's
-/// LISTEN/NOTIFY lets any connection publish an arbitrary string that
-/// every listener receives; this is that, over the FacetQL API instead.
+/// LISTEN/NOTIFY lets a connection publish an arbitrary string that
+/// listeners receive; this is that, over the FacetQL API instead.
+///
+/// # Who the message reaches
+///
+/// The audience is decided from the caller's identity, never from the
+/// request body:
+///
+/// * **admin** → [`Audience::Everyone`]. A superuser can already read
+///   every node, so letting it address every subscriber grants nothing
+///   it did not already have.
+/// * **anyone else** → [`Audience::Owner`] of the caller. The message
+///   reaches that owner's own subscribers (every connection holding one
+///   of its tokens) and admins, and nobody else.
+///
+/// This is deliberately narrower than a plain LISTEN/NOTIFY, and the
+/// narrowing is the point. `/events` is a read path shared by every
+/// tenant, so an unrestricted broadcast would hand any valid token a
+/// channel into every other subscriber's stream — a spam and phishing
+/// surface, and an odd one to leave open in the same handler set that
+/// filters node events by visibility (see [`subscribe_events`]). An
+/// owner-scoped notification still satisfies the `Notify` contract it
+/// exists for: a service publishes under its own identity and its own
+/// listeners — which is every instance of that service — receive it.
+///
+/// Nothing here is read out of the database, so there is no stored
+/// visibility to honour; the caller still must not put another tenant's
+/// private data in a payload it chose the contents of.
 async fn publish_event(
     State(db): State<Arc<Database>>,
-    Extension(_identity): Extension<AuthIdentity>,
+    Extension(identity): Extension<AuthIdentity>,
     Json(payload): Json<PublishRequest>,
 ) -> impl IntoResponse {
-    // An explicit application broadcast — the caller asked for this
-    // payload to go out, and chose its contents, so it reaches every
-    // subscriber. Nothing here is read out of the database, so there is
-    // no stored visibility to honour; what the caller must not do is put
-    // private data in it. This is the `Notify` replacement for
-    // LISTEN/NOTIFY.
-    db.publish(Audience::Everyone, payload.payload);
+    let audience = if identity.is_admin() {
+        Audience::Everyone
+    } else {
+        Audience::Owner(identity.owner.clone())
+    };
+
+    db.publish(audience, payload.payload);
     (StatusCode::OK, "published").into_response()
 }
 

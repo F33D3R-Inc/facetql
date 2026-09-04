@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config;
-use crate::core::edge::Edge;
+use crate::core::edge::{Edge, EdgeId};
 use crate::core::history::HistoryEntry;
 use crate::core::node::Node;
 use crate::core::user::UserRecord;
@@ -14,7 +15,17 @@ use crate::crypto;
 ///
 /// Increment this when the serialized WAL representation changes in a
 /// way that is not backwards-compatible.
-pub const WAL_FORMAT_VERSION: u16 = 2;
+///
+/// v2 → v3: [`WalOperation::DeleteEdge`] was added, and added *beside*
+/// `InsertEdge` rather than at the end of the enum, so every variant
+/// after it moved by one bincode tag. A v2 record read by this build
+/// would therefore decode an `InsertUser` as a `DeleteEdge` (or fail
+/// outright) — which is exactly the "not backwards-compatible" case this
+/// constant exists for. `recovery::validate_records` rejects a record
+/// carrying any other version before it can be replayed, so a stale WAL
+/// stops startup with a version complaint instead of replaying the wrong
+/// mutations.
+pub const WAL_FORMAT_VERSION: u16 = 3;
 
 /// Reserved transaction ID for standalone operations.
 ///
@@ -39,6 +50,29 @@ pub const WAL_FRAME_VERSION: u16 = 1;
 ///
 ///     magic(4) + frame_version(2) + payload_len(4) + payload_crc(4)
 const WAL_FRAME_HEADER_LEN: usize = 14;
+
+/// Largest encrypted payload a single WAL frame may carry, in bytes.
+///
+/// This bound is enforced in BOTH directions, and the two directions
+/// protect against two different failures:
+///
+///   * `encode_frame` refuses to *write* a payload above this size, so
+///     one runaway record (a pathological node blob) can never be made
+///     durable in a shape that a later reader would have to reject —
+///     the write fails loudly at the moment the caller can still do
+///     something about it, instead of bricking the next startup.
+///
+///   * `decode_frame` treats a header *declaring* more than this as
+///     `Corrupt`, and does so before allocating or slicing anything
+///     sized by that declaration. A length prefix is the one field a
+///     reader must trust before it has verified anything, so a
+///     corrupted or hostile 4 GiB length must not be able to steer this
+///     process into an unbounded allocation. The bound turns that class
+///     of attack into an ordinary integrity failure.
+///
+/// 64 MiB is far above any legitimate single-record payload while
+/// staying comfortably allocatable.
+pub const MAX_WAL_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 
 /// Durability classification of a single on-disk WAL frame.
 ///
@@ -111,6 +145,25 @@ pub fn encode_frame(
 
     let payload = crypto::encrypt(&bytes);
 
+    /*
+     * Refuse to write what we would refuse to read.
+     *
+     * A frame larger than the reader's bound would be durable but
+     * permanently unreadable — every subsequent startup would classify
+     * it as Corrupt and refuse to recover. Failing here keeps the
+     * failure inside the caller's mutation, where it is still a
+     * recoverable error rather than an unrecoverable log.
+     */
+    if payload.len() > MAX_WAL_PAYLOAD_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "WAL payload of {} bytes exceeds the maximum of {MAX_WAL_PAYLOAD_LEN} bytes",
+                payload.len(),
+            ),
+        ));
+    }
+
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| {
             io::Error::new(
@@ -160,9 +213,26 @@ pub fn decode_frame(
     }
 
     if raw[0..4] != WAL_FRAME_MAGIC {
-        return FrameOutcome::Corrupt(
-            "frame magic mismatch".to_string(),
-        );
+        /*
+         * The line decoded as hex and is long enough to hold a header,
+         * yet does not start with the magic. By far the most likely
+         * cause is not bit-rot but *history*: a WAL written before the
+         * frame envelope existed, whose lines are bare
+         * hex(encrypt(bincode(record))) with no header at all. Say so,
+         * because the operator's action differs completely from the
+         * bit-rot case — such a log has to be recovered (or checkpointed
+         * and removed) by hand, and no amount of restarting will help.
+         */
+        return FrameOutcome::Corrupt(format!(
+            "frame magic mismatch: expected {:?} ({}), found 0x{}. \
+             This line carries no frame header, which means the WAL \
+             predates the frame envelope (or was written by another \
+             tool). It cannot be replayed safely and must be recovered \
+             or removed by an operator.",
+            String::from_utf8_lossy(&WAL_FRAME_MAGIC),
+            crypto::encode_hex(&WAL_FRAME_MAGIC),
+            crypto::encode_hex(&raw[0..4]),
+        ));
     }
 
     let frame_version =
@@ -177,6 +247,25 @@ pub fn decode_frame(
     let payload_len = u32::from_le_bytes([
         raw[6], raw[7], raw[8], raw[9],
     ]) as usize;
+
+    /*
+     * Bound the declared length BEFORE it is used for anything.
+     *
+     * `payload_len` is attacker- and bit-rot-controlled: it is read
+     * straight off disk and nothing has been authenticated yet. Checking
+     * it here — ahead of the truncation comparison below, and ahead of
+     * any allocation or slice sized from it — means a corrupted length
+     * prefix can never drive this process into an unbounded allocation,
+     * and can never masquerade as a merely-`Torn` tail that recovery
+     * would silently discard. An impossible length is an integrity
+     * failure, so it is `Corrupt`.
+     */
+    if payload_len > MAX_WAL_PAYLOAD_LEN {
+        return FrameOutcome::Corrupt(format!(
+            "frame declares a payload of {payload_len} bytes, above the \
+             maximum of {MAX_WAL_PAYLOAD_LEN} bytes"
+        ));
+    }
 
     let declared_crc = u32::from_le_bytes([
         raw[10], raw[11], raw[12], raw[13],
@@ -280,6 +369,16 @@ pub enum WalOperation {
 
     /// Insert an edge.
     InsertEdge(Edge),
+
+    /// Delete the edge with this identity.
+    ///
+    /// Carries an [`EdgeId`] — `(from, to, kind)` — rather than a whole
+    /// `Edge`, because that triple is what an edge *is*; the owner is an
+    /// authorization attribute the delete has already been checked
+    /// against by the time this record is written, and including it
+    /// would let two records name the same edge while comparing
+    /// unequal.
+    DeleteEdge(EdgeId),
 
     /// Insert a persistent user.
     InsertUser(UserRecord),
@@ -408,6 +507,7 @@ impl WalRecord {
                 | WalOperation::Insert(_)
                 | WalOperation::Delete(_)
                 | WalOperation::InsertEdge(_)
+                | WalOperation::DeleteEdge(_)
                 | WalOperation::InsertUser(_)
                 | WalOperation::RevokeUser(_)
         )
@@ -418,6 +518,25 @@ impl WalRecord {
 ///
 /// Sequence persistence across process restarts is handled by scanning
 /// the existing WAL during database startup.
+///
+/// GAPS ARE INTENTIONAL — DO NOT "FIX" THEM.
+///
+/// A caller allocates a sequence (and an operation ID) *before* the
+/// append that would make it durable, so any failed or torn append burns
+/// its number: the durable log then reads 7, 8, 10. That is correct and
+/// must stay that way. Recovery's contract is that sequences are
+/// strictly *increasing*, never that they are contiguous
+/// (`recovery::validate_sequence` checks exactly that), because the only
+/// way to guarantee contiguity would be to reuse a burned number — and
+/// reusing one is precisely what breaks the strictly-increasing
+/// invariant when the earlier append actually did reach disk.
+///
+/// These three atomics are also the single source of truth for their
+/// identifiers: `WalRecord::standalone/begin/commit/abort`, the engine's
+/// `append_wal`, and the transaction frame all draw from them. Nothing
+/// in this module may introduce a second counter, and nothing here
+/// allocates a sequence on a path that cannot write it (`append` and
+/// `read_all` allocate nothing at all).
 pub fn next_sequence() -> u64 {
     NEXT_SEQUENCE.fetch_add(
         1,
@@ -493,7 +612,17 @@ fn advance_counter(
     }
 }
 
-/// Append one authenticated WAL record.
+/// Path of the write-ahead log within the configured data dir.
+///
+/// Single source of truth for the file name: writer, reader and
+/// truncation all resolve it through here, so relocating the data
+/// directory (see `config.rs`) can never leave one of them addressing a
+/// different file than the others.
+pub fn wal_path() -> PathBuf {
+    config::data_file("facetql.wal")
+}
+
+/// Append one authenticated WAL record as a complete on-disk frame.
 ///
 /// Durability boundary:
 ///
@@ -501,7 +630,9 @@ fn advance_counter(
 ///        ↓
 ///     encrypt/authenticate
 ///        ↓
-///     append
+///     frame (magic + version + length + CRC32)
+///        ↓
+///     append frame + '\n' as ONE write
 ///        ↓
 ///     sync_data()
 ///        ↓
@@ -509,45 +640,349 @@ fn advance_counter(
 ///
 /// Once this function returns successfully, the WAL record has been
 /// handed to the filesystem's durable-data synchronization boundary.
+///
+/// WHY THE FRAME MATTERS HERE
+///
+/// The line this writes is no longer bare `hex(encrypt(bincode(..)))`;
+/// it is `hex(FRAME)` (see `encode_frame`). The difference is entirely
+/// about what a *crash in the middle of this function* leaves behind.
+///
+/// Without the envelope, a torn append leaves a partial hex line that no
+/// reader can tell apart from a whole one, and the next process — which
+/// opens in append mode and writes straight onto the end of that partial
+/// line — splices two half-records into a single line. The recovery path
+/// itself manufactures unrecoverable mid-log corruption. With the
+/// envelope, the frame carries its own declared length and CRC, so a
+/// short tail is *structurally* recognisable as torn (`FrameOutcome::
+/// Torn`) before its contents are trusted, and a splice shows up as
+/// bytes beyond the declared length (`Corrupt`) rather than as a
+/// plausible record.
+///
+/// Two deliberate details of the write itself:
+///
+///   * The frame and its newline go out in ONE `write_all`. Two writes
+///     admit a window where the frame is durable but its terminator is
+///     not; one write narrows the loss of the newline to the same tear
+///     that would have damaged the frame bytes — which the frame's own
+///     length and CRC already catch.
+///
+///   * If the file does not already end on a newline, we emit one
+///     first. Reaching that state requires a tear at exactly the last
+///     byte, but it is the one state in which a following append would
+///     splice onto a previous record. A separator turns that
+///     never-should-happen case into an empty line, which the reader
+///     skips, instead of into corruption that ends recovery forever.
+///
+/// This allocates no sequence, operation or transaction ID: the caller
+/// owns the record, so a failure here burns identifiers the caller
+/// already took (see `next_sequence` on why those gaps are correct).
 pub fn append(
     record: &WalRecord,
 ) -> io::Result<()> {
-    let bytes = bincode::serialize(record)
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                e,
-            )
-        })?;
-
-    let encrypted =
-        crypto::encrypt(&bytes);
-
-    let encoded =
-        crypto::encode_hex(&encrypted);
-
-    let path =
-        config::data_file("facetql.wal");
+    let encoded = encode_frame(record)?;
 
     let mut file =
         OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
-            .open(path)?;
+            .open(wal_path())?;
 
-    file.write_all(
-        encoded.as_bytes(),
-    )?;
+    /*
+     * Splice guard.
+     *
+     * In append mode every write lands at end-of-file regardless of the
+     * seek position, so probing the last byte here is safe and costs one
+     * seek plus one 1-byte read — nothing next to the fsync below.
+     */
+    let existing_len = file.metadata()?.len();
 
-    file.write_all(b"\n")?;
+    let mut line =
+        Vec::with_capacity(encoded.len() + 2);
+
+    if existing_len > 0 {
+        file.seek(SeekFrom::End(-1))?;
+
+        let mut last = [0u8; 1];
+
+        file.read_exact(&mut last)?;
+
+        if last[0] != b'\n' {
+            line.push(b'\n');
+        }
+    }
+
+    line.extend_from_slice(encoded.as_bytes());
+    line.push(b'\n');
+
+    file.write_all(&line)?;
 
     /*
      * Explicit durability boundary.
      *
      * We don't acknowledge the WAL append until the data has been
-     * synchronized.
+     * synchronized. `sync_data` (not `sync_all`) is deliberate: the
+     * file's length metadata is updated by the append itself and the
+     * data is what must survive; the directory entry already exists.
      */
     file.sync_data()?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// READING THE LOG BACK
+//
+// Everything below is the reader half of the envelope above. Recovery
+// consumes this API and nothing else — it must never re-derive the
+// on-disk shape for itself, because the whole point of the frame is
+// that exactly one piece of code decides what "durable" means.
+// ---------------------------------------------------------------------
+
+/// The durability state of the WAL file's final bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalTail {
+    /// The file ends exactly on a frame boundary.
+    Clean,
+
+    /// The file ends in a structurally incomplete frame — the signature
+    /// of a crash mid-append. `durable_len` is the byte length of the
+    /// fully-durable prefix (i.e. the offset the file must be truncated
+    /// to before any further append).
+    Torn { durable_len: u64, detail: String },
+}
+
+/// Read every durable WAL record in file order, plus the tail state.
+/// Returns `(Vec::new(), WalTail::Clean)` when the file does not exist.
+///
+/// THE THREE OUTCOMES, AND WHY THEY ARE TREATED DIFFERENTLY
+///
+///   * `Durable` — the frame's length matched, its CRC matched, its
+///     AEAD authenticated and its record deserialized. Replayable.
+///
+///   * `Torn` — the frame is structurally short. This is what a crash
+///     mid-`append` looks like and it is tolerable in exactly ONE
+///     position: the last non-empty line. There it is the crash point,
+///     and the caller drops it with `truncate_torn_tail`. Anywhere else
+///     it means a short frame was later written *past* — mid-log
+///     corruption, not a crash tail — and we refuse to guess which side
+///     of it is real.
+///
+///   * `Corrupt` — the frame is structurally complete but failed
+///     integrity (CRC, authentication, version, or an impossible
+///     length). This is bit-rot or tampering, never a clean crash, so it
+///     is ALWAYS an error — including at the tail. Silently truncating
+///     here would turn "your disk is lying to you" into "some writes
+///     quietly vanished", which is the one outcome a WAL exists to
+///     prevent. The operator gets told.
+///
+/// Offsets are tracked as real file offsets — the running sum of every
+/// line's bytes including its `\n` — so a returned `durable_len` can be
+/// handed straight to `truncate_torn_tail`.
+pub fn read_all() -> io::Result<(Vec<WalRecord>, WalTail)> {
+    let path = wal_path();
+
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+
+        /*
+         * A missing WAL is a legitimate state: first boot, or a
+         * checkpointed log an operator removed. It is not an error.
+         */
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound =>
+        {
+            return Ok((
+                Vec::new(),
+                WalTail::Clean,
+            ));
+        }
+
+        Err(e) => return Err(e),
+    };
+
+    let mut records: Vec<WalRecord> = Vec::new();
+
+    /*
+     * Byte offset of the start of the line currently being examined.
+     * Every branch below advances this by the line's own bytes plus its
+     * terminator, so it stays a true file offset even across skipped
+     * blank lines.
+     */
+    let mut offset: u64 = 0;
+
+    /*
+     * A torn frame is provisional: it is only acceptable once we know
+     * nothing non-empty follows it. Hold it here until end of file.
+     */
+    let mut torn: Option<(u64, usize, String)> = None;
+
+    let segments: Vec<&[u8]> =
+        bytes.split(|&b| b == b'\n').collect();
+
+    /*
+     * `split` yields one more segment than there are newlines, so the
+     * final segment is the bytes after the last '\n' — empty when the
+     * file ends on a newline. Only that final segment lacks a
+     * terminator, which is what the `+ 1` below encodes.
+     */
+    let last_index = segments.len() - 1;
+
+    for (index, segment) in segments.iter().enumerate() {
+        let line_start = offset;
+
+        let line_number = index + 1;
+
+        offset += segment.len() as u64
+            + if index < last_index { 1 } else { 0 };
+
+        /*
+         * Our own writer emits nothing but hex and '\n'. Bytes outside
+         * UTF-8 therefore cannot come from a torn append of a frame we
+         * wrote — something else damaged or wrote this file — so it is
+         * reported rather than absorbed as a torn tail.
+         */
+        let text = match std::str::from_utf8(segment) {
+            Ok(text) => text,
+
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL line {line_number} at byte offset \
+                         {line_start} is not valid UTF-8 ({e}); the log \
+                         contains bytes no WAL writer produces and must \
+                         be recovered or removed by an operator"
+                    ),
+                ));
+            }
+        };
+
+        let text = text.trim();
+
+        /*
+         * Blank lines carry no record but do carry bytes: they still
+         * advanced `offset` above. They are produced by the writer's
+         * splice guard and by an operator's editor, and are harmless.
+         */
+        if text.is_empty() {
+            continue;
+        }
+
+        /*
+         * A torn frame with anything real after it is not a crash tail.
+         * Checked before decoding this line so the error names the line
+         * that proved it, whatever that line turns out to contain.
+         */
+        if let Some((_, torn_line, detail)) = &torn {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WAL line {torn_line} is a torn frame ({detail}) but \
+                     line {line_number} follows it; a torn frame is only \
+                     valid as the final line, so this is mid-log \
+                     corruption rather than a crash tail and must be \
+                     recovered by an operator"
+                ),
+            ));
+        }
+
+        match decode_frame(text) {
+            FrameOutcome::Durable(record) => {
+                records.push(record);
+            }
+
+            FrameOutcome::Torn(detail) => {
+                /*
+                 * Provisional. `line_start` — the offset at the START of
+                 * this line — is the length of the fully-durable prefix,
+                 * because everything before it was a complete frame and
+                 * nothing from this line can be trusted.
+                 */
+                torn = Some((
+                    line_start,
+                    line_number,
+                    detail,
+                ));
+            }
+
+            FrameOutcome::Corrupt(detail) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL line {line_number} at byte offset \
+                         {line_start} is corrupt: {detail}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    /*
+     * A final line with no trailing '\n' that decoded Durable IS
+     * durable. The frame verified its own declared length and CRC, so
+     * the only way the newline could be missing while the frame is
+     * whole is a tear at the very last byte — and `append`'s splice
+     * guard makes that state safe to append onto anyway.
+     */
+    match torn {
+        Some((durable_len, _, detail)) => Ok((
+            records,
+            WalTail::Torn {
+                durable_len,
+                detail,
+            },
+        )),
+
+        None => Ok((records, WalTail::Clean)),
+    }
+}
+
+/// Physically drop a torn trailing frame by truncating the WAL to
+/// `durable_len`, then fsync so the truncation itself is durable.
+///
+/// WHY THE DIRECTORY FSYNC
+///
+/// `set_len` changes the file's *metadata* (its length), and
+/// `sync_all` on the file forces that file's data and metadata out. But
+/// on POSIX filesystems the guarantee that a size change is visible
+/// after a crash also depends on the directory entry that names the
+/// file being flushed: the inode update and the directory block can be
+/// journalled independently. If we skipped it, a crash immediately after
+/// truncation could leave the WAL back at its old length — with the torn
+/// frame restored, and now with fresh appends written after it. That is
+/// the exact mid-log corruption `read_all` refuses to replay, so the
+/// truncation must be as durable as the appends it is protecting.
+pub fn truncate_torn_tail(
+    durable_len: u64,
+) -> io::Result<()> {
+    let path = wal_path();
+
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&path)?;
+
+    file.set_len(durable_len)?;
+
+    /*
+     * `sync_all`, not `sync_data`: the length IS metadata here, so
+     * flushing data alone would not persist the truncation.
+     */
+    file.sync_all()?;
+
+    let directory = match path.parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => PathBuf::from("."),
+    };
+
+    /*
+     * Opening a directory read-only and fsyncing the handle is the
+     * standard POSIX way to force a metadata change out; there is
+     * nothing to write to it.
+     */
+    let directory = File::open(directory)?;
+
+    directory.sync_all()?;
 
     Ok(())
 }
