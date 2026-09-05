@@ -35,16 +35,47 @@ visibility and ownership checks on every path (same idea as a Postgres
 superuser bypassing row-level security). Routes marked **admin** below
 return **403** `admin only` to anyone else.
 
-### Request body limit
+### The authorization matrix
 
-4 MiB by default, applied before any deserialization
-(`FACETQL_MAX_BODY_BYTES`). Over it → **413**.
+`facetql routes` prints every route, who may call it, its rate-limit
+class and the per-object rule its handler applies — compiled into the
+binary from `api::routes::ROUTES`, which the authorization tests drive
+through the real router. It is the authoritative version of the
+per-endpoint statements below.
+
+### Resource guards
+
+Refusals every endpoint can return, in the order a request meets them.
+None of them change a request or response *shape*; they are additional
+statuses (`src/api/limits.rs`).
+
+| Bound | Default | Over it |
+|---|---|---|
+| request body | 4 MiB (`FACETQL_MAX_BODY_BYTES`) | **413**, before any deserialization |
+| in-flight requests | 512 (`FACETQL_MAX_CONCURRENT_REQUESTS`) | **503** + `Retry-After: 1` |
+| per-identity rate, by class | see below | **429** + `Retry-After: <seconds>` |
+| per-request deadline | 30 s (`FACETQL_REQUEST_TIMEOUT_SECS`) | **408** |
+| concurrent `GET /events` streams | 256 (`FACETQL_MAX_SUBSCRIBERS`) | **503** |
+| accepted TLS connections | 2048 (`FACETQL_MAX_CONNECTIONS`) | socket dropped, no response |
+
+Rate-limit classes are cost profiles, each a separate token bucket per
+identity: `read` (600 burst / 300 per second), `write` (300/150), `bulk`
+— `POST /nodes/query` and `POST /transaction` — (120/60), `admin` —
+`/admin/*` and `/stats` — (60/30), and `subscribe` — opening
+`GET /events` — (30/5). Each is `FACETQL_RATE_<CLASS>` as
+`burst[:per_second]`, or `off`. A value that does not parse falls back to
+the default, never to no limit.
+
+The per-request deadline is never applied to `GET /events`, which is
+supposed to outlive it.
 
 ### CORS
 
-Permissive: any origin, any header, `GET`/`POST`/`PUT`/`DELETE`
-(`src/api/routes.rs:244`). Development-appropriate; narrow before
-exposing publicly.
+Follows the deployment posture. In development: any origin, any header.
+In production: exactly the origins in `FACETQL_ALLOWED_ORIGINS`
+(comma-separated), all origins if it is `*`, and no cross-origin access
+at all if it is unset. A non-browser client sends no `Origin` header and
+is unaffected either way.
 
 ---
 
@@ -180,11 +211,24 @@ is archived to history automatically.
 ### `DELETE /node/:address`
 
 **204 No Content** · **403** `not authorized to delete this node` ·
-**404** `node not found` · **500**.
+**404** `node not found` · **409** · **400** · **500**.
 
 The removed state is archived to history first. Removing the index entry
 is what makes the node gone; the record's bytes remain in the heap until
 compaction reclaims them.
+
+With references declared (`POST /admin/references`) a delete also
+expands the closure of referential actions and applies it in the same
+frame, which adds two refusals — both leaving the database exactly as it
+was:
+
+* **409 Conflict** — something still references this node through a
+  `restrict` reference. The message names the referencing node and the
+  rule.
+* **400 Bad Request** — the cascade resolves to more mutations than one
+  frame will stage (`FACETQL_MAX_TRANSACTION_OPS`). A cascade is atomic
+  or it is not a cascade, so it is refused rather than split; delete the
+  referencing nodes in batches first.
 
 ### `GET /node/:address/history`
 
@@ -217,7 +261,14 @@ body. This is the `FOR UPDATE SKIP LOCKED` primitive for a durable job
 queue: the check and the write happen inside one mutation, so exactly
 one concurrent caller wins.
 
-**200** `claimed` · **404** `node not found` · **409**
+**Authorization: `can_write` on the node, or admin** — a claim sets
+`claimed_by` and archives the previous value, so it is a write to that
+node and is governed by the same rule as `PUT` and `DELETE`. A node the
+caller cannot *read* answers exactly as an absent one, so this endpoint
+cannot be used to discover which private addresses exist.
+
+**200** `claimed` · **403** `not authorized to claim this node` ·
+**404** `node not found` (absent, or unreadable) · **409**
 `already claimed by <owner>` · **500**.
 
 There is no unclaim route; release a claim by overwriting the node.
@@ -282,10 +333,22 @@ names mirror FCT's `runtime.Query`.
 **200**
 
 ```json
-{ "nodes": [ { "...": "Node" } ], "next": "eyJvIjoxNzI5OTk5OTk5LCJhIjoicG9zdDo3In0" }
+{
+  "nodes": [ { "...": "Node" } ],
+  "next": "eyJvIjoxNzI5OTk5OTk5LCJhIjoicG9zdDo3In0",
+  "examined": 2099
+}
 ```
 
 `next` is `""` on the last page. Otherwise feed it back as `after`.
+
+`examined` is how many candidate nodes the plan actually read and tested
+to produce this page — the one number that distinguishes a plan from its
+answer, since twenty rows look identical whether they came from an index
+scan that stopped at the page or a read of every node of the kind. It is
+the same quantity `EXPLAIN ANALYZE` reports as rows returned plus rows
+removed by filter. Additive: a client that does not know the field
+ignores it.
 Anything else — a bad cursor, an unevaluable predicate, an over-limit
 offset, a scan that would exceed `FACETQL_MAX_SCAN_ROWS` — is **400**
 with the reason in the body. A predicate the engine cannot evaluate is
@@ -343,6 +406,15 @@ Wire-compatible with FCT's `ir.Expr` (`src/core/predicate.rs`). Fields:
   concatenates when both sides are strings, otherwise adds. Ordering
   comparisons require numeric operands.
 
+**Bounds.** A predicate is evaluated once per candidate row, so the work
+one request buys is its node count times the row count. Both are bounded:
+at most **64** levels of nesting and **256** expression nodes in total
+(counting `args`, `key` and `where`, which are deserialized whether or
+not they are evaluated), and a string produced by `+` may not exceed
+**64 KiB**. Over any of these → **400** naming the bound. The same limits
+apply to the `delete_where` transaction op, which runs the same
+evaluator.
+
 Anything else — a `call`, a `filter`, a nested object access — is
 rejected with a message naming what could not be evaluated, so a client
 can fall back to filtering its own rows. Nesting deeper than 64 levels
@@ -375,8 +447,18 @@ the same `(from, to, kind)` lands on the same entry rather than beside
 it — but replacing an edge owned by someone else is refused, because the
 owner is who may retract it.
 
-**201** `Edge created` · **400** with the reason (`edge 'from' address
-not found: …`, `edge … is owned by …`).
+**Authorization: `can_write` on `from`, `can_read` on `to`, or admin.**
+The two endpoints are not symmetric. Writing an edge out of a node
+changes what that node's adjacency list says, and
+`GET /node/:address/edges/out` reads it back as fact, so it is a write to
+that node. Pointing an edge *at* a node modifies nothing, so read is the
+right bound there — and it is a bound, because an unreadable target would
+otherwise make this an existence oracle one address at a time. A target
+the caller cannot read therefore answers identically to a missing one.
+
+**201** `Edge created` · **403** `not authorized to create an edge from
+…` · **400** with the reason (`edge 'from' address not found: …` —
+absent or unreadable — `edge … is owned by …`).
 
 ### `DELETE /edge`
 
@@ -451,6 +533,11 @@ is a no-op, not an error. The removed state is archived.
 Endpoints are checked against the staged view: an edge may reference a
 node this batch inserted **earlier**, but not one it deleted, and not one
 inserted later.
+
+Authorization is the same rule `POST /edge` applies, through the same
+check — `can_write` on `from`, `can_read` on `to`, or admin — so a batch
+cannot assert an edge a single request would have been refused. A
+refusal is **403** and nothing in the batch is applied.
 
 #### `delete_edge`
 
@@ -644,7 +731,7 @@ restart.
 Declare an index over one top-level `data` field of one kind.
 
 ```json
-{ "name": "post_created", "kind": "Post", "field": "created_at" }
+{ "name": "post_created", "kind": "Post", "field": "created_at", "unique": false }
 ```
 
 * `name` — 1–64 bytes, `[A-Za-z0-9_-]` only (it becomes the filename
@@ -653,6 +740,12 @@ Declare an index over one top-level `data` field of one kind.
   no schema across kinds.
 * `field` — the top-level field, the same name you would pass as
   `order` on `POST /nodes/query`.
+* `unique` — optional, default `false`. Makes the index a constraint:
+  a write giving two nodes of this kind the same value for the field is
+  refused, checked inside the writer lock ahead of the WAL. Declaring it
+  over data that already holds a duplicate is refused (400) rather than
+  created false. A unique index is also what a reference's
+  `parent_field` resolves through.
 
 **This call reads every existing node of the kind**, twice over: once to
 prove every existing value produces an admissible key, and once to
@@ -690,6 +783,89 @@ logged-but-unapplicable mutation would fail every subsequent startup.
 Queries the index was serving keep working — they fall back to the
 materialize-and-sort path, which is slower and bounded by
 `FACETQL_MAX_SCAN_ROWS`, not wrong.
+
+**400 Bad Request** when a declared reference is enforced through this
+index — the cascade would have no way to find its targets, or the
+referenced value nothing to keep it unique. Drop the reference first.
+
+### `POST /admin/references` — admin
+
+Declare a reference: which `data` field of which kind points at which
+other kind, and what deleting the referenced node does to the nodes
+referencing it.
+
+```json
+{
+  "name": "post_comments",
+  "kind": "Comment",
+  "field": "post",
+  "parent_kind": "Post",
+  "parent_field": null,
+  "on_delete": "cascade"
+}
+```
+
+* `name` — 1–64 bytes, `[A-Za-z0-9_-]` only (it becomes a URL path
+  segment).
+* `kind` / `field` — the **referencing** side: the kind that holds the
+  reference and the top-level `data` field carrying the referenced
+  node's key. `null` or absent in a row means the row references
+  nothing, which is always admissible — a nullable foreign key.
+* `parent_kind` — the kind being referenced. Checked on resolution: a
+  value that resolves to a node of another kind is a dangling reference
+  that happens to collide, not a match.
+* `parent_field` — optional, default `null` = the parent's **address**.
+  A field name means the child's value matches that top-level `data`
+  field of the parent instead, which is the shape an application has
+  when its own ids live in the row.
+* `on_delete` — `"cascade"`, `"restrict"` or `"set_null"`. No default.
+
+**The access paths have to exist first**, and the declaration is refused
+naming what is missing otherwise:
+
+* an index over `(kind, field)` — without it, every delete of a
+  referenced node would read the whole referencing kind;
+* a **unique** index over `(parent_kind, parent_field)` when
+  `parent_field` is given — a reference has to name exactly one node,
+  and a value two nodes can hold names neither. An address needs
+  nothing: it is unique by construction.
+
+**The existing data has to satisfy it**: every referencing node of that
+kind is resolved before anything is logged, the same read
+`POST /admin/indexes` does for a unique index. A rule accepted over data
+that already breaks it is false from the moment it is created.
+
+**201** — the stored definition · **409** a *different* reference already
+holds that name (re-declaring the identical one is a 201) · **400** a
+missing access path, a definition the engine cannot honour, or existing
+data that breaks it, with the offending row named.
+
+Once declared:
+
+* every `Insert` naming a parent that does not exist is refused, checked
+  against the **net effect** of the whole batch — so a transaction may
+  insert a comment before the post it belongs to, and two nodes may
+  reference each other if one batch creates both;
+* every delete — `DELETE /node/:address`, `delete_node`, `clear_kind`
+  and `delete_where` alike — expands the closure of referential actions
+  and stages it in **one frame** with the delete that triggered it.
+
+A referential action runs with the authority of the declaration, not of
+the caller: a cascade removes another owner's referencing nodes. That is
+what makes it an integrity rule rather than a request, and it is why
+declaring one is admin-only.
+
+### `GET /admin/references` — admin
+
+**200** `[ { "name": …, "kind": …, "field": …, "parent_kind": …,
+"parent_field": …, "on_delete": … }, … ]`, in name order.
+
+### `DELETE /admin/references/:name` — admin
+
+**204** · **404** `no reference named '<name>'`.
+
+The rows it governed are untouched. What stops is the enforcement, so a
+later delete of a referenced node leaves whatever pointed at it behind.
 
 ---
 

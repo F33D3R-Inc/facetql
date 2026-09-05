@@ -84,19 +84,76 @@ impl FacetClient {
     /// `Api` error carrying the server's own words, so the CLI does not
     /// second-guess the engine's rules — it only pre-checks the ones it
     /// can check without a round trip (see `validate_index_name`).
+    ///
+    /// `mode` selects which question the index answers — `"ordered"` for
+    /// the B+tree over whole values, `"text"` for the inverted index over
+    /// substrings. Sent on every request rather than only for `"text"`,
+    /// so what the CLI asked for is visible in the request rather than
+    /// implied by its absence; the server's default for a missing `mode`
+    /// is the same `"ordered"`, which is what keeps older clients working.
     pub async fn create_index(
         &self,
         name: &str,
         kind: &str,
         field: &str,
+        unique: bool,
+        mode: &str,
     ) -> Result<Value, CliError> {
         let body = json!({
             "name": name,
             "kind": kind,
             "field": field,
+            "unique": unique,
+            "mode": mode,
         });
         let resp = self.post("/admin/indexes", &body).await?;
         read_json(resp).await
+    }
+
+    /// `POST /admin/references` — declare a reference between two kinds.
+    ///
+    /// `parent_field` is omitted when the reference is by address, which
+    /// is what the server's own default means; sending an explicit null
+    /// would say the same thing, and this keeps the request identical to
+    /// the one the contract documents.
+    pub async fn create_reference(
+        &self,
+        name: &str,
+        kind: &str,
+        field: &str,
+        parent_kind: &str,
+        parent_field: Option<&str>,
+        on_delete: &str,
+    ) -> Result<Value, CliError> {
+        let mut body = json!({
+            "name": name,
+            "kind": kind,
+            "field": field,
+            "parent_kind": parent_kind,
+            "on_delete": on_delete,
+        });
+
+        if let Some(parent_field) = parent_field {
+            body["parent_field"] = json!(parent_field);
+        }
+
+        let resp = self.post("/admin/references", &body).await?;
+        read_json(resp).await
+    }
+
+    /// `GET /admin/references` — every declared reference.
+    pub async fn list_references(&self) -> Result<Vec<Value>, CliError> {
+        let resp = self.get("/admin/references").await?;
+        read_json_array(resp).await
+    }
+
+    /// `DELETE /admin/references/:name` — stop enforcing one. The rows
+    /// it governed are untouched.
+    pub async fn drop_reference(&self, name: &str) -> Result<(), CliError> {
+        let resp = self
+            .send(self.http.delete(self.url(&format!("/admin/references/{name}"))))
+            .await?;
+        expect_success(resp).await
     }
 
     /// `GET /admin/indexes` — every declared index, as an array of

@@ -15,3 +15,10 @@ facetql.tombstones
 
 # rustfmt backup files
 **/*.rs.bk
+
+# ----------------
+# Go helper tool (fa/facetql.go, no go.mod of its own) — if ever built
+# directly with `go build`, it leaves a binary named after the dir/package.
+# ----------------
+fa/facetql
+fa/fa

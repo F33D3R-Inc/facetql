@@ -19,7 +19,7 @@ digest = "=0.10.7"
 block-buffer = "=0.10.4"
 rand = "0.8"
 libc = "0.2"
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "timeout"] }
 aes-gcm = "0.10"
 native-tls = "0.2"
 tokio-native-tls = "0.3"

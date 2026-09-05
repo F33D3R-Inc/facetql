@@ -17,6 +17,7 @@ use crate::storage::wal::{
 ///
 /// Normal write path:
 ///
+/// ```text
 ///     mutation
 ///        ↓
 ///       WAL
@@ -24,19 +25,30 @@ use crate::storage::wal::{
 ///     storage
 ///        ↓
 ///      memory
+/// ```
 ///
 /// Recovery path:
 ///
+/// ```text
 ///     WAL
 ///      ↓
+/// ```
 ///    read framed records (repair a torn tail)
+/// ```text
 ///      ↓
+/// ```
 ///    validate
+/// ```text
 ///      ↓
+/// ```
 ///    pass 1: classify transactions (no mutation)
+/// ```text
 ///      ↓
+/// ```
 ///    pass 2: replay in strict WAL sequence order
+/// ```text
 ///      ↓
+/// ```
 ///    memory
 ///
 /// Recovery MUST NOT call normal mutation methods because those methods
@@ -78,6 +90,8 @@ pub fn recover(engine: &mut StorageEngine) -> io::Result<()> {
     wal::initialize_counters(floor, 0, floor);
 
     if !path.exists() {
+        note_scan_horizon(floor);
+
         return Ok(());
     }
 
@@ -100,6 +114,12 @@ pub fn recover(engine: &mut StorageEngine) -> io::Result<()> {
      *     `Err` for it — which we propagate, refusing startup.
      */
     let (records, tail) = wal::read_all()?;
+
+    if records.is_empty() {
+        // Same state as a missing file, reached a different way: an
+        // emptied or never-written log. See `note_scan_horizon`.
+        note_scan_horizon(floor);
+    }
 
     if let WalTail::Torn { durable_len, detail } = tail {
         eprintln!(
@@ -268,7 +288,7 @@ type TransactionBuffers = HashMap<u64, Vec<WalOperation>>;
 ///
 /// A transaction ID that is absent was never committed (incomplete or
 /// aborted) and must be discarded entirely.
-type CommittedTransactions = HashMap<u64, u64>;
+pub(crate) type CommittedTransactions = HashMap<u64, u64>;
 
 /// Walk the WAL in total order and apply it.
 ///
@@ -392,14 +412,28 @@ fn replay_in_sequence_order(
 /// Returns the COMMIT sequence of every committed transaction. Any
 /// transaction absent from the result is discarded by pass 2.
 ///
+/// `pub(crate)` because recovery is no longer its only caller:
+/// [`crate::storage::changes::scan`] has to answer the same question —
+/// which of the log's mutations actually happened — for a read rather
+/// than a replay, and a change feed that surfaced an uncommitted
+/// mutation would report a write that never occurred. There must be
+/// exactly one definition of "committed" in this crate, and it is this
+/// one. The scan differs only in what it does with an *incomplete*
+/// frame: recovery runs after a crash, so an incomplete frame is always
+/// dead, while a scan runs against a live log where the last frame may
+/// simply not have reached its COMMIT yet.
+///
 /// Only this exact lifecycle is committed:
 ///
+/// ```text
 ///     BEGIN
 ///       mutation...
 ///     COMMIT
+/// ```
 ///
 /// Anything else is discarded:
 ///
+/// ```text
 ///     BEGIN
 ///       mutation...
 ///     EOF
@@ -407,12 +441,13 @@ fn replay_in_sequence_order(
 ///     BEGIN
 ///       mutation...
 ///     ABORT
+/// ```
 ///
 /// and a frame whose shape is not merely incomplete but impossible
 /// (records after COMMIT, a second BEGIN, a mutation before BEGIN) is a
 /// hard error — the log claims something that cannot have happened, so
 /// we refuse to guess.
-fn classify_transactions(
+pub(crate) fn classify_transactions(
     records: &[WalRecord],
 ) -> io::Result<CommittedTransactions> {
     let mut frames: HashMap<u64, Vec<&WalRecord>> =
@@ -495,9 +530,11 @@ fn sorted_transaction_ids(
 ///
 /// A transaction is committed only if:
 ///
+/// ```text
 ///     first record = BEGIN
 ///     last control record = COMMIT
 ///     no ABORT occurred
+/// ```
 ///
 /// Returns the sequence number of the COMMIT record when the frame
 /// committed, `None` when it is merely incomplete or aborted (discard,
@@ -525,9 +562,57 @@ fn classify_transaction(
         ordered.first().map(|record| &record.operation),
         Some(WalOperation::Begin)
     ) {
-        // No valid BEGIN means this transaction is incomplete/corrupt.
-        //
-        // Do not replay it.
+        /*
+         * A frame whose first surviving record is not BEGIN comes in two
+         * kinds, and they are opposites — one is routine, the other is
+         * the loss this whole module exists to prevent. Which one it is
+         * is decided by whether a COMMIT survived alongside it.
+         *
+         *   * NO COMMIT — nothing was ever promised. The batch was in
+         *     flight when the process died, or it aborted; either way no
+         *     caller was told it happened, so discarding it is the
+         *     correct outcome and needs no comment.
+         *
+         *   * A COMMIT IS PRESENT — the log is asserting that a
+         *     transaction committed while the record that opened it is
+         *     gone. A correct writer cannot produce that: BEGIN is the
+         *     first record of the frame and carries the lowest sequence
+         *     in it, so anything that removed BEGIN while leaving the
+         *     COMMIT removed a *middle* of the log. That is either a
+         *     checkpoint/rotation that sliced through a live frame (the
+         *     fence in `storage::checkpoint` exists to make this
+         *     impossible) or external damage. Returning `Ok(None)` here
+         *     would silently drop a batch that was acknowledged to a
+         *     client — data loss with no signal anywhere — so it is a
+         *     hard startup failure instead. The operator gets told which
+         *     transaction and which sequences, because the surviving
+         *     records ARE the batch and recovering them by hand is the
+         *     only remedy.
+         */
+        if let Some(commit) = ordered
+            .iter()
+            .find(|record| matches!(record.operation, WalOperation::Commit))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "transaction {transaction_id} has a durable COMMIT at \
+                     sequence {} but no BEGIN record; its first surviving \
+                     record is sequence {}. A committed transaction whose \
+                     opening record is missing means the log was truncated \
+                     through the middle of a frame, so replaying what is \
+                     left would apply part of a batch and discarding it \
+                     would silently lose one that was acknowledged. \
+                     Recovery refuses both and must be resolved by an \
+                     operator.",
+                    commit.sequence,
+                    ordered[0].sequence,
+                ),
+            ));
+        }
+
+        // No BEGIN and no COMMIT: an incomplete frame. Nothing was
+        // promised, so it is discarded rather than replayed.
         return Ok(None);
     }
 
@@ -897,6 +982,44 @@ fn apply_recovery_operation(
                 .map_err(storage_error)?;
         }
 
+        WalOperation::CreateReference(def) => {
+            /*
+             * Last-write-wins by name in both the log and the resident
+             * set, so re-declaring a reference that is already there
+             * converges on the same definition. A reference builds no
+             * structure, so unlike an index there is not even a
+             * backfill to redo.
+             */
+            engine
+                .replay_create_reference(def)
+                .map_err(storage_error)?;
+        }
+
+        WalOperation::DropReference(name) => {
+            engine
+                .replay_drop_reference(&name)
+                .map_err(storage_error)?;
+        }
+
+        WalOperation::CreateTextIndex(def) => {
+            /*
+             * Same convergence as `CreateIndex`, one level finer: the
+             * backfill writes one key per trigram per row, every one of
+             * them a `put` keyed by (gram, address), so a replay lands
+             * on the keys the interrupted pass already wrote and fills
+             * in the ones it did not reach.
+             */
+            engine
+                .replay_create_text_index(def)
+                .map_err(storage_error)?;
+        }
+
+        WalOperation::DropTextIndex(name) => {
+            engine
+                .replay_drop_text_index(&name)
+                .map_err(storage_error)?;
+        }
+
         // Transaction-control records are consumed by the transaction
         // state machine and never reach this function.
         WalOperation::Begin
@@ -919,4 +1042,36 @@ fn storage_error(
         io::ErrorKind::Other,
         error,
     )
+}
+
+/// Stamp the change scan's horizon for a log that holds no records.
+///
+/// Two opposite states reach an empty log, and only the checkpoint tells
+/// them apart:
+///
+///   * **no checkpoint** — this database has never made a mutation
+///     durable, so nothing has been lost and every position is
+///     answerable. The horizon stays at zero and
+///     `crate::storage::changes::scan` truthfully answers "no changes".
+///
+///   * **a checkpoint exists** — records were written, made durable, and
+///     then rotated away or removed by an operator. Whatever they said
+///     is gone, and *nothing here can bound how far it went*: the
+///     positions those records carried are not derivable from a
+///     checkpoint (which counts sequences, not operation IDs) nor from a
+///     file with no records in it. So the scan can vouch for nothing at
+///     all, and says so, rather than answering an old `after=` with an
+///     empty page that is indistinguishable from "you are up to date".
+///
+/// The second case stamps `u64::MAX`, which refuses every scan **while
+/// the log is empty** and nothing longer: the moment a mutation is
+/// appended the log is non-empty and states its own horizon (see
+/// `changes::horizon`), so this is a refusal that repairs itself with
+/// the first write rather than a latch.
+fn note_scan_horizon(checkpoint_floor: u64) {
+    if checkpoint_floor == 0 {
+        return;
+    }
+
+    wal::note_scan_horizon(u64::MAX);
 }

@@ -33,7 +33,9 @@ use crate::core::history::HistoryEntry;
 use crate::core::node::Node;
 use crate::core::user::UserRecord;
 use crate::storage::commit::StagedCommit;
-use crate::storage::index::{self as keys, IndexDef};
+use crate::storage::index::{self as keys, Declared, IndexDef};
+use crate::storage::text::{self, TextIndexDef};
+use crate::storage::reference::ReferenceDef;
 use crate::storage::wal::WalOperation;
 
 /// One resolved mutation within a transaction.
@@ -94,6 +96,35 @@ pub enum Operation {
 
     /// Drop a declared index and remove its tree.
     DropIndex(String),
+
+    /// Declare a reference — a durable rule about what one kind's
+    /// `data` field points at, and what deleting the referenced node
+    /// does to the nodes referencing it.
+    ///
+    /// A mutation for the same reason `CreateIndex` is: from the moment
+    /// it lands, every later delete has to honour it, so the definition
+    /// has to reach disk through the same log the deletes do. Unlike an
+    /// index it builds nothing — the access paths it needs already
+    /// exist, which is why declaring one is refused unless they do.
+    CreateReference(ReferenceDef),
+
+    /// Drop a declared reference. The nodes it governed are untouched;
+    /// what stops is the enforcement.
+    DropReference(String),
+
+    /// Declare an inverted index over a `data` field's text, and
+    /// populate it from the nodes that already exist.
+    ///
+    /// A mutation for the reason [`Operation::CreateIndex`] is, with one
+    /// addition of its own: this index is the only one whose backfill
+    /// writes many keys per row, so a half-created one is not merely
+    /// incomplete, it is a search that silently omits whatever the crash
+    /// interrupted. Logging the declaration means recovery re-declares
+    /// and re-populates it, both idempotent by key.
+    CreateTextIndex(TextIndexDef),
+
+    /// Drop a declared inverted index and remove its tree.
+    DropTextIndex(String),
 }
 
 impl Operation {
@@ -113,11 +144,13 @@ impl Operation {
     /// [`crate::storage::index`]), so there is one definition of an
     /// admissible key rather than a copy of it here that can drift.
     ///
-    /// `indexes` is the set of declared `data`-field indexes the
-    /// mutation will have to maintain: a node carries one key per index
-    /// over its kind, and those keys are subject to the same
-    /// "admissible before it is logged" rule as the built-in ones.
-    pub fn validate(&self, indexes: &[IndexDef]) -> Result<(), String> {
+    /// `declared` is the set of operator-declared indexes the mutation
+    /// will have to maintain — ordered and inverted both. A node carries
+    /// one key per ordered index over its kind and one per trigram of
+    /// its text per inverted index, and every one of those keys is
+    /// subject to the same "admissible before it is logged" rule as the
+    /// built-in ones.
+    pub fn validate(&self, declared: &Declared) -> Result<(), String> {
         match self {
             Operation::Archive(entry) => keys::check_history_keys(
                 &entry.address,
@@ -130,7 +163,13 @@ impl Operation {
                 keys::check_node_keys(&node.address, &node.kind, &node.owner)?;
 
                 keys::check_data_keys(
-                    indexes.iter().filter(|def| def.kind == node.kind),
+                    declared.data_for(&node.kind),
+                    &node.address,
+                    &node.data,
+                )?;
+
+                text::check_text_keys(
+                    declared.text_for(&node.kind),
                     &node.address,
                     &node.data,
                 )
@@ -160,6 +199,22 @@ impl Operation {
             Operation::CreateIndex(def) => def.validate(),
 
             Operation::DropIndex(_) => Ok(()),
+
+            // Also a definition rather than a row, and with no keys of
+            // its own at all: a reference writes nothing, it only
+            // decides what other mutations must do.
+            Operation::CreateReference(def) => def.validate(),
+
+            Operation::DropReference(_) => Ok(()),
+
+            // A definition too, held to the same rule as `CreateIndex`:
+            // the name has to be a filename and the kind/field have to
+            // be key components. The postings its backfill writes are
+            // checked by the backfill, which is the only thing that
+            // knows how long the text out there actually is.
+            Operation::CreateTextIndex(def) => def.validate(),
+
+            Operation::DropTextIndex(_) => Ok(()),
         }
     }
 
@@ -179,6 +234,18 @@ impl Operation {
             Operation::RevokeUser(hash) => WalOperation::RevokeUser(hash.clone()),
             Operation::CreateIndex(def) => WalOperation::CreateIndex(def.clone()),
             Operation::DropIndex(name) => WalOperation::DropIndex(name.clone()),
+            Operation::CreateReference(def) => {
+                WalOperation::CreateReference(def.clone())
+            }
+            Operation::DropReference(name) => {
+                WalOperation::DropReference(name.clone())
+            }
+            Operation::CreateTextIndex(def) => {
+                WalOperation::CreateTextIndex(def.clone())
+            }
+            Operation::DropTextIndex(name) => {
+                WalOperation::DropTextIndex(name.clone())
+            }
         }
     }
 }
@@ -261,7 +328,7 @@ impl Transaction {
     /// An empty transaction is a no-op: it opens no frame, writes no
     /// records, and returns sequence 0 — a value below every real
     /// sequence, so it can never move the checkpoint forward.
-    pub fn commit<F>(self, indexes: &[IndexDef], mut apply: F) -> io::Result<u64>
+    pub fn commit<F>(self, declared: &Declared, mut apply: F) -> io::Result<u64>
     where
         F: FnMut(&Operation) -> Result<(), String>,
     {
@@ -277,7 +344,7 @@ impl Transaction {
         // committing its neighbours.
         for operation in &self.operations {
             operation
-                .validate(indexes)
+                .validate(declared)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         }
 

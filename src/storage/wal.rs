@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use crate::config;
 use crate::core::edge::{Edge, EdgeId};
@@ -11,6 +12,8 @@ use crate::core::node::Node;
 use crate::core::user::UserRecord;
 use crate::crypto;
 use crate::storage::index::IndexDef;
+use crate::storage::reference::ReferenceDef;
+use crate::storage::text::TextIndexDef;
 
 /// Current on-disk WAL record format.
 ///
@@ -49,7 +52,9 @@ pub const WAL_FRAME_VERSION: u16 = 1;
 
 /// Size of the fixed frame header, in bytes:
 ///
+/// ```text
 ///     magic(4) + frame_version(2) + payload_len(4) + payload_crc(4)
+/// ```
 const WAL_FRAME_HEADER_LEN: usize = 14;
 
 /// Largest encrypted payload a single WAL frame may carry, in bytes.
@@ -58,18 +63,22 @@ const WAL_FRAME_HEADER_LEN: usize = 14;
 /// protect against two different failures:
 ///
 ///   * `encode_frame` refuses to *write* a payload above this size, so
+/// ```text
 ///     one runaway record (a pathological node blob) can never be made
 ///     durable in a shape that a later reader would have to reject —
 ///     the write fails loudly at the moment the caller can still do
 ///     something about it, instead of bricking the next startup.
+/// ```
 ///
 ///   * `decode_frame` treats a header *declaring* more than this as
+/// ```text
 ///     `Corrupt`, and does so before allocating or slicing anything
 ///     sized by that declaration. A length prefix is the one field a
 ///     reader must trust before it has verified anything, so a
 ///     corrupted or hostile 4 GiB length must not be able to steer this
 ///     process into an unbounded allocation. The bound turns that class
 ///     of attack into an ordinary integrity failure.
+/// ```
 ///
 /// 64 MiB is far above any legitimate single-record payload while
 /// staying comfortably allocatable.
@@ -123,6 +132,7 @@ pub fn crc32(data: &[u8]) -> u32 {
 ///
 /// On-disk frame layout (before hex-encoding the whole line):
 ///
+/// ```text
 ///     offset  size  field
 ///     ------  ----  ---------------------------------------------
 ///     0       4     MAGIC = b"FQW1"
@@ -130,6 +140,7 @@ pub fn crc32(data: &[u8]) -> u32 {
 ///     6       4     PAYLOAD_LEN   (u32, little-endian)
 ///     10      4     PAYLOAD_CRC32 (u32, little-endian, over PAYLOAD)
 ///     14      N     PAYLOAD = AES-256-GCM(bincode(WalRecord))
+/// ```
 ///
 /// The explicit length + CRC let recovery detect a torn trailing frame
 /// structurally, before ever trusting its contents.
@@ -397,6 +408,34 @@ pub enum WalOperation {
 
     /// Drop a declared index.
     DropIndex(String),
+
+    /// Declare a reference.
+    ///
+    /// Carries the whole definition for the same reason `CreateIndex`
+    /// does: the definition log it also writes is applied by the same
+    /// operation, so a crash between the two must be repairable from
+    /// this record alone.
+    CreateReference(ReferenceDef),
+
+    /// Drop a declared reference.
+    DropReference(String),
+
+    /// Declare an inverted index over a `data` field's text.
+    ///
+    /// Carries the whole definition for the reason `CreateIndex` does.
+    ///
+    /// Appended **at the end** of this enum rather than beside
+    /// `CreateIndex`, deliberately: bincode tags variants by position, so
+    /// inserting one in the middle renumbers every variant after it and
+    /// makes an existing WAL decode into the wrong mutations — the exact
+    /// mistake that forced the v2 → v3 bump documented on
+    /// [`WAL_FORMAT_VERSION`]. Appending leaves every existing tag where
+    /// it is, so a WAL written before this variant existed still replays
+    /// correctly and the format version does not have to move.
+    CreateTextIndex(TextIndexDef),
+
+    /// Drop a declared inverted index.
+    DropTextIndex(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -522,6 +561,32 @@ pub fn next_transaction_id() -> u64 {
     )
 }
 
+/// The oldest position [`crate::storage::changes::scan`] can serve
+/// **when the log holds no records at all**.
+///
+/// A non-empty log states its own horizon — the oldest record still in
+/// it — and needs nothing from here. An empty one states nothing, and
+/// the two ways to reach an empty log are opposites: a database that has
+/// never been written (nothing was lost, so any position is answerable)
+/// and a checkpointed log whose records were rotated or removed
+/// (everything was lost, so nothing below "now" is answerable). Zero is
+/// the first; recovery stamps the second by minting a position from the
+/// counter that has already been advanced past every durable identifier
+/// — the same trick `EventFeed::new` uses to make a resume token from a
+/// previous process refusable.
+static SCAN_HORIZON: AtomicU64 = AtomicU64::new(0);
+
+/// Record that nothing at or below `position` can be scanned from the
+/// log any more. Monotone: a horizon never moves backwards.
+pub fn note_scan_horizon(position: u64) {
+    SCAN_HORIZON.fetch_max(position, Ordering::Relaxed);
+}
+
+/// The horizon for an empty log. See [`SCAN_HORIZON`].
+pub fn scan_horizon() -> u64 {
+    SCAN_HORIZON.load(Ordering::Relaxed)
+}
+
 /// Advance the process-local counters beyond values already observed
 /// in a durable WAL.
 ///
@@ -588,6 +653,7 @@ pub fn wal_path() -> PathBuf {
 ///
 /// Durability boundary:
 ///
+/// ```text
 ///     serialize
 ///        ↓
 ///     encrypt/authenticate
@@ -596,12 +662,18 @@ pub fn wal_path() -> PathBuf {
 ///        ↓
 ///     append frame + '\n' as ONE write
 ///        ↓
-///     sync_data()
-///        ↓
 ///     return Ok(())
+/// ```
 ///
-/// Once this function returns successfully, the WAL record has been
-/// handed to the filesystem's durable-data synchronization boundary.
+/// **This does not make the record durable, and that is deliberate.**
+/// A record's durability boundary belongs to its *transaction*, not to
+/// the record: a framed mutation becomes durable when its frame's
+/// COMMIT is synced ([`commit`]), and a standalone mutation — which is
+/// its own whole transaction — is flushed by the [`sync_pending`] its
+/// entry point runs after releasing the writer lock. A record that
+/// reaches disk without its COMMIT is discarded by recovery, so syncing
+/// it separately guarantees nothing that the COMMIT's own sync does not
+/// already guarantee, and costs an `fsync` to guarantee it.
 ///
 /// WHY THE FRAME MATTERS HERE
 ///
@@ -623,73 +695,290 @@ pub fn wal_path() -> PathBuf {
 /// Two deliberate details of the write itself:
 ///
 ///   * The frame and its newline go out in ONE `write_all`. Two writes
+/// ```text
 ///     admit a window where the frame is durable but its terminator is
 ///     not; one write narrows the loss of the newline to the same tear
 ///     that would have damaged the frame bytes — which the frame's own
 ///     length and CRC already catch.
+/// ```
 ///
 ///   * If the file does not already end on a newline, we emit one
+/// ```text
 ///     first. Reaching that state requires a tear at exactly the last
 ///     byte, but it is the one state in which a following append would
 ///     splice onto a previous record. A separator turns that
 ///     never-should-happen case into an empty line, which the reader
 ///     skips, instead of into corruption that ends recovery forever.
+/// ```
 ///
 /// This allocates no sequence, operation or transaction ID: the caller
 /// owns the record, so a failure here burns identifiers the caller
 /// already took (see `next_sequence` on why those gaps are correct).
-pub fn append(
-    record: &WalRecord,
-) -> io::Result<()> {
+pub fn append(record: &WalRecord) -> io::Result<()> {
     let encoded = encode_frame(record)?;
 
-    let mut file =
-        OpenOptions::new()
+    with_handle(|handle| handle.write_line(&encoded))?;
+
+    APPENDED.fetch_max(record.sequence, Ordering::Relaxed);
+
+    Ok(())
+}
+
+/// Highest sequence written to the log, durable or not.
+static APPENDED: AtomicU64 = AtomicU64::new(0);
+
+/// Completed `fsync` calls, and records covered by them.
+///
+/// The ratio is what group commit is: `records / flushes` is the average
+/// number of writers that shared one flush. One means no grouping.
+static FLUSHES: AtomicU64 = AtomicU64::new(0);
+static FLUSHED_RECORDS: AtomicU64 = AtomicU64::new(0);
+
+/// `(flushes, records covered)` since the process started.
+pub fn flush_stats() -> (u64, u64) {
+    (
+        FLUSHES.load(Ordering::Relaxed),
+        FLUSHED_RECORDS.load(Ordering::Relaxed),
+    )
+}
+
+/// Coalescing state for [`sync_pending`].
+struct SyncState {
+    /// Highest sequence a completed `fsync` has covered.
+    durable: u64,
+    /// A thread is inside `sync_data` right now.
+    syncing: bool,
+}
+
+fn sync_state() -> &'static (Mutex<SyncState>, Condvar) {
+    static STATE: OnceLock<(Mutex<SyncState>, Condvar)> = OnceLock::new();
+
+    STATE.get_or_init(|| {
+        (
+            Mutex::new(SyncState {
+                durable: 0,
+                syncing: false,
+            }),
+            Condvar::new(),
+        )
+    })
+}
+
+/// Make everything appended so far durable — sharing one `fsync` with
+/// every other writer waiting for the same thing.
+///
+/// # Group commit
+///
+/// An `fsync` costs the same whether it flushes one record or a hundred:
+/// on this project's own hardware, 7–24 ms either way. Paying it once per
+/// writer therefore caps durable writes at roughly `1 / fsync` no matter
+/// how many cores or clients there are, and no matter how much work each
+/// writer did.
+///
+/// So the writers share it. The first one in becomes the syncer; the
+/// others wait on the condvar, and when the syncer finishes they find
+/// their own records already covered — because a single `fsync` flushes
+/// the file's pending data, not merely the caller's share of it. `N`
+/// concurrent writers cost one `fsync` between them instead of `N`.
+///
+/// This is only reachable because the engine's writer mutex is released
+/// before this is called. While the fsync happened *inside* the mutex
+/// there was never a second writer waiting to group with — which is why
+/// this could not be built until reads stopped taking that lock.
+pub fn sync_pending() -> io::Result<()> {
+    let (mutex, condvar) = sync_state();
+
+    let target = APPENDED.load(Ordering::Relaxed);
+    let mut state = mutex.lock().unwrap_or_else(|e| e.into_inner());
+
+    loop {
+        if state.durable >= target {
+            return Ok(());
+        }
+
+        if state.syncing {
+            // Someone else is flushing. Their fsync may or may not cover
+            // us — it covers whatever had been appended when it started
+            // — so re-check the condition rather than assuming.
+            state = condvar
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
+
+        // Become the syncer. `covered` is read before the flush and
+        // published after it: an fsync makes durable everything written
+        // before it began, and claiming more than that would mark a
+        // record durable that the flush had not yet seen.
+        state.syncing = true;
+        let covered = APPENDED.load(Ordering::Relaxed);
+        drop(state);
+
+        // Take the descriptor under the handle lock, flush outside it.
+        // `sync_data`, not `sync_all`: the WAL's length is not metadata
+        // a reader depends on — a frame carries its own length — so the
+        // size does not have to be flushed alongside the bytes.
+        let outcome = with_handle(|handle| Ok(handle.file()))
+            .and_then(|file| file.sync_data());
+
+        let mut state = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        state.syncing = false;
+
+        if outcome.is_ok() {
+            let gained = covered.saturating_sub(state.durable);
+
+            state.durable = state.durable.max(covered);
+
+            FLUSHES.fetch_add(1, Ordering::Relaxed);
+            FLUSHED_RECORDS.fetch_add(gained, Ordering::Relaxed);
+        }
+
+        // Every waiter has to re-evaluate, including on failure: a
+        // failed flush leaves them waiting for a syncer that has gone.
+        condvar.notify_all();
+
+        outcome?;
+
+        return Ok(());
+    }
+}
+
+/// Reset the group-commit bookkeeping. Called when the log file itself is
+/// replaced, since sequence numbers no longer describe the same bytes.
+fn reset_sync_state() {
+    let (mutex, condvar) = sync_state();
+    let mut state = mutex.lock().unwrap_or_else(|e| e.into_inner());
+
+    state.durable = 0;
+    state.syncing = false;
+
+    condvar.notify_all();
+}
+
+/// Drop the cached file handle, so the next append reopens the log.
+///
+/// Anything that replaces the WAL *file* rather than appending to it —
+/// [`rotate`], which renames a rebuilt log over the old one, and
+/// [`truncate_torn_tail`], which shortens it during recovery — must call
+/// this. A cached handle would otherwise keep writing into the previous
+/// inode, or past a tail that no longer exists.
+pub fn reset_handle() {
+    *handle_slot() = None;
+
+    reset_sync_state();
+}
+
+/// The open WAL, kept across appends.
+///
+/// Before this existed, every single record did its own
+/// `open` + `metadata` + `seek` + 1-byte `read` + `write` + `fsync`. The
+/// syscalls were not the expensive part; the `fsync` was, and there was
+/// one per record. A 500-operation transaction performed 502 of them,
+/// serially, while holding the engine's global write lock — which is why
+/// a batch measured *slower per record* than the same records written
+/// one at a time.
+struct WalHandle {
+    /// Shared so a flush can run on it without holding the handle lock.
+    ///
+    /// This is what makes group commit possible rather than merely
+    /// coded: the first version kept the `File` by value and flushed it
+    /// inside `with_handle`, which held the append lock for the whole
+    /// 7 ms `fsync`. No other writer could append during it, so by the
+    /// time the flush finished there was never anyone waiting to share
+    /// it — measured at 1592 flushes for 1600 concurrent writes. Appends
+    /// and the flush now use the same descriptor concurrently, which is
+    /// exactly what the flush is for: it makes durable whatever has been
+    /// written, and more arriving while it runs is the point.
+    file: Arc<File>,
+
+    /// The file does not currently end on a newline, so the next append
+    /// has to emit a separator first. Probed once when the handle is
+    /// opened; after that it is known, because every line this writes
+    /// ends in one.
+    needs_separator: bool,
+
+    /// Records have been written since the last `sync_data`.
+    unsynced: bool,
+}
+
+impl WalHandle {
+    fn open() -> io::Result<WalHandle> {
+        let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(wal_path())?;
 
-    /*
-     * Splice guard.
-     *
-     * In append mode every write lands at end-of-file regardless of the
-     * seek position, so probing the last byte here is safe and costs one
-     * seek plus one 1-byte read — nothing next to the fsync below.
-     */
-    let existing_len = file.metadata()?.len();
+        // Splice guard, paid once per handle rather than once per record.
+        // Reaching a WAL that does not end on a newline requires a tear
+        // at exactly the last byte, but it is the one state in which a
+        // following append would splice onto a previous record.
+        let needs_separator = if file.metadata()?.len() > 0 {
+            file.seek(SeekFrom::End(-1))?;
 
-    let mut line =
-        Vec::with_capacity(encoded.len() + 2);
+            let mut last = [0u8; 1];
+            file.read_exact(&mut last)?;
 
-    if existing_len > 0 {
-        file.seek(SeekFrom::End(-1))?;
+            last[0] != b'\n'
+        } else {
+            false
+        };
 
-        let mut last = [0u8; 1];
-
-        file.read_exact(&mut last)?;
-
-        if last[0] != b'\n' {
-            line.push(b'\n');
-        }
+        Ok(WalHandle {
+            file: Arc::new(file),
+            needs_separator,
+            unsynced: false,
+        })
     }
 
-    line.extend_from_slice(encoded.as_bytes());
-    line.push(b'\n');
+    /// The frame and its newline go out in ONE `write_all`. Two writes
+    /// admit a window where the frame is durable but its terminator is
+    /// not; one write narrows the loss of the newline to the same tear
+    /// that would have damaged the frame bytes — which the frame's own
+    /// declared length and CRC already catch.
+    fn write_line(&mut self, encoded: &str) -> io::Result<()> {
+        let mut line = Vec::with_capacity(encoded.len() + 2);
 
-    file.write_all(&line)?;
+        if self.needs_separator {
+            line.push(b'\n');
+        }
 
-    /*
-     * Explicit durability boundary.
-     *
-     * We don't acknowledge the WAL append until the data has been
-     * synchronized. `sync_data` (not `sync_all`) is deliberate: the
-     * file's length metadata is updated by the append itself and the
-     * data is what must survive; the directory entry already exists.
-     */
-    file.sync_data()?;
+        line.extend_from_slice(encoded.as_bytes());
+        line.push(b'\n');
 
-    Ok(())
+        // `impl Write for &File` — the descriptor is opened in append
+        // mode, so every write lands at end-of-file regardless of what
+        // any concurrent flush is doing with the same fd.
+        (&*self.file).write_all(&line)?;
+
+        self.needs_separator = false;
+        self.unsynced = true;
+
+        Ok(())
+    }
+
+    /// The descriptor, for a flush that must not hold the append lock.
+    fn file(&self) -> Arc<File> {
+        Arc::clone(&self.file)
+    }
+}
+
+fn handle_slot() -> MutexGuard<'static, Option<WalHandle>> {
+    static HANDLE: Mutex<Option<WalHandle>> = Mutex::new(None);
+
+    HANDLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn with_handle<R>(
+    act: impl FnOnce(&mut WalHandle) -> io::Result<R>,
+) -> io::Result<R> {
+    let mut slot = handle_slot();
+
+    if slot.is_none() {
+        *slot = Some(WalHandle::open()?);
+    }
+
+    act(slot.as_mut().expect("just opened"))
 }
 
 // ---------------------------------------------------------------------
@@ -720,23 +1009,29 @@ pub enum WalTail {
 /// THE THREE OUTCOMES, AND WHY THEY ARE TREATED DIFFERENTLY
 ///
 ///   * `Durable` — the frame's length matched, its CRC matched, its
+/// ```text
 ///     AEAD authenticated and its record deserialized. Replayable.
+/// ```
 ///
 ///   * `Torn` — the frame is structurally short. This is what a crash
+/// ```text
 ///     mid-`append` looks like and it is tolerable in exactly ONE
 ///     position: the last non-empty line. There it is the crash point,
 ///     and the caller drops it with `truncate_torn_tail`. Anywhere else
 ///     it means a short frame was later written *past* — mid-log
 ///     corruption, not a crash tail — and we refuse to guess which side
 ///     of it is real.
+/// ```
 ///
 ///   * `Corrupt` — the frame is structurally complete but failed
+/// ```text
 ///     integrity (CRC, authentication, version, or an impossible
 ///     length). This is bit-rot or tampering, never a clean crash, so it
 ///     is ALWAYS an error — including at the tail. Silently truncating
 ///     here would turn "your disk is lying to you" into "some writes
 ///     quietly vanished", which is the one outcome a WAL exists to
 ///     prevent. The operator gets told.
+/// ```
 ///
 /// Offsets are tracked as real file offsets — the running sum of every
 /// line's bytes including its `\n` — so a returned `durable_len` can be
@@ -918,6 +1213,10 @@ pub fn read_all() -> io::Result<(Vec<WalRecord>, WalTail)> {
 pub fn truncate_torn_tail(
     durable_len: u64,
 ) -> io::Result<()> {
+    // A cached handle would still believe the log ends where it did
+    // before the truncation, including whether it ends on a newline.
+    reset_handle();
+
     let path = wal_path();
 
     let file = OpenOptions::new()
@@ -989,6 +1288,22 @@ pub fn commit(
             transaction_id,
         );
 
+    // The COMMIT record is written here and made durable by
+    // `sync_pending`, which the mutation entry point calls after
+    // releasing the writer lock. Both halves matter:
+    //
+    // * one flush per *frame* rather than per record, because an fsync
+    //   makes durable everything written before it — so BEGIN, every
+    //   staged mutation and this COMMIT go together; and
+    // * one flush per *group of writers* rather than per frame, because
+    //   the flush happens outside the lock where concurrent writers can
+    //   share it.
+    //
+    // Neither is a shortcut: recovery commits a frame only when it finds
+    // BEGIN, the mutations and COMMIT, and discards it otherwise, so a
+    // frame that was appended but not yet flushed is simply not a
+    // transaction yet — which is exactly true, since its caller has not
+    // been told it committed.
     append(&record)?;
 
     Ok(record)
@@ -1010,6 +1325,10 @@ pub fn abort(
             transaction_id,
         );
 
+    // Deliberately not synced. An ABORT that does not survive a crash
+    // leaves a frame with no durable COMMIT, and recovery discards such
+    // a frame whether or not it is marked aborted — the outcome is the
+    // same, so paying an fsync to reach it is not worth it.
     append(&record)?;
 
     Ok(record)
@@ -1123,6 +1442,29 @@ pub fn rotate(durable_checkpoint: u64) -> io::Result<usize> {
         return Ok(kept.len());
     }
 
+    /*
+     * The change scan's horizon moves with this, and it has to move
+     * *before* the file does: everything about to be dropped stops
+     * being answerable the instant the rename lands, and a scan that
+     * ran in between would otherwise report a complete answer built on
+     * a log it no longer has. The highest dropped position is the
+     * boundary — `after=` that value is still honest, because every
+     * record above it survives the rewrite.
+     *
+     * Only consulted when the rewrite leaves the log empty (a checkpoint
+     * that covered everything); a log with records left in it states its
+     * own horizon. Noting it unconditionally is what makes that case
+     * correct without a second code path to forget.
+     */
+    let dropped = records
+        .iter()
+        .filter(|record| record.sequence <= durable_checkpoint)
+        .map(|record| record.operation_id)
+        .max()
+        .unwrap_or(0);
+
+    note_scan_horizon(dropped);
+
     let mut body = Vec::new();
 
     for record in &kept {
@@ -1151,6 +1493,11 @@ pub fn rotate(durable_checkpoint: u64) -> io::Result<usize> {
     }
 
     sync_parent_dir(&path)?;
+
+    // The cached handle still refers to the inode the rename just
+    // unlinked. Anything appended through it would land in a file with
+    // no name and be lost at the next restart.
+    reset_handle();
 
     Ok(kept.len())
 }

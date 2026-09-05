@@ -59,10 +59,45 @@ pub async fn serve_tls(
             }
         };
 
+        /*
+         * The connection cap, and the only place either serving path
+         * can apply one.
+         *
+         * A TLS connection costs a file descriptor, a task and a full
+         * handshake — asymmetric public-key work this process performs
+         * before one byte of HTTP has been parsed, and therefore before
+         * any credential has been presented. It is the one cost a
+         * completely unauthenticated client can impose, so it cannot be
+         * governed by any of the per-identity bounds, and it is not
+         * reachable from a tower layer either: a layer runs per
+         * *request*, which is already past the handshake.
+         *
+         * Dropping the stream is the whole refusal. There is nothing to
+         * answer with — no session has been negotiated — and answering
+         * would mean doing the work being refused.
+         */
+        let permit = match crate::api::limits::connection_permit() {
+            Some(permit) => permit,
+
+            None => {
+                eprintln!(
+                    "warning: refusing a connection from {remote_addr}: at \
+                     the concurrent-connection limit"
+                );
+
+                drop(tcp_stream);
+                continue;
+            }
+        };
+
         let acceptor = acceptor.clone();
         let app = app.clone();
 
         tokio::spawn(async move {
+            // Released when this task ends, i.e. when the connection
+            // closes — not when its first request finishes.
+            let _connection_slot = permit;
+
             let tls_stream = match acceptor.accept(tcp_stream).await {
                 Ok(stream) => stream,
                 Err(e) => {

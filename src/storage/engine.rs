@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, RwLock};
 use std::sync::Arc;
 
 use serde::{Serialize, Deserialize};
@@ -10,11 +11,18 @@ use crate::core::history::HistoryEntry;
 use crate::core::node::Node;
 use crate::core::predicate::{self, Expr};
 use crate::core::user::UserRecord;
+use crate::metrics::{self, CellAttribution, CellTable, RuntimeStats};
 use crate::storage::binary::{self, UserOpRecord};
 use crate::storage::cache::RecordCache;
 use crate::storage::catalog::Catalog;
 use crate::storage::heap::{HeapRecord, RecordStore};
-use crate::storage::index::{self as keys, IndexDef, IndexOpRecord, Indexes};
+use crate::storage::index::{
+    self as keys, Declared, IndexDef, IndexInfo, IndexOpRecord, Indexes,
+};
+use crate::storage::text::{self as text, TextIndex, TextIndexDef, TextIndexOpRecord};
+use crate::storage::reference::{
+    ReferenceDef, ReferenceOpRecord, ReferentialAction, References,
+};
 use crate::storage::location::RecordLocation;
 use crate::storage::transaction::{Operation, Transaction};
 use crate::storage::wal;
@@ -82,6 +90,32 @@ const SEGMENTS_PER_COMPACTION: usize = 1;
 /// caller narrows the query, or an operator raises the bound. A wrong
 /// answer is not.
 ///
+/// The reserved kind sequences live under.
+///
+/// A sequence is an ordinary node, which is deliberate: it gets the WAL
+/// record, the crash recovery, the ownership check and the history that
+/// every other write gets, rather than a second durability story written
+/// specially for a counter.
+const SEQUENCE_KIND: &str = "__sequence";
+
+/// Longest sequence name.
+const MAX_SEQUENCE_NAME: usize = 128;
+
+/// Largest block one allocation may take.
+///
+/// Big enough that a bulk import takes its ids in one call; small enough
+/// that a typo cannot burn a meaningful part of the range.
+const MAX_SEQUENCE_BLOCK: u64 = 100_000;
+
+/// Addresses one `multi_get` may name.
+///
+/// Each one costs an index descent and a record read, so this is the
+/// same kind of bound as the scan-row cap — it limits the work a single
+/// request can buy. A feed page is twenty rows and the enrichment for it
+/// a few hundred addresses, so a thousand is comfortably above what a
+/// page needs and well below what a scan costs.
+const MAX_MULTI_GET: usize = 1_000;
+
 /// 100_000 nodes is far past any interactive page and still a bounded,
 /// modest allocation.
 const DEFAULT_MAX_SCAN_ROWS: usize = 100_000;
@@ -183,6 +217,55 @@ fn max_scan_rows() -> usize {
     })
 }
 
+// ---------------------------------------------------------------------
+// Inverted-index probe budget
+// ---------------------------------------------------------------------
+//
+// Three bounds on how hard the planner tries to narrow a substring
+// search before it gives up and reads the candidates it has. All three
+// are safe to hit in *either* direction, which is the property that
+// makes them tunable numbers rather than correctness decisions: dropping
+// a trigram only ever widens the candidate set, and a wider candidate
+// set is still a superset of the answer because the predicate is
+// re-evaluated on every candidate regardless.
+
+/// How many of a needle's trigrams are tried as the *seed* — the one
+/// whose whole posting list is read.
+///
+/// The seed decides the cost of everything after it, so a rare trigram
+/// is worth looking for. But looking is not free: finding the smallest
+/// of N lists costs N times the size of the smallest, because each
+/// attempt has to be read far enough to know it is not smaller. Four is
+/// where that stops paying — past it the hunt costs more than a slightly
+/// better seed saves.
+const MAX_TEXT_SEED_GRAMS: usize = 4;
+
+/// A posting list at most this long ends the seed hunt immediately.
+///
+/// The hunt exists to avoid seeding from a trigram that half the corpus
+/// holds. Once a list this short is in hand that danger is gone, and
+/// reading three more lists to find one marginally shorter is pure loss
+/// — the refinement probes below narrow it the rest of the way for one
+/// B+tree descent per candidate, which is cheaper than another list
+/// scan. Measured on a 20 000-row corpus, taking the first list under
+/// this bound instead of hunting for the smallest cut the query from
+/// 385 ms to 92 ms without changing a single row of the answer.
+const MAX_TEXT_SEED_ENOUGH: usize = 1024;
+
+/// How many trigrams are then probed against the seed's candidates.
+///
+/// Each probe is one B+tree descent per surviving candidate and can only
+/// shrink the set, so this is purely a cost ceiling.
+const MAX_TEXT_PROBE_GRAMS: usize = 16;
+
+/// The candidate count below which probing stops.
+///
+/// Under this many candidates it is cheaper to read the records and let
+/// the predicate decide than to spend another trigram's worth of
+/// descents removing a few of them — and the predicate has to run on the
+/// survivors either way.
+const MAX_TEXT_PROBE_FLOOR: usize = 64;
+
 /// The refusal a scan raises when it would have to hold more than
 /// [`max_scan_rows`] rows.
 ///
@@ -267,13 +350,31 @@ pub struct StorageEngine {
     /// these, so every mutation must maintain every one of them.
     indexes: Indexes,
 
+    /// The declared references: which `data` field points at which
+    /// kind, and what deleting the referenced node does to the nodes
+    /// referencing it.
+    ///
+    /// Beside the indexes rather than inside them because it is a
+    /// different kind of thing — an index is an access path, a reference
+    /// is a rule *about* mutations that happens to need one. Resident
+    /// for the same reason the index definitions are: every delete has
+    /// to ask whether anything points at what it is removing, and a rule
+    /// that costs a read to discover is a rule every write pays for.
+    references: References,
+
     /// Bounded LRU over recently read/written nodes. A pure accelerator
     /// — every entry can be re-derived from the heap through the primary
     /// index, and a cold cache changes latency, never answers.
     cache: RecordCache,
 
     /// Persistent users, keyed by token_hash.
-    pub users: HashMap<String, UserRecord>,
+    /// Persistent identities, keyed by token hash.
+    ///
+    /// Behind a lock rather than owned exclusively: authentication reads
+    /// this on every request, and a read must not have to wait for a
+    /// write to some unrelated node. Bounded by identity count, not by
+    /// data volume, which is why it is resident at all.
+    users: RwLock<HashMap<String, UserRecord>>,
 
     /// Process-lifetime operation counters, the rate source behind
     /// `GET /stats`. `reads_total` counts calls to `get`/`query`/
@@ -297,14 +398,32 @@ pub struct StorageEngine {
     reads_total: AtomicU64,
     writes_total: AtomicU64,
 
+    /// Per-coordinate attribution of the two counters above.
+    ///
+    /// `reads_total` and `writes_total` describe the whole instance, and
+    /// an instance is not the unit anyone places data in — a *cell* is.
+    /// A control plane that can only see the instance total can only
+    /// ever move everything or nothing, however precisely it reasons.
+    /// This is the same traffic, broken down by the coordinate the
+    /// records actually live at.
+    ///
+    /// Fixed-size and lock-free by construction: see [`CellTable`] for
+    /// the bound, what happens past it, and why it is counted rather
+    /// than concealed. It is engine state rather than process state
+    /// because a coordinate is a property of *this* database's records.
+    cells: CellTable,
+
     /// Highest WAL sequence whose effects have been applied to the heap
     /// and indexes — in the buffer pool, not necessarily on disk. The
     /// checkpoint may advance to this value, and only to this value,
     /// once a flush has made those effects durable.
-    applied_sequence: u64,
+    /// Atomic only so that every method can take `&self`; it is written
+    /// exclusively under [`StorageEngine::write_lock`], so there is no
+    /// interleaving to reason about.
+    applied_sequence: AtomicU64,
 
-    /// Mutations applied since the last checkpoint.
-    pending_mutations: u64,
+    /// Mutations applied since the last checkpoint. Same story.
+    pending_mutations: AtomicU64,
 
     /// How many mutations to let accumulate before checkpointing.
     checkpoint_interval: u64,
@@ -312,8 +431,63 @@ pub struct StorageEngine {
     /// Records currently in `facetql.users`, tracked so the log can be
     /// compacted when it has grown far past the identities it describes.
     /// See [`StorageEngine::compact_user_log`].
-    user_log_records: usize,
+    user_log_records: AtomicUsize,
+
+    /// Bumped by every checkpoint. A reader pins the current value for
+    /// the length of its work; a heap segment retired at epoch `E` is
+    /// deleted only once no reader is pinned below `E`.
+    epoch: AtomicU64,
+
+    /// Epochs currently pinned by live readers, and how many hold each.
+    /// The same shape, and the same job, as the B+tree's reader registry
+    /// — that one defers page reuse, this one defers file deletion.
+    readers: Mutex<BTreeMap<u64, usize>>,
+
+    /// Segments drained by compaction, with the epoch at which the
+    /// committed indexes stopped pointing into them.
+    retired: Mutex<Vec<(u32, u64)>>,
+
+    /// Serializes writers against each other.
+    ///
+    /// The engine used to be wrapped in one `RwLock` at the `Database`
+    /// level, which did two jobs at once: it made writes exclusive of
+    /// each other (which they must be — this is a single-writer engine)
+    /// and it made writes exclusive of *reads* (which they need not be,
+    /// now that the B+tree serves snapshots and the record cache is
+    /// keyed by version).
+    ///
+    /// Splitting them means this mutex keeps the property that matters
+    /// and drops the one that only cost throughput. It is taken by the
+    /// public mutation entry points and by nothing else; the `_locked`
+    /// variants exist for the two places a mutation calls another one
+    /// (`claim` → `insert`, `note_applied` → `checkpoint`), which would
+    /// otherwise deadlock on a non-reentrant lock.
+    writer: Mutex<()>,
 }
+
+/// A live read's claim on the engine's current epoch.
+///
+/// While one exists, no heap segment retired at or after the epoch it
+/// pinned is deleted. Created by [`StorageEngine::pin_read`]; the pin
+/// lasts exactly as long as the value.
+pub struct ReadPin<'a> {
+    engine: &'a StorageEngine,
+    epoch: u64,
+}
+
+impl ReadPin<'_> {
+    /// The epoch this read is pinned to.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl Drop for ReadPin<'_> {
+    fn drop(&mut self) {
+        self.engine.release_read(self.epoch);
+    }
+}
+
 
 impl StorageEngine {
     // ---------------------------------------------------------------------
@@ -344,6 +518,129 @@ impl StorageEngine {
     /// sequence numbers, breaking the strictly-increasing invariant
     /// `recovery::validate_sequence` enforces — which would make the
     /// *next* startup fail to recover at all.
+    /// The identity map, for reading.
+    fn users_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, UserRecord>> {
+        self.users.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The identity map, for writing. Callers already hold the writer
+    /// lock; this guards the map against concurrent authentication
+    /// reads, which do not.
+    fn users_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, UserRecord>> {
+        self.users.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Serialize this writer against every other one.
+    ///
+    /// Taken by the public mutation entry points. A mutation that calls
+    /// another mutation must call its `_locked` form instead — this lock
+    /// is not reentrant, and `std::sync::Mutex` deadlocks rather than
+    /// reporting the mistake.
+    /// Pin the current epoch for the length of a read.
+    ///
+    /// # What this protects
+    ///
+    /// Reads no longer exclude writes, so a `checkpoint` — including its
+    /// compaction — can run while a query is in flight. Compaction
+    /// drains a mostly-dead segment by copying its live records
+    /// elsewhere and repointing the indexes, then deletes the file. That
+    /// is safe against the *committed* index generation, which no longer
+    /// names it. It is not safe against a reader that resolved a
+    /// `RecordLocation` a moment earlier and is about to read it.
+    ///
+    /// So deletion is deferred, exactly the way the B+tree defers page
+    /// reuse: the segment is retired with the epoch that unreferenced
+    /// it, and the file goes away once no reader is pinned below that.
+    /// Holding a pin for a long time costs disk, never correctness.
+    pub fn pin_read(&self) -> ReadPin<'_> {
+        let epoch = self.epoch.load(Ordering::Relaxed);
+
+        *self.readers_lock().entry(epoch).or_insert(0) += 1;
+
+        ReadPin {
+            engine: self,
+            epoch,
+        }
+    }
+
+    fn readers_lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, usize>> {
+        self.readers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Release a pin. Called from [`ReadPin::drop`].
+    fn release_read(&self, epoch: u64) {
+        let mut readers = self.readers_lock();
+
+        if let std::collections::btree_map::Entry::Occupied(mut slot) = readers.entry(epoch) {
+            *slot.get_mut() -= 1;
+
+            if *slot.get() == 0 {
+                slot.remove();
+            }
+        }
+    }
+
+    /// The oldest epoch any live reader is pinned to.
+    fn oldest_reader(&self) -> Option<u64> {
+        self.readers_lock().keys().next().copied()
+    }
+
+    /// Delete every retired segment no reader can still reach.
+    ///
+    /// Called at each checkpoint. A segment held back by a long-running
+    /// read is simply reconsidered at the next one — the list is the
+    /// only thing that grows, and it grows by one `(u32, u64)` per
+    /// deferred segment.
+    fn drop_unreferenced_segments(&self) -> io::Result<()> {
+        let oldest = self.oldest_reader();
+
+        let ready: Vec<u32> = {
+            let mut retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ready = Vec::new();
+
+            retired.retain(|(segment, epoch)| {
+                if oldest.is_none_or(|pinned| pinned >= *epoch) {
+                    ready.push(*segment);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            ready
+        };
+
+        for segment in ready {
+            self.store.drop_segment(segment)?;
+        }
+
+        Ok(())
+    }
+
+    fn write_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        // A poisoned writer lock means a thread panicked *partway
+        // through a mutation*: some indexes updated, others not. Ending
+        // the process is the repair, because every acknowledged write is
+        // already in the WAL and startup recovery replays it. Continuing
+        // would serve from state that is inconsistent with the disk.
+        //
+        // This used to be the `Database`-level `RwLock`'s job. It moved
+        // here with the exclusion it enforces.
+        // Every mutation path in this file acquires the writer through
+        // here, which makes it the one place that can see a writer
+        // *queue*. Two relaxed adds around a lock acquisition that is
+        // itself an atomic RMW: the measurement costs less than the
+        // thing it measures.
+        metrics::enter_write_queue();
+
+        let guard =
+            self.writer.lock().unwrap_or_else(|_| crate::database::poisoned());
+
+        metrics::leave_write_queue();
+
+        guard
+    }
+
     fn append_wal(
         &self,
         transaction_id: u64,
@@ -358,6 +655,10 @@ impl StorageEngine {
             operation,
         );
 
+        // Written, not flushed. Every mutation — standalone or framed —
+        // is made durable by the `wal::sync_pending` its entry point
+        // runs after releasing the writer lock, which is where
+        // concurrent writers meet and share one fsync.
         wal::append(&record).map_err(|e| e.to_string())?;
 
         Ok(sequence)
@@ -414,7 +715,7 @@ impl StorageEngine {
     /// checkpoint last and only over state that has actually reached the
     /// disk.
     fn apply_atomic(
-        &mut self,
+        &self,
         operations: Vec<Operation>,
     ) -> Result<(), String> {
         match operations.len() {
@@ -432,8 +733,10 @@ impl StorageEngine {
                 // become durable: recovery would replay it into the
                 // same refusal on every subsequent start. See
                 // `Operation::validate`.
-                let declared = self.index_definitions();
+                let declared = self.declared_indexes();
                 operation.validate(&declared)?;
+                self.check_unique(&operations)?;
+                self.check_references(&operations)?;
 
                 let sequence = self.append_wal(0, operation.to_wal())?;
 
@@ -450,7 +753,9 @@ impl StorageEngine {
             // resolved this operation list instead of
             // `lower_transaction` lowering it from a request.
             _ => {
-                let declared = self.index_definitions();
+                let declared = self.declared_indexes();
+                self.check_unique(&operations)?;
+                self.check_references(&operations)?;
 
                 let sequence = Transaction::from_operations(operations)
                     .commit(&declared, |operation| self.apply_committed(operation))
@@ -475,20 +780,20 @@ impl StorageEngine {
     /// triggered it is already durable in the WAL, so failing it here
     /// would report a committed write as failed. What a stuck checkpoint
     /// actually costs is a longer replay at the next startup.
-    fn note_applied(&mut self, sequence: u64) {
-        self.applied_sequence = self.applied_sequence.max(sequence);
-        self.pending_mutations += 1;
+    fn note_applied(&self, sequence: u64) {
+        self.applied_sequence.fetch_max(sequence, Ordering::Relaxed);
+        let pending = self.pending_mutations.fetch_add(1, Ordering::Relaxed) + 1;
 
-        if self.pending_mutations < self.checkpoint_interval {
+        if pending < self.checkpoint_interval {
             return;
         }
 
-        if let Err(e) = self.checkpoint() {
+        if let Err(e) = self.checkpoint_locked() {
             eprintln!(
                 "warning: failed to checkpoint physical storage at WAL \
                  sequence {}: {e}. The mutation is durable in the WAL and \
                  will be replayed on the next start.",
-                self.applied_sequence
+                self.applied_sequence.load(Ordering::Relaxed)
             );
         }
     }
@@ -512,25 +817,46 @@ impl StorageEngine {
     /// a re-applied insert rewrites the same key, a re-applied archive
     /// lands on the same `(address, version)` — so redoing work that
     /// *did* survive costs a superseded record and nothing else.
-    pub fn checkpoint(&mut self) -> io::Result<()> {
+    pub fn checkpoint(&self) -> io::Result<()> {
+        let _writer = self.write_lock();
+
+        self.checkpoint_locked()
+    }
+
+    /// The checkpoint itself, for callers already holding the writer
+    /// lock. `note_applied` reaches this from inside a mutation, which
+    /// is why the lock is not taken here.
+    fn checkpoint_locked(&self) -> io::Result<()> {
         let drained = self.compact()?;
 
         self.store.sync()?;
         self.indexes.commit()?;
 
-        crate::storage::checkpoint::advance(self.applied_sequence)?;
+        crate::storage::checkpoint::advance(self.applied_sequence.load(Ordering::Relaxed))?;
 
-        self.pending_mutations = 0;
+        self.pending_mutations.store(0, Ordering::Relaxed);
 
         self.rotate_wal()?;
 
         // Only now: the index entries that used to point into these
         // segments are committed elsewhere, so the bytes are genuinely
-        // unreferenced. A crash before this leaves a segment full of
-        // dead records that the next pass drains for free.
-        for segment in drained {
-            self.store.drop_segment(segment)?;
+        // unreferenced *by the committed generation*. A crash before
+        // this leaves a segment full of dead records that the next pass
+        // drains for free.
+        //
+        // A reader pinned at an earlier epoch may still hold a location
+        // into one of them, so the epoch advances and the segments are
+        // retired against it rather than deleted outright. See
+        // `pin_read`.
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if !drained.is_empty() {
+            let mut retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+
+            retired.extend(drained.into_iter().map(|segment| (segment, epoch)));
         }
+
+        self.drop_unreferenced_segments()?;
 
         Ok(())
     }
@@ -556,7 +882,7 @@ impl StorageEngine {
     /// self`, so no append can be in flight, and no transaction frame
     /// can be open — the staged-commit driver holds the same exclusive
     /// borrow for the whole of its frame.
-    fn rotate_wal(&mut self) -> io::Result<()> {
+    fn rotate_wal(&self) -> io::Result<()> {
         if wal::size()? < wal::rotate_threshold() {
             return Ok(());
         }
@@ -584,7 +910,7 @@ impl StorageEngine {
     /// the work, and then every record in it is checked against the
     /// index entry that would address it. A record the index no longer
     /// points at is garbage by definition, whatever the counter said.
-    fn compact(&mut self) -> io::Result<Vec<u32>> {
+    fn compact(&self) -> io::Result<Vec<u32>> {
         let candidates = self.store.compaction_candidates(COMPACTION_RATIO);
 
         let mut drained = Vec::new();
@@ -597,7 +923,7 @@ impl StorageEngine {
         Ok(drained)
     }
 
-    fn drain_segment(&mut self, segment: u32) -> io::Result<()> {
+    fn drain_segment(&self, segment: u32) -> io::Result<()> {
         // Collect the live records' identities first and move them
         // afterwards. Scanning and appending at the same time would be
         // appending to a structure being walked, and holding whole
@@ -651,73 +977,101 @@ impl StorageEngine {
     // ---------------------------------------------------------------------
 
     pub(crate) fn replay_archive(
-        &mut self,
+        &self,
         entry: HistoryEntry,
     ) -> Result<(), String> {
         self.apply_committed(&Operation::Archive(entry))
     }
 
     pub(crate) fn replay_insert(
-        &mut self,
+        &self,
         node: Node,
     ) -> Result<(), String> {
         self.apply_committed(&Operation::Insert(node))
     }
 
     pub(crate) fn replay_delete(
-        &mut self,
+        &self,
         address: &str,
     ) -> Result<(), String> {
         self.apply_committed(&Operation::Delete(address.to_string()))
     }
 
     pub(crate) fn replay_insert_edge(
-        &mut self,
+        &self,
         edge: Edge,
     ) -> Result<(), String> {
         self.apply_committed(&Operation::InsertEdge(edge))
     }
 
     pub(crate) fn replay_delete_edge(
-        &mut self,
+        &self,
         id: &EdgeId,
     ) -> Result<(), String> {
         self.apply_committed(&Operation::DeleteEdge(id.clone()))
     }
 
     pub(crate) fn replay_insert_user(
-        &mut self,
+        &self,
         record: UserRecord,
     ) -> Result<(), String> {
         self.apply_committed(&Operation::InsertUser(record))
     }
 
     pub(crate) fn replay_revoke_user(
-        &mut self,
+        &self,
         token_hash: &str,
     ) -> Result<(), String> {
         self.apply_committed(&Operation::RevokeUser(token_hash.to_string()))
     }
 
     pub(crate) fn replay_create_index(
-        &mut self,
+        &self,
         def: IndexDef,
     ) -> Result<(), String> {
         self.apply_committed(&Operation::CreateIndex(def))
     }
 
     pub(crate) fn replay_drop_index(
-        &mut self,
+        &self,
         name: &str,
     ) -> Result<(), String> {
         self.apply_committed(&Operation::DropIndex(name.to_string()))
     }
 
+    pub(crate) fn replay_create_reference(
+        &self,
+        def: ReferenceDef,
+    ) -> Result<(), String> {
+        self.apply_committed(&Operation::CreateReference(def))
+    }
+
+    pub(crate) fn replay_drop_reference(
+        &self,
+        name: &str,
+    ) -> Result<(), String> {
+        self.apply_committed(&Operation::DropReference(name.to_string()))
+    }
+
+    pub(crate) fn replay_create_text_index(
+        &self,
+        def: TextIndexDef,
+    ) -> Result<(), String> {
+        self.apply_committed(&Operation::CreateTextIndex(def))
+    }
+
+    pub(crate) fn replay_drop_text_index(
+        &self,
+        name: &str,
+    ) -> Result<(), String> {
+        self.apply_committed(&Operation::DropTextIndex(name.to_string()))
+    }
+
     /// Note how far recovery replayed, so the checkpoint it takes
     /// afterwards moves the durability boundary across the work it just
     /// redid instead of leaving it to be redone again next time.
-    pub(crate) fn note_recovered(&mut self, sequence: u64) {
-        self.applied_sequence = self.applied_sequence.max(sequence);
+    pub(crate) fn note_recovered(&self, sequence: u64) {
+        self.applied_sequence.fetch_max(sequence, Ordering::Relaxed);
     }
 
     // ---------------------------------------------------------------------
@@ -738,6 +1092,11 @@ impl StorageEngine {
         // See `storage::lock`.
         crate::storage::lock::acquire()?;
 
+        // Starts the clock behind `uptime_seconds` and the first
+        // observation window. Here, because "up" means "has a database
+        // open", not "has served a request".
+        metrics::init();
+
         let catalog = Arc::new(Catalog::open()?);
         let store = RecordStore::open(Arc::clone(&catalog));
         let indexes = Indexes::open()?;
@@ -752,14 +1111,20 @@ impl StorageEngine {
             catalog,
             store,
             indexes,
+            references: References::new(),
             cache: RecordCache::new(),
-            users: HashMap::new(),
+            users: RwLock::new(HashMap::new()),
             reads_total: AtomicU64::new(0),
             writes_total: AtomicU64::new(0),
-            applied_sequence: 0,
-            pending_mutations: 0,
+            cells: CellTable::new(),
+            applied_sequence: AtomicU64::new(0),
+            pending_mutations: AtomicU64::new(0),
             checkpoint_interval,
-            user_log_records: 0,
+            user_log_records: AtomicUsize::new(0),
+            epoch: AtomicU64::new(1),
+            readers: Mutex::new(BTreeMap::new()),
+            retired: Mutex::new(Vec::new()),
+            writer: Mutex::new(()),
         })
     }
 
@@ -781,20 +1146,20 @@ impl StorageEngine {
     /// layer subsequently applies committed WAL operations through the
     /// replay_* methods without generating new WAL records.
     pub fn load() -> io::Result<Self> {
-        let mut engine = Self::open()?;
+        let engine = Self::open()?;
 
         let log = binary::read_all_records::<UserOpRecord>(&binary::users_path())?;
 
-        engine.user_log_records = log.len();
+        engine.user_log_records.store(log.len(), Ordering::Relaxed);
 
         for (_offset, record) in log {
             match record {
                 UserOpRecord::Put(user) => {
-                    engine.users.insert(user.token_hash.clone(), user);
+                    engine.users_write().insert(user.token_hash.clone(), user);
                 }
 
                 UserOpRecord::Revoke(token_hash) => {
-                    engine.users.remove(&token_hash);
+                    engine.users_write().remove(&token_hash);
                 }
             }
         }
@@ -831,6 +1196,51 @@ impl StorageEngine {
             engine.indexes.open_data(def)?;
         }
 
+        // Declared inverted indexes, replayed exactly the same way and
+        // for the same reason: an index the engine does not know about
+        // at the first write is an index that is silently missing rows
+        // from then on.
+        let declared = binary::read_all_records::<TextIndexOpRecord>(
+            &text::definitions_path(),
+        )?;
+
+        let mut definitions: HashMap<String, TextIndexDef> = HashMap::new();
+
+        for (_offset, record) in declared {
+            match record {
+                TextIndexOpRecord::Put(def) => {
+                    definitions.insert(def.name.clone(), def);
+                }
+
+                TextIndexOpRecord::Drop(name) => {
+                    definitions.remove(&name);
+                }
+            }
+        }
+
+        let mut definitions: Vec<TextIndexDef> = definitions.into_values().collect();
+        definitions.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for def in definitions {
+            engine.indexes.open_text(def)?;
+        }
+
+        // Declared references, replayed the same way and for a sharper
+        // version of the same reason: a delete applied without knowing
+        // about a reference does not merely leave an index stale, it
+        // leaves rows referencing a node that is gone — and nothing
+        // later will ever find them to clean up.
+        let declared = binary::read_all_records::<ReferenceOpRecord>(
+            &crate::storage::reference::definitions_path(),
+        )?;
+
+        for (_offset, record) in declared {
+            match record {
+                ReferenceOpRecord::Put(def) => engine.references.put(def),
+                ReferenceOpRecord::Drop(name) => engine.references.remove(&name),
+            }
+        }
+
         Ok(engine)
     }
 
@@ -848,19 +1258,11 @@ impl StorageEngine {
     /// A miss is ordinary and correct; the cache changes how long this
     /// takes and never what it returns.
     fn read_node(&self, address: &str) -> io::Result<Option<Node>> {
-        if let Some(node) = self.cache.get(address) {
-            return Ok(Some((*node).clone()));
-        }
-
         let Some(location) = self.node_location(address)? else {
             return Ok(None);
         };
 
-        let node = self.node_at(location)?;
-
-        self.cache.put(address, Arc::new(node.clone()));
-
-        Ok(Some(node))
+        Ok(Some(self.node_at(location)?))
     }
 
     fn node_location(&self, address: &str) -> io::Result<Option<RecordLocation>> {
@@ -870,9 +1272,31 @@ impl StorageEngine {
         }
     }
 
+    /// The node at one physical location, through the record cache.
+    ///
+    /// Every path that resolves an address to a location comes through
+    /// here, so the cache now serves the query paths too — before, only
+    /// the by-address read consulted it.
     fn node_at(&self, location: RecordLocation) -> io::Result<Node> {
+        // Per-cell read attribution happens here and only here, for the
+        // same reason `writes_total` is incremented in exactly one
+        // place: this is the funnel every path that turns an address
+        // into a record passes through, so no query plan can under-report
+        // a cell by forgetting to count. A cache hit is counted too — it
+        // is still a read of that cell's data, and a cell whose working
+        // set fits in cache is not a cell nobody is using.
+        if let Some(node) = self.cache.get(location) {
+            self.cells.record_read(node.coordinate, node.data.len() as u64);
+
+            return Ok((*node).clone());
+        }
+
         match self.store.read(location)? {
-            HeapRecord::Node(node) => Ok(node),
+            HeapRecord::Node(node) => {
+                self.cells.record_read(node.coordinate, node.data.len() as u64);
+                self.cache.put(location, Arc::new(node.clone()));
+                Ok(node)
+            }
             other => Err(mismatched_record("node", &other)),
         }
     }
@@ -892,10 +1316,6 @@ impl StorageEngine {
     }
 
     fn contains_node(&self, address: &str) -> io::Result<bool> {
-        if self.cache.get(address).is_some() {
-            return Ok(true);
-        }
-
         Ok(self.indexes.primary.get(address.as_bytes())?.is_some())
     }
 
@@ -915,7 +1335,25 @@ impl StorageEngine {
     /// overwrite is the canonical two-record case: `Archive` + `Insert`
     /// go into one frame, so a crash can never leave history claiming a
     /// value was superseded by a value that never landed.
-    pub fn insert(&mut self, node: Node) -> Result<(), String> {
+    pub fn insert(&self, node: Node) -> Result<(), String> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = {
+            let _writer = self.write_lock();
+
+            self.insert_locked(node)
+        };
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
+    }
+
+    /// The insert itself, for callers already holding the writer lock —
+    /// `claim` reserves a node by inserting it.
+    fn insert_locked(&self, node: Node) -> Result<(), String> {
         let mut operations = Vec::with_capacity(2);
 
         // Archive the previous value, staged immediately ahead of the
@@ -929,6 +1367,162 @@ impl StorageEngine {
         operations.push(Operation::Insert(node));
 
         self.apply_atomic(operations)
+    }
+
+    /// Read many nodes by address in one call.
+    ///
+    /// # Why this is a primitive and not a loop
+    ///
+    /// Rendering a page of a feed needs the viewer's own state for every
+    /// row on it — did I like this, did I repost it, do I follow the
+    /// author. Done one address at a time that is a round trip per row,
+    /// and the round trip dominates: twenty per-row reads measured 13.7 ms
+    /// against 0.93 ms for the same answers fetched together. The
+    /// Postgres implementation of this product writes the same thing as
+    /// `WHERE id = ANY($1::uuid[])` and issues exactly two queries per
+    /// page.
+    ///
+    /// Addresses that do not exist are skipped rather than reported: the
+    /// caller asked which of these exist, and a missing row is an answer,
+    /// not a failure. Addresses the caller may not read are skipped for
+    /// the same reason `query_where` filters them — a caller must not be
+    /// able to probe for the existence of a private node.
+    ///
+    /// Results come back in the order asked for, so a caller can zip them
+    /// against its own list without matching on address.
+    pub fn multi_get(
+        &self,
+        addresses: &[String],
+        requester: Option<&str>,
+    ) -> Result<Vec<Node>, String> {
+        if addresses.len() > MAX_MULTI_GET {
+            return Err(format!(
+                "multi-get asked for {} addresses; the maximum is \
+                 {MAX_MULTI_GET}. Each one is an index descent and a record \
+                 read, so the batch is bounded like any other scan.",
+                addresses.len(),
+            ));
+        }
+
+        self.reads_total.fetch_add(1, Ordering::Relaxed);
+
+        let mut found = Vec::with_capacity(addresses.len());
+
+        for address in addresses {
+            let Some(node) = self.read_node(address).map_err(io_message)? else {
+                continue;
+            };
+
+            let visible = match requester {
+                Some(owner) => node.can_read(owner),
+                None => true,
+            };
+
+            if visible {
+                found.push(node);
+            }
+        }
+
+        Ok(found)
+    }
+
+    /// Allocate the next `count` values of a named sequence.
+    ///
+    /// Returns the first value allocated; the caller owns
+    /// `[first, first + count)` and no other caller will ever be given
+    /// them.
+    ///
+    /// # Why the engine has to own this
+    ///
+    /// An application that allocates ids by asking "what is the largest
+    /// one so far" has to read every row to find out, and then two
+    /// callers that read at the same moment allocate the same id. The
+    /// fct runtime does exactly that: its `nextID` is a high-water mark
+    /// derived from loading every row of every table at boot, which is a
+    /// large part of why it holds the whole database in memory.
+    ///
+    /// A sequence is the standard answer and it is small: one durable
+    /// record per allocation, taken under the writer lock, so the read
+    /// and the increment cannot interleave.
+    ///
+    /// # Blocks
+    ///
+    /// `count` above one hands out a range in a single round trip. A
+    /// client inserting a thousand rows takes a thousand ids once rather
+    /// than paying a durable write per id — the same reason Postgres
+    /// sequences have a cache.
+    ///
+    /// Gaps are normal and are not an error: a caller that takes a block
+    /// and uses three of it has burned the rest. A sequence guarantees
+    /// uniqueness and monotonicity, never density.
+    pub fn sequence_next(
+        &self,
+        name: &str,
+        count: u64,
+        owner: &str,
+        is_admin: bool,
+    ) -> Result<u64, String> {
+        if count == 0 || count > MAX_SEQUENCE_BLOCK {
+            return Err(format!(
+                "sequence block must be between 1 and {MAX_SEQUENCE_BLOCK}, got {count}"
+            ));
+        }
+
+        if name.is_empty() || name.len() > MAX_SEQUENCE_NAME || name.contains(':') {
+            return Err(format!(
+                "sequence name must be 1..={MAX_SEQUENCE_NAME} characters and \
+                 contain no ':', got {name:?}"
+            ));
+        }
+
+        let address = format!("{SEQUENCE_KIND}:{name}");
+
+        let outcome = (|| {
+            let _writer = self.write_lock();
+
+            let previous = self.read_node(&address).map_err(io_message)?;
+
+            let start = match &previous {
+                Some(node) => {
+                    if !(is_admin || node.can_write(owner)) {
+                        return Err(format!(
+                            "not authorized to advance sequence {name:?}: it \
+                             belongs to another owner"
+                        ));
+                    }
+
+                    serde_json::from_str::<serde_json::Value>(&node.data)
+                        .ok()
+                        .and_then(|v| v.get("next").and_then(serde_json::Value::as_u64))
+                        .unwrap_or(1)
+                }
+                None => 1,
+            };
+
+            let next = start.checked_add(count).ok_or_else(|| {
+                format!("sequence {name:?} is exhausted at {start}")
+            })?;
+
+            let mut node = Node::new(
+                crate::core::coordinate::Coordinate::new(0, 0, 0, 0),
+                address.clone(),
+                SEQUENCE_KIND.to_string(),
+                previous
+                    .as_ref()
+                    .map(|n| n.owner.clone())
+                    .unwrap_or_else(|| owner.to_string()),
+            );
+
+            node.data = format!(r#"{{"next":{next}}}"#);
+
+            self.insert_locked(node)?;
+
+            Ok(start)
+        })();
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
     }
 
     /// Every archived previous state for `address`, oldest first.
@@ -986,27 +1580,39 @@ impl StorageEngine {
     /// the archive and the insert would leave the node *unclaimed* while
     /// history recorded that it had been superseded.
     pub fn claim(
-        &mut self,
+        &self,
         address: &str,
         worker: &str,
     ) -> Result<(), ClaimError> {
-        let mut node = match self
-            .read_node(address)
-            .map_err(|e| ClaimError::StorageError(e.to_string()))?
-        {
-            Some(node) => node,
-            None => return Err(ClaimError::NotFound),
-        };
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
 
-        if let Some(existing) = &node.claimed_by {
-            return Err(ClaimError::AlreadyClaimed(existing.clone()));
-        }
+            let mut node = match self
+                .read_node(address)
+                .map_err(|e| ClaimError::StorageError(e.to_string()))?
+            {
+                Some(node) => node,
+                None => return Err(ClaimError::NotFound),
+            };
 
-        node.claimed_by = Some(worker.to_string());
+            if let Some(existing) = &node.claimed_by {
+                return Err(ClaimError::AlreadyClaimed(existing.clone()));
+            }
 
-        self.insert(node).map_err(ClaimError::StorageError)?;
+            node.claimed_by = Some(worker.to_string());
 
-        Ok(())
+            self.insert_locked(node).map_err(ClaimError::StorageError)?;
+
+            Ok(())
+        })();
+
+        wal::sync_pending().map_err(|e| ClaimError::StorageError(e.to_string()))?;
+
+        outcome
     }
 
     // ---------------------------------------------------------------------
@@ -1033,16 +1639,51 @@ impl StorageEngine {
     /// The record bytes are not erased. The primary index stops pointing
     /// at them, which is what makes the node gone; compaction reclaims
     /// the space later.
-    pub fn delete(&mut self, address: &str) -> Result<(), String> {
-        let mut operations = Vec::with_capacity(2);
+    pub fn delete(&self, address: &str) -> Result<(), TransactionError> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
 
-        if let Some(existing) = self.read_node(address).map_err(io_message)? {
-            operations.push(Operation::Archive(HistoryEntry::now(existing)));
-        }
+            let existing = self
+                .read_node(address)
+                .map_err(|e| TransactionError::Storage(e.to_string()))?;
 
-        operations.push(Operation::Delete(address.to_string()));
+            let Some(existing) = existing else {
+                // Nothing there: nothing to archive, and nothing that
+                // could be referencing it either, since a reference
+                // resolves to a node. Stays a single no-op `Delete`.
+                return self
+                    .apply_atomic(vec![Operation::Delete(address.to_string())])
+                    .map_err(TransactionError::Storage);
+            };
 
-        self.apply_atomic(operations)
+            // Not "archive it and remove it" but "lower this delete",
+            // because what a delete means is now a property of the
+            // declared references rather than of this call site. With
+            // none declared this resolves to exactly the two operations
+            // it always did.
+            let mut operations = Vec::with_capacity(2);
+            let mut staged: HashMap<String, Option<Node>> = HashMap::new();
+
+            self.lower_delete_closure(
+                vec![existing],
+                &mut operations,
+                &mut staged,
+            )?;
+
+            // Every failure the closure could raise has been raised;
+            // what is left is the durable apply, whose only remaining
+            // failure mode is the storage itself.
+            self.apply_atomic(operations).map_err(TransactionError::Storage)
+        })();
+
+        wal::sync_pending()
+            .map_err(|e| TransactionError::Storage(e.to_string()))?;
+
+        outcome
     }
 
     /// Does one node fall inside a bulk-delete selection?
@@ -1257,25 +1898,37 @@ impl StorageEngine {
     ///
     /// One durable record, so this stays standalone under the rule in
     /// [`Self::apply_atomic`].
-    pub fn insert_edge(&mut self, edge: Edge) -> Result<(), String> {
-        if !self.contains_node(&edge.from).map_err(io_message)? {
-            return Err(format!("edge 'from' address not found: {}", edge.from));
-        }
+    pub fn insert_edge(&self, edge: Edge) -> Result<(), String> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
 
-        if !self.contains_node(&edge.to).map_err(io_message)? {
-            return Err(format!("edge 'to' address not found: {}", edge.to));
-        }
-
-        if let Some(existing) = self.find_edge(&edge.id()).map_err(io_message)? {
-            if existing.owner != edge.owner {
-                return Err(format!(
-                    "edge {} -[{}]-> {} is owned by {}",
-                    edge.from, edge.kind, edge.to, existing.owner
-                ));
+            if !self.contains_node(&edge.from).map_err(io_message)? {
+                return Err(format!("edge 'from' address not found: {}", edge.from));
             }
-        }
 
-        self.apply_atomic(vec![Operation::InsertEdge(edge)])
+            if !self.contains_node(&edge.to).map_err(io_message)? {
+                return Err(format!("edge 'to' address not found: {}", edge.to));
+            }
+
+            if let Some(existing) = self.find_edge(&edge.id()).map_err(io_message)? {
+                if existing.owner != edge.owner {
+                    return Err(format!(
+                        "edge {} -[{}]-> {} is owned by {}",
+                        edge.from, edge.kind, edge.to, existing.owner
+                    ));
+                }
+            }
+
+            self.apply_atomic(vec![Operation::InsertEdge(edge)])
+        })();
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
     }
 
     /// The live edge with this identity, or `None`.
@@ -1300,15 +1953,27 @@ impl StorageEngine {
     /// existed. Authorization is the caller's: this is the storage
     /// primitive, and the ownership check lives where the requester's
     /// identity does — the route, or `TxOperation::DeleteEdge`.
-    pub fn delete_edge(&mut self, id: &EdgeId) -> Result<(), String> {
-        if self.find_edge(id).map_err(io_message)?.is_none() {
-            return Err(format!(
-                "edge not found: {} -[{}]-> {}",
-                id.from, id.kind, id.to
-            ));
-        }
+    pub fn delete_edge(&self, id: &EdgeId) -> Result<(), String> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
 
-        self.apply_atomic(vec![Operation::DeleteEdge(id.clone())])
+            if self.find_edge(id).map_err(io_message)?.is_none() {
+                return Err(format!(
+                    "edge not found: {} -[{}]-> {}",
+                    id.from, id.kind, id.to
+                ));
+            }
+
+            self.apply_atomic(vec![Operation::DeleteEdge(id.clone())])
+        })();
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
     }
 
     /// Every edge leaving `address`.
@@ -1594,7 +2259,16 @@ impl StorageEngine {
             None => None,
         };
 
+        // Counted here because this is the single point every access
+        // path funnels its candidates through: a node reaches `matches`
+        // exactly when a plan has read it in order to decide about it.
+        // Counting inside each plan instead would count whatever each
+        // plan happened to think was worth counting.
+        let examined = std::cell::Cell::new(0u64);
+
         let matches = |node: &Node| -> Result<bool, String> {
+            examined.set(examined.get() + 1);
+
             if let Some(k) = kind {
                 if node.kind != k {
                     return Ok(false);
@@ -1625,53 +2299,649 @@ impl StorageEngine {
                 .map_err(|e| format!("predicate evaluation failed: {e}"))
         };
 
-        // Does the predicate pin an indexed field to one value? Then
-        // the answer lives under a single prefix of that index, and the
-        // rest of the kind never has to be read at all.
-        //
-        // Entries under one prefix are ordered by address — the value
-        // part of the key is identical for all of them — which is why
-        // this serves both orderings without a re-sort: it *is* address
-        // order, and it is also `(value, address)` order for the field
-        // it pins, because that value does not vary within the prefix.
+        // The plan runs inside a closure so every branch's page
+        // passes one exit, where the candidate count is attached to
+        // it. Five `return`s and five places to remember would be
+        // five chances for one plan to under-report what it read.
+        let mut page = (|| -> Result<QueryPage, String> {
+            // Does the predicate pin an indexed field to one value? Then
+            // the answer lives under a single prefix of that index, and the
+            // rest of the kind never has to be read at all.
+            //
+            // Entries under one prefix are ordered by address — the value
+            // part of the key is identical for all of them — which is why
+            // this serves both orderings without a re-sort: it *is* address
+            // order, and it is also `(value, address)` order for the field
+            // it pins, because that value does not vary within the prefix.
+            if let Some((index, literal)) =
+                self.equality_prefix_plan(kind, order_field, predicate, item_var)
+            {
+                return self.query_by_data_prefix(
+                    &index, &literal, cursor, desc, limit, offset, matches,
+                );
+            }
+
+            // Does the predicate pin an indexed *string* field to a prefix?
+            // Then the answer lives under a byte prefix of that index.
+            //
+            // Unlike the equality case this is only sound when the ordering
+            // is that same field: entries under a string prefix vary in
+            // value, so their order is `(value, address)` and not address
+            // order. Asking for address order and being handed value order
+            // would be a wrong answer that looks like a right one.
+            if let Some((index, literal)) =
+                self.string_prefix_plan(kind, order_field, predicate, item_var)
+            {
+                let prefix = keys::encode_string_prefix(&literal);
+
+                return self.query_by_key_prefix(
+                    &index, prefix, cursor, desc, limit, offset, matches,
+                );
+            }
+
+            // Does the predicate require a substring of a field an
+            // inverted index covers? Then the rows that can possibly
+            // match are the intersection of that substring's trigram
+            // postings — a superset of the answer, never a subset, so
+            // `matches` still decides every row (see
+            // `text_candidate_plan`).
+            //
+            // Only for the address ordering here. The candidate set
+            // arrives sorted by address, which *is* the contract when no
+            // `order` was asked for; any other ordering needs these rows
+            // sorted by a field the postings say nothing about, so it
+            // goes to `query_sorted` below, which takes the same
+            // candidates as its enumeration source.
+            if order_field.is_none()
+                && let Some(candidates) = self
+                    .text_candidate_plan(kind, predicate, item_var)
+                    .map_err(io_message)?
+            {
+                return self.query_by_text(
+                    candidates, cursor, desc, limit, offset, matches,
+                );
+            }
+
+            if order_field.is_none() {
+                return self.query_by_address(
+                    kind, owner, cursor, desc, limit, offset, matches,
+                );
+            }
+
+            // An index over exactly this `(kind, field)` turns the sort into
+            // a range scan: the entries are already in `(value, address)`
+            // order, so the page is read by walking from the cursor and
+            // stopping at `limit`. Nothing outside the page is read, and the
+            // `max_scan_rows` refusal below never comes up — which is the
+            // whole reason to declare one.
+            if let (Some(k), Some(field)) = (kind, order_field)
+                && self.indexes.data_find(k, field).is_some()
+            {
+                return self.query_by_data_index(
+                    k, field, cursor, desc, limit, offset, matches,
+                );
+            }
+
+            // The sorted path enumerates through the narrowest source
+            // it has. An equality prefix is narrower than a trigram
+            // intersection — it selects on a whole value rather than on
+            // windows of one — so it wins when both apply, and the
+            // postings are only resolved when it does not.
+            let text_candidates =
+                match self.equality_selection(kind, predicate, item_var) {
+                    Some(_) => None,
+                    None => self
+                        .text_candidate_plan(kind, predicate, item_var)
+                        .map_err(io_message)?,
+                };
+
+            self.query_sorted(
+                kind,
+                owner,
+                order_field,
+                cursor,
+                desc,
+                limit,
+                offset,
+                predicate,
+                item_var,
+                text_candidates,
+                matches,
+            )
+        })()?;
+
+        page.examined = examined.get();
+
+        Ok(page)
+    }
+
+    /// How many nodes match — without materializing any of them.
+    ///
+    /// The same `kind`/`owner`/visibility filtering and the same pushable
+    /// predicate as [`Self::query_where`], answered as a number.
+    ///
+    /// # Why this exists rather than "query and count the rows"
+    ///
+    /// A caller that wants a count and only has a paged read has two bad
+    /// options: ask for one enormous page, which is the allocation
+    /// `max_scan_rows` exists to refuse, or walk the cursor to the end,
+    /// which is one network round trip per page and turns "how many
+    /// replies does this post have" into an N+1 across the wire. Both are
+    /// worse than the scan they are avoiding. `SELECT count(*)` is a
+    /// primitive in every database for the same reason.
+    ///
+    /// # Why it is not bounded by `max_scan_rows`
+    ///
+    /// That bound exists because a *result set* is held in memory, and
+    /// the size of the answer is chosen by the data rather than by the
+    /// request. A count holds one integer no matter how many rows it
+    /// visits, so the reason does not apply. What it does cost is time
+    /// proportional to the candidates, and time is bounded elsewhere and
+    /// deliberately — the per-request deadline and the per-identity rate
+    /// limit on the `bulk` endpoint class (see `api::limits`). Refusing a
+    /// count because a kind is large would make `count(Post)` fail on
+    /// exactly the databases where the number is most worth having.
+    ///
+    /// # The three access paths, cheapest first
+    ///
+    /// 1. **Index keys only.** With no predicate and no visibility
+    ///    filtering, the answer is how many entries the `kind` (or
+    ///    `owner`) index holds under its prefix. No record is read and no
+    ///    JSON is decoded — the count costs the index range and nothing
+    ///    else.
+    /// 2. **An equality prefix**, when the predicate pins a field a
+    ///    declared index covers: only the entries holding that value are
+    ///    walked, so a count over fifty matches in a million-row kind
+    ///    costs the fifty.
+    /// 3. **The candidate scan**, the general case: the narrowest index
+    ///    the filters allow, decoding each candidate to test it.
+    pub fn count_where(
+        &self,
+        kind: Option<&str>,
+        owner: Option<&str>,
+        requester: Option<&str>,
+        predicate: Option<&Expr>,
+        item_var: &str,
+    ) -> Result<u64, String> {
+        self.reads_total.fetch_add(1, Ordering::Relaxed);
+
+        let matches = |node: &Node| -> Result<bool, String> {
+            if let Some(k) = kind
+                && node.kind != k
+            {
+                return Ok(false);
+            }
+
+            if let Some(o) = owner
+                && node.owner != o
+            {
+                return Ok(false);
+            }
+
+            if let Some(r) = requester
+                && !node.can_read(r)
+            {
+                return Ok(false);
+            }
+
+            let Some(expr) = predicate else {
+                return Ok(true);
+            };
+
+            let data: serde_json::Value =
+                serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
+
+            predicate::eval(expr, item_var, &data)
+                .map(|v| matches!(v, serde_json::Value::Bool(true)))
+                .map_err(|e| format!("predicate evaluation failed: {e}"))
+        };
+
+        // Path 1: nothing to test per row, so nothing has to be read. The
+        // membership index already knows the answer.
+        if predicate.is_none()
+            && requester.is_none()
+            && let Some((index, prefix)) = match (kind, owner) {
+                (Some(k), None) => Some((&self.indexes.kind, keys::kind_prefix(k))),
+                (None, Some(o)) => Some((&self.indexes.owner, keys::owner_prefix(o))),
+                _ => None,
+            }
+        {
+            let mut total = 0u64;
+
+            index
+                .for_each_range(&prefix, None, false, |_key, _value| {
+                    total += 1;
+                    Ok(true)
+                })
+                .map_err(io_message)?;
+
+            return Ok(total);
+        }
+
+        let mut total = 0u64;
+        let mut failure: Option<String> = None;
+
+        // Path 2: the predicate pins an indexed field. `None` for the
+        // ordering, because a count has no order to preserve — any access
+        // path that visits each matching row exactly once will do.
         if let Some((index, literal)) =
-            self.equality_prefix_plan(kind, order_field, predicate, item_var)
+            self.equality_prefix_plan(kind, None, predicate, item_var)
         {
-            return self.query_by_data_prefix(
-                index, &literal, cursor, desc, limit, offset, matches,
-            );
+            let prefix = keys::encode_order_value(Some(&literal));
+
+            index
+                .tree
+                .for_each_range(&prefix, None, false, |key, _value| {
+                    let Some(raw) = keys::address_from_data_key(key) else {
+                        return Ok(true);
+                    };
+
+                    let address = String::from_utf8_lossy(raw).into_owned();
+
+                    let Some(node) = self.read_node(&address)? else {
+                        return Ok(true);
+                    };
+
+                    match matches(&node) {
+                        Ok(true) => total += 1,
+                        Ok(false) => {}
+                        Err(e) => {
+                            failure = Some(e);
+                            return Ok(false);
+                        }
+                    }
+
+                    Ok(true)
+                })
+                .map_err(io_message)?;
+
+            return match failure {
+                Some(e) => Err(e),
+                None => Ok(total),
+            };
         }
 
-        if order_field.is_none() {
-            return self.query_by_address(
-                kind, owner, cursor, desc, limit, offset, matches,
-            );
-        }
-
-        // An index over exactly this `(kind, field)` turns the sort into
-        // a range scan: the entries are already in `(value, address)`
-        // order, so the page is read by walking from the cursor and
-        // stopping at `limit`. Nothing outside the page is read, and the
-        // `max_scan_rows` refusal below never comes up — which is the
-        // whole reason to declare one.
-        if let (Some(k), Some(field)) = (kind, order_field)
-            && self.indexes.data_find(k, field).is_some()
+        // Path 2b: the predicate requires a substring an inverted index
+        // covers. The postings hand back a superset of the matching
+        // rows, so the count reads those and lets `matches` decide —
+        // the same access path and the same guarantee `query_where`
+        // gets, which is what keeps a count and its query agreeing.
+        if let Some(candidates) = self
+            .text_candidate_plan(kind, predicate, item_var)
+            .map_err(io_message)?
         {
-            return self.query_by_data_index(
-                k, field, cursor, desc, limit, offset, matches,
-            );
+            for address in &candidates {
+                let Some(node) = self.read_node(address).map_err(io_message)?
+                else {
+                    continue;
+                };
+
+                match matches(&node) {
+                    Ok(true) => total += 1,
+                    Ok(false) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
+            return Ok(total);
         }
 
-        self.query_sorted(
-            kind,
-            owner,
-            order_field,
-            cursor,
-            desc,
-            limit,
-            offset,
-            matches,
-        )
+        // Path 3: the general scan.
+        self.scan_candidates(kind, owner, None, false, |node| {
+            match matches(&node) {
+                Ok(true) => total += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    failure = Some(e);
+                    return Ok(false);
+                }
+            }
+
+            Ok(true)
+        })
+        .map_err(io_message)?;
+
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
+    }
+
+    /// Every distinct value of one `data` field, with how many nodes
+    /// carry it.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Self::count_where`] answers one question per call, which is
+    /// wrong for the shape that asks it most. A feed rendering twenty
+    /// posts, each showing its like/reply/repost totals, is sixty counts
+    /// — sixty round trips, sixty rate-limit tokens, and sixty scans —
+    /// to fill in numbers that all come from the same three predicates
+    /// with one field varying. That is an N+1, and moving it from SQL to
+    /// HTTP does not stop it being one.
+    ///
+    /// Grouping is the fix: one call per *predicate shape* per page
+    /// instead of one per row. The caller asks "how many Likes per
+    /// tweet" once and indexes the answer itself.
+    ///
+    /// # Why this one IS bounded by `max_scan_rows`
+    ///
+    /// Unlike a plain count, the answer here is a result set whose size
+    /// the data chooses — one entry per distinct value — so the reason
+    /// that bound exists applies in full. A group-by over a field that
+    /// is nearly unique is a request for a copy of the table with the
+    /// rows replaced by ones. Refusing is recoverable; a multi-gigabyte
+    /// map is not.
+    ///
+    /// # The two access paths
+    ///
+    /// With a declared index over the grouped field, and nothing that
+    /// needs a record to decide — no predicate, no visibility filtering
+    /// — the index keys already carry the value: entries sharing a value
+    /// are adjacent, so the counting is a walk of the index and the only
+    /// records read are **one per distinct group**, to recover the value
+    /// in its own JSON type. Otherwise every candidate is decoded, which
+    /// is the same cost as the scan the caller was going to do anyway,
+    /// paid once instead of once per row.
+    ///
+    /// # One entry per value
+    ///
+    /// The reply holds **at most one entry per distinct value**, on
+    /// every path. A caller indexes this answer by value — fct's reads
+    /// it straight into a map — so a second entry for a value is not a
+    /// redundancy it can merge, it is a count it silently drops.
+    ///
+    /// That is why the index path accumulates its runs through the same
+    /// grouping the scan uses instead of emitting one entry per run: a
+    /// run whose representative record was deleted underneath the walk
+    /// cannot name its value, and two such runs would otherwise both be
+    /// reported as `null`. They are counted under `null` alongside the
+    /// rows that genuinely carry no value there — the same bucket the
+    /// scan path puts those in, and the only choice that keeps the
+    /// groups summing to the count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn count_by(
+        &self,
+        kind: Option<&str>,
+        owner: Option<&str>,
+        requester: Option<&str>,
+        predicate: Option<&Expr>,
+        item_var: &str,
+        group_by: &str,
+        values: Option<&[serde_json::Value]>,
+    ) -> Result<Vec<GroupCount>, String> {
+        self.reads_total.fetch_add(1, Ordering::Relaxed);
+
+        let cap = max_scan_rows();
+
+        // Groups are accumulated under the field value's order-preserving
+        // encoding rather than under the value itself, for the same
+        // reason the index is keyed that way: a JSON value is not
+        // hashable and its text form is not canonical, while this
+        // encoding is exactly one byte string per distinct value and is
+        // already what "the same value" means everywhere else here.
+        let mut groups: HashMap<Vec<u8>, GroupCount> = HashMap::new();
+
+        let mut note = |value: Option<&serde_json::Value>,
+                        by: u64|
+         -> Result<(), String> {
+            let key = keys::encode_order_value(value);
+
+            match groups.get_mut(&key) {
+                Some(entry) => entry.count += by,
+                None => {
+                    if groups.len() >= cap {
+                        return Err(scan_limit_exceeded(
+                            "grouping by a field with this many distinct values",
+                        )
+                        .to_string());
+                    }
+
+                    groups.insert(
+                        key,
+                        GroupCount {
+                            value: value.cloned(),
+                            count: by,
+                        },
+                    );
+                }
+            }
+
+            Ok(())
+        };
+
+        // Whichever path filled `groups`, the answer leaves through
+        // here. Two paths that each shaped their own reply is how they
+        // came to disagree about what a well-formed one is, so the
+        // completion and the ordering are written once.
+        let finish = |mut groups: HashMap<Vec<u8>, GroupCount>| -> Vec<GroupCount> {
+            // A requested value with no matching row still gets an
+            // entry: the caller asked about it, so "no rows" is an
+            // answer, and an absent key would be indistinguishable from
+            // one the engine forgot.
+            if let Some(wanted) = values {
+                for value in wanted {
+                    groups
+                        .entry(keys::encode_order_value(Some(value)))
+                        .or_insert_with(|| GroupCount {
+                            value: Some(value.clone()),
+                            count: 0,
+                        });
+                }
+            }
+
+            // Sorted so the reply is deterministic — a caller diffing
+            // two samples, or a test asserting one, should not be
+            // reading hash iteration order.
+            let mut out: Vec<GroupCount> = groups.into_values().collect();
+
+            out.sort_by(|a, b| {
+                keys::compare_order_values(a.value.as_ref(), b.value.as_ref())
+            });
+
+            out
+        };
+
+        // The caller named the values it cares about, an index covers the
+        // field, and nothing needs a record to decide — so each answer is
+        // the length of one prefix range and NO record is read at all.
+        //
+        // This is the shape that motivated the whole endpoint, and
+        // measuring it is what showed the unrestricted form is the wrong
+        // tool for it: a feed rendering twenty posts wants twenty counts,
+        // and grouping the whole kind to get them computed twenty
+        // thousand. One call, twenty prefix walks, nothing decoded.
+        if let Some(wanted) = values {
+            if wanted.len() > MAX_GROUP_VALUES {
+                return Err(format!(
+                    "count_by was given {} values; the maximum is \
+                     {MAX_GROUP_VALUES}. Ask for the values a page actually \
+                     renders, or omit `values` to group the whole kind.",
+                    wanted.len()
+                ));
+            }
+
+            if predicate.is_none()
+                && requester.is_none()
+                && owner.is_none()
+                && let Some(k) = kind
+                && let Some(index) = self.indexes.data_find(k, group_by)
+            {
+                let mut answered: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::with_capacity(wanted.len());
+
+                for value in wanted {
+                    let prefix = keys::encode_order_value(Some(value));
+
+                    // The same value named twice is one question. Walking
+                    // its range again would answer it with twice the rows
+                    // — and `1` and `1.0` are the same question here, for
+                    // the same reason they are one key in the index.
+                    if !answered.insert(prefix.clone()) {
+                        continue;
+                    }
+
+                    let mut count = 0u64;
+
+                    index
+                        .tree
+                        .for_each_range(&prefix, None, false, |_key, _value| {
+                            count += 1;
+                            Ok(true)
+                        })
+                        .map_err(io_message)?;
+
+                    // Every requested value comes back, zero included: the
+                    // caller asked about it, so "no rows" is an answer and
+                    // an absent key would be indistinguishable from one
+                    // the engine forgot.
+                    note(Some(value), count)?;
+                }
+
+                return Ok(finish(groups));
+            }
+        }
+
+        // The index path: adjacency in the index *is* the grouping, so
+        // the walk never reads a record to decide which group an entry
+        // belongs to — only once per group, to recover the value.
+        if predicate.is_none()
+            && requester.is_none()
+            && owner.is_none()
+            && let Some(k) = kind
+            && let Some(index) = self.indexes.data_find(k, group_by)
+        {
+            let mut runs: Vec<(Vec<u8>, String, u64)> = Vec::new();
+
+            index
+                .tree
+                .for_each_range(&[], None, false, |key, _value| {
+                    let Some(raw) = keys::address_from_data_key(key) else {
+                        return Ok(true);
+                    };
+
+                    // Everything before the address is the encoded value.
+                    let encoded = key[..key.len() - raw.len()].to_vec();
+
+                    match runs.last_mut() {
+                        Some((last, _, count)) if *last == encoded => *count += 1,
+                        _ => {
+                            if runs.len() >= cap {
+                                return Err(scan_limit_exceeded(
+                                    "grouping by a field with this many distinct values",
+                                ));
+                            }
+
+                            runs.push((
+                                encoded,
+                                String::from_utf8_lossy(raw).into_owned(),
+                                1,
+                            ));
+                        }
+                    }
+
+                    Ok(true)
+                })
+                .map_err(io_message)?;
+
+            for (_encoded, representative, count) in runs {
+                // One read per group, purely to recover the value with
+                // its JSON type intact. A representative deleted since
+                // the walk leaves its run unable to name itself: those
+                // rows were read, so they are counted under `null`
+                // rather than dropped, which is where a row with no
+                // value for the field lands anyway.
+                let value = match self.read_node(&representative).map_err(io_message)? {
+                    Some(node) => serde_json::from_str::<serde_json::Value>(&node.data)
+                        .ok()
+                        .and_then(|d| d.get(group_by).cloned()),
+                    None => None,
+                };
+
+                // Through the accumulator the scan path uses, not into a
+                // vector of its own: runs are distinct by encoded key,
+                // but the values they recover need not be, and a second
+                // entry for a value is a count the caller loses.
+                note(value.as_ref(), count)?;
+            }
+
+            return Ok(finish(groups));
+        }
+
+        let matches = |node: &Node| -> Result<bool, String> {
+            if let Some(k) = kind
+                && node.kind != k
+            {
+                return Ok(false);
+            }
+
+            if let Some(o) = owner
+                && node.owner != o
+            {
+                return Ok(false);
+            }
+
+            if let Some(r) = requester
+                && !node.can_read(r)
+            {
+                return Ok(false);
+            }
+
+            let Some(expr) = predicate else {
+                return Ok(true);
+            };
+
+            let data: serde_json::Value =
+                serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
+
+            predicate::eval(expr, item_var, &data)
+                .map(|v| matches!(v, serde_json::Value::Bool(true)))
+                .map_err(|e| format!("predicate evaluation failed: {e}"))
+        };
+
+        let mut failure: Option<String> = None;
+
+        self.scan_candidates(kind, owner, None, false, |node| {
+            match matches(&node) {
+                Ok(true) => {}
+                Ok(false) => return Ok(true),
+                Err(e) => {
+                    failure = Some(e);
+                    return Ok(false);
+                }
+            }
+
+            let data: serde_json::Value =
+                serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
+
+            let value = data.get(group_by);
+
+            // With `values` given, everything outside the asked-for set is
+            // not a group the caller wanted — counting it would make the
+            // reply an answer to a different question.
+            if let Some(wanted) = values
+                && !wanted.iter().any(|w| {
+                    keys::compare_order_values(Some(w), value)
+                        == std::cmp::Ordering::Equal
+                })
+            {
+                return Ok(true);
+            }
+
+            if let Err(e) = note(value, 1) {
+                failure = Some(e);
+                return Ok(false);
+            }
+
+            Ok(true)
+        })
+        .map_err(io_message)?;
+
+        if let Some(e) = failure {
+            return Err(e);
+        }
+
+        Ok(finish(groups))
     }
 
     /// The index-ordered page: walk the access path from the cursor and
@@ -1744,7 +3014,302 @@ impl StorageEngine {
             _ => String::new(),
         };
 
-        Ok(QueryPage { nodes, next })
+        Ok(QueryPage { nodes, next, examined: 0 })
+    }
+
+    /// The rows a substring predicate can possibly match, from an
+    /// inverted index — or `None`, meaning "no index serves this, use
+    /// the scan".
+    ///
+    /// # The correctness claim, stated once
+    ///
+    /// The returned addresses are a **superset** of the rows the scan
+    /// would return, never a subset. That is not a hope about the
+    /// tokenizer, it follows from one property of trigrams: if
+    /// `v.contains(s)` then every trigram of `s` is a trigram of `v`
+    /// ([`crate::storage::text`] proves it directly). So the
+    /// intersection of the needle's posting lists contains every true
+    /// match, plus rows where the trigrams occur scattered rather than
+    /// adjacent. Those are removed by the caller's `matches` closure,
+    /// which evaluates the *whole* original predicate on every candidate
+    /// exactly as every other access path does.
+    ///
+    /// Everything this function does to bound its own cost — trying only
+    /// a few trigrams as the seed, probing only some of the rest, giving
+    /// up on a probe budget — drops trigrams from the intersection, and
+    /// dropping a trigram can only make the candidate set *larger*. So
+    /// no tuning decision in here can turn a superset into a subset, and
+    /// none of them can change the query's answer.
+    ///
+    /// # When it declines
+    ///
+    /// * no `kind` (the index is per-kind), or no predicate;
+    /// * no inverted index over a field the predicate constrains;
+    /// * every literal shorter than one trigram — `contains(x, "hi")`
+    ///   has no window to look up, so there is nothing to intersect;
+    /// * every candidate trigram's posting list is longer than
+    ///   [`max_scan_rows`] — the substring is so common that the index
+    ///   is not narrowing anything, and the scan is the honest path.
+    ///
+    /// Declining is always safe: it costs a scan, which is what the
+    /// query cost before this index existed.
+    fn text_candidate_plan(
+        &self,
+        kind: Option<&str>,
+        predicate: Option<&Expr>,
+        item_var: &str,
+    ) -> io::Result<Option<Vec<String>>> {
+        let (Some(kind), Some(predicate)) = (kind, predicate) else {
+            return Ok(None);
+        };
+
+        // Name order, so a database with two applicable inverted indexes
+        // plans the same way on every request rather than following hash
+        // iteration order.
+        for index in self.indexes.text_all() {
+            if index.def.kind != kind {
+                continue;
+            }
+
+            let literals =
+                predicate::substring_literals(predicate, item_var, &index.def.field);
+
+            if literals.is_empty() {
+                continue;
+            }
+
+            // Every literal is a requirement, so every literal's trigrams
+            // are required: the union of their windows is the set the
+            // postings have to agree on.
+            let mut grams: Vec<[u8; text::GRAM_LEN]> = literals
+                .iter()
+                .flat_map(|literal| text::grams(literal))
+                .collect();
+
+            grams.sort_unstable();
+            grams.dedup();
+
+            if grams.is_empty() {
+                continue;
+            }
+
+            if let Some(candidates) = self.text_candidates(&index, &grams)? {
+                return Ok(Some(candidates));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Intersect posting lists: read the rarest trigram's list, then
+    /// probe the others against it.
+    ///
+    /// Seeding from the smallest list and probing the rest — rather than
+    /// reading every list and intersecting — is what keeps the cost
+    /// proportional to the *answer* instead of to the most common
+    /// trigram in the needle. `"the quick brown fox"` contains `"the"`,
+    /// whose list is most of the corpus, and `"qui"`, whose list is
+    /// tiny; reading the tiny one and asking the tree eleven questions
+    /// about each survivor is the difference between the two.
+    ///
+    /// Returns `None` when no trigram's list was small enough to seed
+    /// from, which is the planner's signal to use the scan.
+    fn text_candidates(
+        &self,
+        index: &TextIndex,
+        grams: &[[u8; text::GRAM_LEN]],
+    ) -> io::Result<Option<Vec<String>>> {
+        let cap = max_scan_rows();
+
+        // The seed: a short posting list among the first few trigrams.
+        //
+        // Three bounds, and each one is a cost bound rather than a
+        // correctness one. Each attempt stops as soon as it is longer
+        // than the best already found, so a rare trigram found early
+        // makes the rest of the hunt nearly free. The hunt as a whole
+        // stops at the first list short enough that a better seed could
+        // not repay the reading. And `budget` caps what the hunt may
+        // read in total, so a needle made entirely of common trigrams
+        // gives up and lets the scan answer instead of paying several
+        // scans' worth of index reads to discover that it cannot help.
+        let mut best: Option<BTreeSet<String>> = None;
+        let mut best_len = cap;
+        let mut budget = cap;
+
+        for gram in grams.iter().take(MAX_TEXT_SEED_GRAMS) {
+            let limit = best_len.min(budget);
+
+            if limit == 0 {
+                break;
+            }
+
+            let mut list: BTreeSet<String> = BTreeSet::new();
+            let mut read = 0usize;
+            let mut over = false;
+
+            index.tree.for_each_range(&gram[..], None, false, |key, _value| {
+                if read >= limit {
+                    over = true;
+                    return Ok(false);
+                }
+
+                read += 1;
+
+                if let Some(raw) = text::address_from_key(key) {
+                    list.insert(String::from_utf8_lossy(raw).into_owned());
+                }
+
+                Ok(true)
+            })?;
+
+            budget -= read;
+
+            if over {
+                continue;
+            }
+
+            best_len = list.len();
+            best = Some(list);
+
+            // Nothing holds this trigram, so nothing holds the needle:
+            // no later trigram can improve on an empty intersection. And
+            // a list already short enough is not worth improving on.
+            if best_len <= MAX_TEXT_SEED_ENOUGH {
+                break;
+            }
+        }
+
+        let Some(mut candidates) = best else {
+            return Ok(None);
+        };
+
+        // The refinement: every remaining trigram must also be present,
+        // asked one candidate at a time. `budget` is what stops an
+        // unselective query from paying for probes that are not removing
+        // anything — abandoning them leaves a wider candidate set, which
+        // is still a superset.
+        let mut budget = cap;
+
+        for gram in grams.iter().take(MAX_TEXT_PROBE_GRAMS) {
+            if candidates.len() <= MAX_TEXT_PROBE_FLOOR
+                || budget < candidates.len()
+            {
+                break;
+            }
+
+            budget -= candidates.len();
+
+            let mut kept: BTreeSet<String> = BTreeSet::new();
+
+            for address in &candidates {
+                if index.tree.get(&text::key(gram, address))?.is_some() {
+                    kept.insert(address.clone());
+                }
+            }
+
+            candidates = kept;
+        }
+
+        // A `BTreeSet<String>` orders by the address bytes, which is the
+        // order the `kind` index walks in — so this list *is* address
+        // order, and the address-ordered plan can page through it
+        // without sorting anything.
+        Ok(Some(candidates.into_iter().collect()))
+    }
+
+    /// The page over an inverted index's candidates, in address order.
+    ///
+    /// The counterpart of [`Self::query_by_address`] for a substring
+    /// search: same contract, same cursor shape, same `matches` filter —
+    /// the only difference is that the candidates came from posting
+    /// lists rather than from a walk of the whole kind. A cursor issued
+    /// here is exactly one [`Self::query_by_address`] would issue, so
+    /// dropping the index mid-page leaves an outstanding cursor valid.
+    #[allow(clippy::too_many_arguments)]
+    fn query_by_text<F>(
+        &self,
+        candidates: Vec<String>,
+        cursor: Option<Cursor>,
+        desc: bool,
+        limit: usize,
+        offset: usize,
+        matches: F,
+    ) -> Result<QueryPage, String>
+    where
+        F: Fn(&Node) -> Result<bool, String>,
+    {
+        let start_after = cursor.as_ref().map(|c| c.a.as_str());
+
+        // As in `query_by_address`: a cursor supersedes `offset`.
+        let to_skip = if start_after.is_some() { 0 } else { offset };
+
+        // The candidates are ascending, so resuming past the cursor is a
+        // binary search rather than a walk — which is what keeps a deep
+        // page from re-reading the shallow ones.
+        let slice: &[String] = match start_after {
+            Some(after) if desc => {
+                &candidates[..candidates.partition_point(|a| a.as_str() < after)]
+            }
+            Some(after) => {
+                &candidates[candidates.partition_point(|a| a.as_str() <= after)..]
+            }
+            None => &candidates[..],
+        };
+
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut skipped = 0usize;
+        let mut more = false;
+
+        let mut visit = |address: &String| -> Result<bool, String> {
+            // A candidate whose record is gone is not an error: the
+            // posting outlives the row only inside this one plan, and
+            // every other access path skips a missing record the same
+            // way.
+            let Some(node) = self.read_node(address).map_err(io_message)? else {
+                return Ok(true);
+            };
+
+            if !matches(&node)? {
+                return Ok(true);
+            }
+
+            if skipped < to_skip {
+                skipped += 1;
+                return Ok(true);
+            }
+
+            if nodes.len() == limit {
+                // One row past the page: proof that a next cursor is
+                // worth emitting, and the last row this plan reads.
+                more = true;
+                return Ok(false);
+            }
+
+            nodes.push(node);
+
+            Ok(true)
+        };
+
+        if desc {
+            for address in slice.iter().rev() {
+                if !visit(address)? {
+                    break;
+                }
+            }
+        } else {
+            for address in slice.iter() {
+                if !visit(address)? {
+                    break;
+                }
+            }
+        }
+
+        let next = match nodes.last() {
+            Some(last) if more => Cursor::from_node(last, None).encode(),
+            _ => String::new(),
+        };
+
+        Ok(QueryPage { nodes, next, examined: 0 })
     }
 
     /// Pick a declared index whose field the predicate pins to a single
@@ -1766,17 +3331,75 @@ impl StorageEngine {
         order_field: Option<&str>,
         predicate: Option<&Expr>,
         item_var: &str,
-    ) -> Option<(&crate::storage::index::DataIndex, serde_json::Value)> {
+    ) -> Option<(std::sync::Arc<crate::storage::index::DataIndex>, serde_json::Value)> {
+        let (index, literal) = self.equality_selection(kind, predicate, item_var)?;
+
+        // The prefix has to serve the *ordering* as well as the
+        // selection, which it does only when the ordering is absent (the
+        // contract is then address order, and entries under one prefix
+        // are in address order) or is the pinned field itself (every row
+        // in the prefix shares that value, so the tiebreak is the whole
+        // ordering). Any other ordering needs these rows sorted by a
+        // field this prefix does not vary — see `query_sorted`, which
+        // uses the selection without the ordering claim.
+        match order_field {
+            None => Some((index, literal)),
+            Some(order) if order == index.def.field => Some((index, literal)),
+            Some(_) => None,
+        }
+    }
+
+    /// The narrowest index that can *enumerate* the rows a predicate
+    /// admits, with no claim about what order they come out in.
+    ///
+    /// Separating this from [`Self::equality_prefix_plan`] is what lets a
+    /// query select through an index and still be ordered by something
+    /// else. Conflating them cost exactly that: with `idx_Tweet_author`
+    /// declared, `where author == 'u7'` took 2.4 ms unordered and
+    /// **1.83 s** ordered by `created`, because the ordering disqualified
+    /// the index for selection too and the query fell back to reading all
+    /// fifty thousand rows of the kind. Selecting a hundred rows through
+    /// the index and sorting those is what any planner does, and is the
+    /// difference between the two numbers.
+    /// The declared index and prefix serving a `starts_with`, if one
+    /// applies.
+    ///
+    /// Requires the ordering to be the pinned field itself. A prefix of a
+    /// string index is a range whose entries are ordered by value, so it
+    /// satisfies `order by <that field>` exactly and satisfies nothing
+    /// else — including the absent ordering, whose contract is address
+    /// order. This is the same distinction that made the equality plan
+    /// wrong once: an index that serves the *selection* does not
+    /// automatically serve the *ordering*, and conflating the two is how
+    /// a query comes back fast and in the wrong order.
+    fn string_prefix_plan(
+        &self,
+        kind: Option<&str>,
+        order_field: Option<&str>,
+        predicate: Option<&Expr>,
+        item_var: &str,
+    ) -> Option<(std::sync::Arc<crate::storage::index::DataIndex>, String)> {
+        let kind = kind?;
+        let predicate = predicate?;
+        let order = order_field?;
+
+        let index = self.indexes.data_find(kind, order)?;
+        let literal = predicate::prefix_literal(predicate, item_var, &index.def.field)?;
+
+        Some((index, literal))
+    }
+
+    fn equality_selection(
+        &self,
+        kind: Option<&str>,
+        predicate: Option<&Expr>,
+        item_var: &str,
+    ) -> Option<(std::sync::Arc<crate::storage::index::DataIndex>, serde_json::Value)> {
         let kind = kind?;
         let predicate = predicate?;
 
         for index in self.indexes.data_all() {
-            if index.def.kind != kind {
-                continue;
-            }
-
-            if let Some(order) = order_field
-                && order != index.def.field
+            if index.def.kind != kind
             {
                 continue;
             }
@@ -1814,11 +3437,39 @@ impl StorageEngine {
     {
         let prefix = keys::encode_order_value(Some(literal));
 
-        let after = cursor.as_ref().map(|c| {
-            let mut key = prefix.clone();
-            key.extend_from_slice(c.a.as_bytes());
-            key
-        });
+        self.query_by_key_prefix(index, prefix, cursor, desc, limit, offset, matches)
+    }
+
+    /// The page under one raw key prefix of one declared index.
+    ///
+    /// Split from [`Self::query_by_data_prefix`] because two different
+    /// predicates reduce to a prefix and they compute different ones: an
+    /// equality pins the whole encoded value, a `starts_with` pins only
+    /// its leading bytes. What happens after — the cursor, the page, the
+    /// visibility filter — is the same walk either way.
+    #[allow(clippy::too_many_arguments)]
+    fn query_by_key_prefix<F>(
+        &self,
+        index: &crate::storage::index::DataIndex,
+        prefix: Vec<u8>,
+        cursor: Option<Cursor>,
+        desc: bool,
+        limit: usize,
+        offset: usize,
+        matches: F,
+    ) -> Result<QueryPage, String>
+    where
+        F: Fn(&Node) -> Result<bool, String>,
+    {
+        // The resume key is the last row's full `(value, address)`, not
+        // `prefix + address`. Those coincide when the prefix is a whole
+        // encoded value — the equality case — and differ the moment it
+        // is not: under a *string* prefix the values vary, so a key built
+        // from the prefix lands in the wrong place and the scan stops
+        // after one page.
+        let after = cursor
+            .as_ref()
+            .map(|c| keys::data_key(c.o.as_ref(), &c.a));
 
         let to_skip = if cursor.is_some() { 0 } else { offset };
 
@@ -1880,7 +3531,7 @@ impl StorageEngine {
             _ => String::new(),
         };
 
-        Ok(QueryPage { nodes, next })
+        Ok(QueryPage { nodes, next, examined: 0 })
     }
 
     /// The declared-index page: walk the `data` index in its own order
@@ -1977,7 +3628,7 @@ impl StorageEngine {
             _ => String::new(),
         };
 
-        Ok(QueryPage { nodes, next })
+        Ok(QueryPage { nodes, next, examined: 0 })
     }
 
     /// The sorted page: materialize the matching candidates, order them
@@ -1992,6 +3643,9 @@ impl StorageEngine {
         desc: bool,
         limit: usize,
         offset: usize,
+        predicate_for_selection: Option<&Expr>,
+        item_var_for_selection: &str,
+        text_candidates: Option<Vec<String>>,
         matches: F,
     ) -> Result<QueryPage, String>
     where
@@ -2001,7 +3655,12 @@ impl StorageEngine {
         let mut failure: Option<String> = None;
         let cap = max_scan_rows();
 
-        self.scan_candidates(kind, owner, None, false, |node| {
+        // Collect one candidate. Shared by both enumeration paths so the
+        // bound and the failure handling cannot differ between them.
+        let take = |node: Node,
+                        candidates: &mut Vec<Node>,
+                        failure: &mut Option<String>|
+         -> io::Result<bool> {
             match matches(&node) {
                 Ok(true) => {
                     // Ordering by an unindexed `data` field is the one
@@ -2017,14 +3676,62 @@ impl StorageEngine {
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    failure = Some(e);
+                    *failure = Some(e);
                     return Ok(false);
                 }
             }
 
             Ok(true)
-        })
-        .map_err(io_message)?;
+        };
+
+        // Selection through an index when the predicate allows it, even
+        // though the ordering does not come from it: read the rows the
+        // predicate admits, then sort those. The alternative — which this
+        // used to do — is reading the whole kind to find them.
+        if let Some((index, literal)) =
+            self.equality_selection(kind, predicate_for_selection, item_var_for_selection)
+        {
+            let prefix = keys::encode_order_value(Some(&literal));
+
+            index
+                .tree
+                .for_each_range(&prefix, None, false, |key, _value| {
+                    let Some(raw) = keys::address_from_data_key(key) else {
+                        return Ok(true);
+                    };
+
+                    let address = String::from_utf8_lossy(raw).into_owned();
+
+                    match self.read_node(&address)? {
+                        Some(node) => take(node, &mut candidates, &mut failure),
+                        None => Ok(true),
+                    }
+                })
+                .map_err(io_message)?;
+        } else if let Some(addresses) = text_candidates {
+            // Selection through an inverted index, for the same reason:
+            // read the rows the substring admits and sort those, rather
+            // than reading the whole kind to find them. The set is a
+            // superset, and `take` runs the full predicate on each row,
+            // so the sorted page is identical to the scan's.
+            for address in &addresses {
+                let Some(node) = self.read_node(address).map_err(io_message)?
+                else {
+                    continue;
+                };
+
+                if !take(node, &mut candidates, &mut failure)
+                    .map_err(io_message)?
+                {
+                    break;
+                }
+            }
+        } else {
+            self.scan_candidates(kind, owner, None, false, |node| {
+                take(node, &mut candidates, &mut failure)
+            })
+            .map_err(io_message)?;
+        }
 
         if let Some(e) = failure {
             return Err(e);
@@ -2079,7 +3786,7 @@ impl StorageEngine {
             _ => String::new(),
         };
 
-        Ok(QueryPage { nodes: page, next })
+        Ok(QueryPage { nodes: page, next, examined: 0 })
     }
 
     // ---------------------------------------------------------------------
@@ -2103,85 +3810,97 @@ impl StorageEngine {
     /// empty: once the batch is atomic there is no such thing as "edges
     /// created before the failure".
     pub fn insert_with_edges(
-        &mut self,
+        &self,
         node: Node,
         edge_targets: Vec<(String, String)>,
         is_admin: bool,
     ) -> Result<Vec<Edge>, (String, Vec<Edge>)> {
-        let address = node.address.clone();
-        let owner = node.owner.clone();
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
 
-        let mut operations = Vec::with_capacity(2 + edge_targets.len());
+            let address = node.address.clone();
+            let owner = node.owner.clone();
 
-        // An overwrite archives what it replaces, exactly as `insert`
-        // does — carried inside this frame rather than settled ahead of
-        // it as its own record.
-        //
-        // And an overwrite is authorized here, against the node it
-        // replaces. This is the same rule the transaction path applies
-        // in `lower_transaction`, and it lives in the engine for the
-        // same reason: an ownership check that only exists in a handler
-        // is one that the next handler can forget. This one *was*
-        // forgotten — `POST /node` reached this method with no check at
-        // all, so writing to an address another identity owned silently
-        // replaced their node and took ownership of it, while `PUT`,
-        // `DELETE` and `insert_node` inside a transaction all refused
-        // the same write. A rule enforced in three places out of four is
-        // not a rule.
-        match self.read_node(&address) {
-            Ok(Some(previous)) => {
-                if !(is_admin || previous.can_write(&owner)) {
-                    return Err((
-                        format!(
-                            "not authorized to overwrite node '{address}':                              it belongs to another owner"
-                        ),
-                        Vec::new(),
-                    ));
-                }
+            let mut operations = Vec::with_capacity(2 + edge_targets.len());
 
-                operations.push(Operation::Archive(HistoryEntry::now(previous)));
-            }
-            Ok(None) => {}
-            Err(e) => return Err((e.to_string(), Vec::new())),
-        }
-
-        operations.push(Operation::Insert(node));
-
-        let mut created = Vec::with_capacity(edge_targets.len());
-
-        for (to, kind) in edge_targets {
-            let edge = Edge::new(address.clone(), to, kind, owner.clone());
-
-            // `from` is the node this call creates, so it counts as
-            // present even though it is not indexed yet: it is staged
-            // ahead of every edge in the frame. The check is written out
-            // rather than assumed, so the staged rule stays visible if
-            // the edge source ever stops being the new node.
-            for (endpoint, label) in [(&edge.from, "from"), (&edge.to, "to")] {
-                if endpoint == &address {
-                    continue;
-                }
-
-                match self.contains_node(endpoint) {
-                    Ok(true) => {}
-                    Ok(false) => {
+            // An overwrite archives what it replaces, exactly as `insert`
+            // does — carried inside this frame rather than settled ahead of
+            // it as its own record.
+            //
+            // And an overwrite is authorized here, against the node it
+            // replaces. This is the same rule the transaction path applies
+            // in `lower_transaction`, and it lives in the engine for the
+            // same reason: an ownership check that only exists in a handler
+            // is one that the next handler can forget. This one *was*
+            // forgotten — `POST /node` reached this method with no check at
+            // all, so writing to an address another identity owned silently
+            // replaced their node and took ownership of it, while `PUT`,
+            // `DELETE` and `insert_node` inside a transaction all refused
+            // the same write. A rule enforced in three places out of four is
+            // not a rule.
+            match self.read_node(&address) {
+                Ok(Some(previous)) => {
+                    if !(is_admin || previous.can_write(&owner)) {
                         return Err((
-                            format!("edge '{label}' address not found: {endpoint}"),
+                            format!(
+                                "not authorized to overwrite node '{address}':                              it belongs to another owner"
+                            ),
                             Vec::new(),
                         ));
                     }
-                    Err(e) => return Err((e.to_string(), Vec::new())),
+
+                    operations.push(Operation::Archive(HistoryEntry::now(previous)));
                 }
+                Ok(None) => {}
+                Err(e) => return Err((e.to_string(), Vec::new())),
             }
 
-            operations.push(Operation::InsertEdge(edge.clone()));
+            operations.push(Operation::Insert(node));
 
-            created.push(edge);
-        }
+            let mut created = Vec::with_capacity(edge_targets.len());
 
-        self.apply_atomic(operations).map_err(|e| (e, Vec::new()))?;
+            for (to, kind) in edge_targets {
+                let edge = Edge::new(address.clone(), to, kind, owner.clone());
 
-        Ok(created)
+                // `from` is the node this call creates, so it counts as
+                // present even though it is not indexed yet: it is staged
+                // ahead of every edge in the frame. The check is written out
+                // rather than assumed, so the staged rule stays visible if
+                // the edge source ever stops being the new node.
+                for (endpoint, label) in [(&edge.from, "from"), (&edge.to, "to")] {
+                    if endpoint == &address {
+                        continue;
+                    }
+
+                    match self.contains_node(endpoint) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err((
+                                format!("edge '{label}' address not found: {endpoint}"),
+                                Vec::new(),
+                            ));
+                        }
+                        Err(e) => return Err((e.to_string(), Vec::new())),
+                    }
+                }
+
+                operations.push(Operation::InsertEdge(edge.clone()));
+
+                created.push(edge);
+            }
+
+            self.apply_atomic(operations).map_err(|e| (e, Vec::new()))?;
+
+            Ok(created)
+        })();
+
+        wal::sync_pending().map_err(|e| (e.to_string(), Vec::new()))?;
+
+        outcome
     }
 
     // ---------------------------------------------------------------------
@@ -2194,7 +3913,43 @@ impl StorageEngine {
 
     /// Every declared `data`-field index, in name order.
     pub fn list_indexes(&self) -> Vec<IndexDef> {
-        self.index_definitions()
+        self.indexes
+            .data_all()
+            .into_iter()
+            .map(|index| index.def.clone())
+            .collect()
+    }
+
+    /// Every declared inverted index, in name order.
+    pub fn list_text_indexes(&self) -> Vec<TextIndexDef> {
+        self.indexes
+            .text_all()
+            .into_iter()
+            .map(|index| index.def.clone())
+            .collect()
+    }
+
+    /// Both kinds of declared index as one listing, in name order.
+    ///
+    /// What the admin endpoint answers with: an operator asking "is this
+    /// field covered?" is asking one question, and two lists to merge is
+    /// the answer to a different one.
+    pub fn list_all_indexes(&self) -> Vec<IndexInfo> {
+        let mut all: Vec<IndexInfo> = self
+            .indexes
+            .data_all()
+            .iter()
+            .map(|index| IndexInfo::ordered(&index.def))
+            .chain(
+                self.indexes
+                    .text_all()
+                    .iter()
+                    .map(|index| IndexInfo::text(&index.def)),
+            )
+            .collect();
+
+        all.sort_by(|a, b| a.name.cmp(&b.name));
+        all
     }
 
     /// The declared definitions as a plain snapshot.
@@ -2202,12 +3957,21 @@ impl StorageEngine {
     /// Taken before the write path borrows the engine mutably, because
     /// validating a batch needs to know which indexes a node's keys will
     /// land in while the apply closure needs `&mut self`.
-    fn index_definitions(&self) -> Vec<IndexDef> {
-        self.indexes
-            .data_all()
-            .into_iter()
-            .map(|index| index.def.clone())
-            .collect()
+    fn declared_indexes(&self) -> Declared {
+        Declared {
+            data: self
+                .indexes
+                .data_all()
+                .into_iter()
+                .map(|index| index.def.clone())
+                .collect(),
+            text: self
+                .indexes
+                .text_all()
+                .into_iter()
+                .map(|index| index.def.clone())
+                .collect(),
+        }
     }
 
     /// Declare an index over one `data` field of one kind.
@@ -2226,48 +3990,124 @@ impl StorageEngine {
     /// key bound first, while the index can still simply not be created.
     /// This is the read Postgres does when it builds an index, for the
     /// reason Postgres reports as "index row size exceeds maximum".
-    pub fn create_index(&mut self, def: IndexDef) -> Result<(), String> {
-        def.validate()?;
+    pub fn create_index(&self, def: IndexDef) -> Result<(), String> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
 
-        if let Some(existing) = self.indexes.data_get(&def.name) {
-            if existing.def == def {
-                return Ok(());
+            def.validate()?;
+
+            if let Some(existing) = self.indexes.data_get(&def.name) {
+                if existing.def == def {
+                    return Ok(());
+                }
+
+                return Err(format!(
+                    "index '{}' already exists, over {}.{} — drop it before                  redefining it",
+                    existing.def.name, existing.def.kind, existing.def.field
+                ));
             }
 
-            return Err(format!(
-                "index '{}' already exists, over {}.{} — drop it before                  redefining it",
-                existing.def.name, existing.def.kind, existing.def.field
-            ));
-        }
+            if let Some(existing) = self.indexes.text_get(&def.name) {
+                return Err(format!(
+                    "index '{}' already exists as an inverted index over \
+                     {}.{} — one name names one index",
+                    existing.def.name, existing.def.kind, existing.def.field
+                ));
+            }
 
-        if let Some(other) = self.indexes.data_find(&def.kind, &def.field) {
-            return Err(format!(
-                "index '{}' already covers {}.{}",
-                other.def.name, def.kind, def.field
-            ));
-        }
+            if let Some(other) = self.indexes.data_find(&def.kind, &def.field) {
+                return Err(format!(
+                    "index '{}' already covers {}.{}",
+                    other.def.name, def.kind, def.field
+                ));
+            }
 
-        self.check_backfill_admissible(&def)?;
+            self.check_backfill_admissible(&def)?;
 
-        self.apply_atomic(vec![Operation::CreateIndex(def)])
+            self.apply_atomic(vec![Operation::CreateIndex(def)])
+        })();
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
     }
 
-    /// Drop a declared index, removing its tree.
-    pub fn drop_index(&mut self, name: &str) -> Result<(), String> {
-        if self.indexes.data_get(name).is_none() {
-            return Err(format!("no index named '{name}'"));
-        }
+    /// Declare an inverted index over one `data` field's text.
+    ///
+    /// The same shape as [`Self::create_index`] — validate, refuse a
+    /// contradiction, prove the backfill is admissible, then log and
+    /// apply as one crash-atomic mutation — because it is the same
+    /// operational act: it adds a durable access path every later write
+    /// has to maintain.
+    ///
+    /// Names are checked against **both** index catalogs. `DELETE
+    /// /admin/indexes/:name` names one index, so a name that resolved to
+    /// two would be a drop with no defined meaning.
+    pub fn create_text_index(&self, def: TextIndexDef) -> Result<(), String> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock — see `create_index`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
 
-        self.apply_atomic(vec![Operation::DropIndex(name.to_string())])
+            def.validate()?;
+
+            if let Some(existing) = self.indexes.text_get(&def.name) {
+                if existing.def == def {
+                    return Ok(());
+                }
+
+                return Err(format!(
+                    "index '{}' already exists, over {}.{} — drop it before \
+                     redefining it",
+                    existing.def.name, existing.def.kind, existing.def.field
+                ));
+            }
+
+            if let Some(existing) = self.indexes.data_get(&def.name) {
+                return Err(format!(
+                    "index '{}' already exists as an ordered index over \
+                     {}.{} — one name names one index",
+                    existing.def.name, existing.def.kind, existing.def.field
+                ));
+            }
+
+            if let Some(other) = self.indexes.text_find(&def.kind, &def.field) {
+                return Err(format!(
+                    "index '{}' already covers the text of {}.{}",
+                    other.def.name, def.kind, def.field
+                ));
+            }
+
+            self.check_text_backfill_admissible(&def)?;
+
+            self.apply_atomic(vec![Operation::CreateTextIndex(def)])
+        })();
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
     }
 
-    /// Refuse a definition whose backfill could not be applied, before
-    /// the create is logged. See [`Self::create_index`].
-    fn check_backfill_admissible(&self, def: &IndexDef) -> Result<(), String> {
+    /// Every existing row of the kind, measured against the bound the
+    /// inverted index imposes — before anything is logged.
+    ///
+    /// The same read [`Self::check_backfill_admissible`] does and for the
+    /// identical reason: a posting the tree would refuse cannot be
+    /// discovered after the create is durable, because recovery would
+    /// replay the create, hit the same refusal, and fail startup for
+    /// good.
+    fn check_text_backfill_admissible(
+        &self,
+        def: &TextIndexDef,
+    ) -> Result<(), String> {
         let mut failure: Option<String> = None;
 
         self.scan_candidates(Some(&def.kind), None, None, false, |node| {
-            if let Err(e) = keys::check_data_keys(
+            if let Err(e) = text::check_text_keys(
                 std::iter::once(def),
                 &node.address,
                 &node.data,
@@ -2290,18 +4130,864 @@ impl StorageEngine {
         }
     }
 
+    /// Drop a declared index, removing its tree.
+    pub fn drop_index(&self, name: &str) -> Result<(), String> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
+
+            // One name names one index, so this is a lookup in both
+            // catalogs rather than two endpoints — an operator dropping
+            // an index should not have to know which sort it was.
+            let Some(index) = self.indexes.data_get(name) else {
+                if self.indexes.text_get(name).is_some() {
+                    // Nothing depends on an inverted index the way a
+                    // reference depends on an ordered one: a reference
+                    // resolves through a value, and this index does not
+                    // store values. So there is no dependent to check.
+                    return self
+                        .apply_atomic(vec![Operation::DropTextIndex(name.to_string())]);
+                }
+
+                return Err(format!("no index named '{name}'"));
+            };
+
+            // A reference is only accepted because the access paths
+            // behind it exist. Dropping one out from under it would
+            // leave a durable rule with no way to be enforced — a
+            // cascade that cannot find its targets, or a referenced
+            // value nothing keeps unique.
+            let dependents = self
+                .references
+                .depending_on_index(&index.def.kind, &index.def.field);
+
+            if let Some(dependent) = dependents.first() {
+                return Err(format!(
+                    "index '{name}' cannot be dropped: reference {:?} is \
+                     enforced through it ({} in total). Drop the reference \
+                     first.",
+                    dependent.name,
+                    dependents.len(),
+                ));
+            }
+
+            self.apply_atomic(vec![Operation::DropIndex(name.to_string())])
+        })();
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
+    }
+
+    // ---------------------------------------------------------------------
+    // Reference administration
+    // ---------------------------------------------------------------------
+
+    /// Every declared reference, in name order.
+    pub fn list_references(&self) -> Vec<ReferenceDef> {
+        self.references.all()
+    }
+
+    /// Declare a reference: what one kind's `data` field points at, and
+    /// what deleting the referenced node does to the nodes referencing
+    /// it.
+    ///
+    /// Re-declaring the identical reference is a no-op, for the same
+    /// reason re-declaring an index is: "make sure this exists" has to
+    /// be expressible.
+    ///
+    /// # Why the whole referencing kind is read first
+    ///
+    /// A rule accepted over data that already breaks it is false from
+    /// the instant it is created, and every read that trusts it is
+    /// wrong. So every existing referencing node is resolved before
+    /// anything is logged — the same read `create_index` does for a
+    /// unique index, and the same one Postgres does when a foreign key
+    /// is added without `NOT VALID`.
+    pub fn create_reference(&self, def: ReferenceDef) -> Result<(), String> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
+
+            def.validate()?;
+
+            if let Some(existing) = self.references.get(&def.name) {
+                if existing == def {
+                    return Ok(());
+                }
+
+                return Err(format!(
+                    "reference '{}' already exists, over {}.{} → {} — drop it \
+                     before redefining it",
+                    existing.name, existing.kind, existing.field,
+                    existing.parent_kind,
+                ));
+            }
+
+            // The referencing side. Without this index, finding what
+            // points at a node being deleted is a scan of the whole
+            // referencing kind, on every delete — which is the cost this
+            // feature exists to remove, not to impose.
+            if self.indexes.data_find(&def.kind, &def.field).is_none() {
+                return Err(format!(
+                    "reference {:?} needs an index over {}.{}: without one, \
+                     deleting a {} would have to read every {}. Declare that \
+                     index first.",
+                    def.name, def.kind, def.field, def.parent_kind, def.kind,
+                ));
+            }
+
+            // The referenced side. An address is unique by construction,
+            // so referencing by address needs nothing; referencing a
+            // `data` field needs that field to actually identify one
+            // node, which is what a unique index means here.
+            if let Some(parent_field) = &def.parent_field {
+                match self.indexes.data_find(&def.parent_kind, parent_field) {
+                    Some(index) if index.def.unique => {}
+
+                    Some(index) => {
+                        return Err(format!(
+                            "reference {:?} points at {}.{}, which index '{}' \
+                             covers but does not make unique — a reference has \
+                             to name exactly one node, and a value two nodes \
+                             can hold names neither",
+                            def.name, def.parent_kind, parent_field,
+                            index.def.name,
+                        ))
+                    }
+
+                    None => {
+                        return Err(format!(
+                            "reference {:?} points at {}.{}, which needs a \
+                             unique index before anything can reference it",
+                            def.name, def.parent_kind, parent_field,
+                        ))
+                    }
+                }
+            }
+
+            self.check_reference_satisfied(&def)?;
+
+            self.apply_atomic(vec![Operation::CreateReference(def)])
+        })();
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
+    }
+
+    /// Drop a declared reference.
+    ///
+    /// The nodes it governed are untouched: what stops is the
+    /// enforcement, so children of a later-deleted parent survive it
+    /// as orphans. That is the same trade dropping a foreign key makes.
+    pub fn drop_reference(&self, name: &str) -> Result<(), String> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
+
+            if self.references.get(name).is_none() {
+                return Err(format!("no reference named '{name}'"));
+            }
+
+            self.apply_atomic(vec![Operation::DropReference(name.to_string())])
+        })();
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
+    }
+
+    /// Refuse a reference the data does not already satisfy. See
+    /// [`Self::create_reference`].
+    fn check_reference_satisfied(&self, def: &ReferenceDef) -> Result<(), String> {
+        let mut failure: Option<String> = None;
+
+        self.scan_candidates(Some(&def.kind), None, None, false, |node| {
+            let Some(key) = Self::referencing_key(&node, def) else {
+                return Ok(true);
+            };
+
+            match self.resolves_live(def, &key) {
+                Ok(true) => Ok(true),
+
+                Ok(false) => {
+                    failure = Some(format!(
+                        "reference {:?} cannot be declared: {} holds {}={} \
+                         which is not a live {}",
+                        def.name, node.address, def.field, key, def.parent_kind,
+                    ));
+
+                    Ok(false)
+                }
+
+                Err(e) => {
+                    failure = Some(e);
+                    Ok(false)
+                }
+            }
+        })
+        .map_err(io_message)?;
+
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Reference resolution
+    // ---------------------------------------------------------------------
+
+    /// The value a node *holds* in its referencing field, or `None` when
+    /// it holds nothing.
+    ///
+    /// Absent and `null` are the same answer on purpose: both mean "this
+    /// node references nothing", which is always admissible. That is a
+    /// nullable foreign key, and it is what makes `set_null` a usable
+    /// action rather than one that produces rows the rule then rejects.
+    fn referencing_key(node: &Node, def: &ReferenceDef) -> Option<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(&node.data)
+            .ok()?
+            .get(&def.field)
+            .filter(|value| !value.is_null())
+            .cloned()
+    }
+
+    /// The value a node is *referenced by* — its address, or the parent
+    /// field the reference names.
+    fn referenced_key(node: &Node, def: &ReferenceDef) -> Option<serde_json::Value> {
+        match &def.parent_field {
+            None => Some(serde_json::Value::String(node.address.clone())),
+
+            Some(field) => serde_json::from_str::<serde_json::Value>(&node.data)
+                .ok()?
+                .get(field)
+                .filter(|value| !value.is_null())
+                .cloned(),
+        }
+    }
+
+    /// Does this value name a live node of the referenced kind?
+    ///
+    /// Two access paths, both O(log n): the primary index when the
+    /// reference is by address, and the parent's unique index when it is
+    /// by a `data` field. Neither reads more than the one node it is
+    /// asking about.
+    fn resolves_live(
+        &self,
+        def: &ReferenceDef,
+        key: &serde_json::Value,
+    ) -> Result<bool, String> {
+        match &def.parent_field {
+            None => {
+                let Some(address) = key.as_str() else {
+                    // A reference by address whose value is not a string
+                    // cannot name a node at all. Reported as unresolved
+                    // rather than as a type error: the answer to "does
+                    // this exist" is no.
+                    return Ok(false);
+                };
+
+                Ok(self
+                    .read_node(address)
+                    .map_err(io_message)?
+                    .is_some_and(|node| node.kind == def.parent_kind))
+            }
+
+            Some(field) => {
+                let index = self
+                    .indexes
+                    .data_find(&def.parent_kind, field)
+                    .ok_or_else(|| {
+                        format!(
+                            "reference {:?} cannot be enforced: the unique \
+                             index over {}.{} it resolves through is gone",
+                            def.name, def.parent_kind, field,
+                        )
+                    })?;
+
+                let prefix = keys::encode_order_value(Some(key));
+                let mut found = false;
+
+                index
+                    .tree
+                    .for_each_range(&prefix, None, false, |_key, _value| {
+                        found = true;
+                        Ok(false)
+                    })
+                    .map_err(io_message)?;
+
+                Ok(found)
+            }
+        }
+    }
+
+    /// Every node that references `key` through `def`, judged against
+    /// the batch's staged view rather than only against the index.
+    ///
+    /// The index alone is not enough inside a transaction, in both
+    /// directions: a child the batch inserted is not in the index yet,
+    /// and a child the batch already changed may no longer hold the
+    /// value the index still remembers. So index candidates and the
+    /// batch's own writes of this kind are unioned, each resolved
+    /// through the overlay, and the field is re-read from the resolved
+    /// node — the index proposes, the current value decides.
+    ///
+    /// `staged_kinds` is what keeps that union from being quadratic. The
+    /// obvious version — union in every address the batch has touched —
+    /// costs the size of the batch on *every* lookup, and a cascade does
+    /// one lookup per removed node per reference, so clearing a large
+    /// kind would spend the batch squared inside the writer lock. Only
+    /// the batch's *written* nodes can be candidates (an address it
+    /// removed resolves to nothing), and they are known before the
+    /// closure starts, so they are grouped by kind once.
+    ///
+    /// Walked through a `BTreeSet` so the order is sorted and
+    /// deterministic: these become WAL records, and a WAL should not
+    /// vary run to run for identical input.
+    fn referencing_nodes(
+        &self,
+        def: &ReferenceDef,
+        key: &serde_json::Value,
+        staged: &HashMap<String, Option<Node>>,
+        staged_kinds: &HashMap<String, Vec<String>>,
+    ) -> Result<Vec<Node>, String> {
+        let index = self
+            .indexes
+            .data_find(&def.kind, &def.field)
+            .ok_or_else(|| {
+                format!(
+                    "reference {:?} cannot be enforced: the index over {}.{} \
+                     it finds referencing nodes through is gone",
+                    def.name, def.kind, def.field,
+                )
+            })?;
+
+        let prefix = keys::encode_order_value(Some(key));
+
+        let mut candidates: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        index
+            .tree
+            .for_each_range(&prefix, None, false, |entry, _value| {
+                if let Some(raw) = keys::address_from_data_key(entry) {
+                    candidates.insert(String::from_utf8_lossy(raw).into_owned());
+                }
+
+                Ok(true)
+            })
+            .map_err(io_message)?;
+
+        if let Some(written) = staged_kinds.get(&def.kind) {
+            candidates.extend(written.iter().cloned());
+        }
+
+        let mut nodes = Vec::new();
+
+        for address in candidates {
+            let Some(node) = self.staged_node(staged, &address).map_err(io_message)?
+            else {
+                continue;
+            };
+
+            if node.kind != def.kind {
+                continue;
+            }
+
+            if Self::referencing_key(&node, def).as_ref() != Some(key) {
+                continue;
+            }
+
+            nodes.push(node);
+        }
+
+        Ok(nodes)
+    }
+
+    // ---------------------------------------------------------------------
+    // Referential actions
+    // ---------------------------------------------------------------------
+
+    /// Lower a delete into every mutation the declared references make
+    /// it entail: the node itself, whatever cascades from it, whatever
+    /// cascades from *that*, and any `set_null` updates along the way.
+    ///
+    /// This is the one place a delete becomes operations, for every
+    /// path — the standalone `delete`, `delete_node`, `clear_kind` and
+    /// `delete_where` — so the referential rules cannot hold on one
+    /// route and not another.
+    ///
+    /// # Why the whole closure is one frame
+    ///
+    /// A parent deleted in one transaction and its children in the next
+    /// is exactly the failure the rule exists to prevent: a crash
+    /// between them leaves rows pointing at a node that is gone, which
+    /// nothing later will find. So the closure is expanded here, before
+    /// anything is written, and staged into the same frame as the delete
+    /// that triggered it.
+    ///
+    /// That is also why it is bounded rather than unbounded: an
+    /// atomic cascade has to fit in one frame, and a cascade that does
+    /// not fit is refused *before* the WAL rather than half-applied
+    /// after it.
+    ///
+    /// # Authority
+    ///
+    /// A referential action runs with the authority of the declaration,
+    /// not of the caller: cascading into another owner's node is what
+    /// makes it an integrity rule rather than a request. Declaring a
+    /// reference across owners is an admin-only act for exactly that
+    /// reason.
+    fn lower_delete_closure(
+        &self,
+        seeds: Vec<Node>,
+        lowered: &mut Vec<Operation>,
+        staged: &mut HashMap<String, Option<Node>>,
+    ) -> Result<(), TransactionError> {
+        // The common case: no references declared at all. Costs one
+        // lock-free check rather than a work queue and a visited set.
+        if self.references.is_empty() {
+            for node in seeds {
+                lowered.push(Operation::Archive(HistoryEntry::now(node.clone())));
+                staged.insert(node.address.clone(), None);
+                lowered.push(Operation::Delete(node.address));
+            }
+
+            return Ok(());
+        }
+
+        let bound = max_transaction_ops();
+
+        // The batch's own written nodes, grouped by kind — the
+        // candidates no index knows about yet. Taken once, and complete
+        // for the life of the closure: lowering is sequential, so every
+        // insert the batch makes has already happened, and the only
+        // entries the closure itself adds are removals (which resolve to
+        // nothing) and `set_null` updates (whose field is now null, so
+        // they reference nothing). A stale copy here is harmless in any
+        // case — this proposes candidates, and each one is re-resolved
+        // through the overlay before it is believed.
+        let mut staged_kinds: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (address, slot) in staged.iter() {
+            if let Some(node) = slot {
+                staged_kinds
+                    .entry(node.kind.clone())
+                    .or_default()
+                    .push(address.clone());
+            }
+        }
+
+        let mut queue: std::collections::VecDeque<Node> = seeds.into();
+
+        // Addresses already scheduled for removal. Also the cycle guard:
+        // a reference graph may contain one, and a closure that revisits
+        // a node it has already removed does not terminate.
+        let mut removed: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        while let Some(node) = queue.pop_front() {
+            if !removed.insert(node.address.clone()) {
+                continue;
+            }
+
+            lowered.push(Operation::Archive(HistoryEntry::now(node.clone())));
+            staged.insert(node.address.clone(), None);
+            lowered.push(Operation::Delete(node.address.clone()));
+
+            for def in self.references.for_parent(&node.kind) {
+                let Some(key) = Self::referenced_key(&node, &def) else {
+                    // Nothing can reference a node that holds no
+                    // referenced value.
+                    continue;
+                };
+
+                let children: Vec<Node> = self
+                    .referencing_nodes(&def, &key, staged, &staged_kinds)
+                    .map_err(TransactionError::Storage)?
+                    .into_iter()
+                    .filter(|child| !removed.contains(&child.address))
+                    .collect();
+
+                if children.is_empty() {
+                    continue;
+                }
+
+                match def.on_delete {
+                    ReferentialAction::Cascade => queue.extend(children),
+
+                    // A conflict, not a malformed request: the batch
+                    // is well formed and the state says no. That is the
+                    // same shape as a lost `set_if` race, and it gets
+                    // the same answer.
+                    ReferentialAction::Restrict => {
+                        return Err(TransactionError::Precondition(format!(
+                            "delete refused, nothing applied: {} is still \
+                             referenced by {} through {:?} ({} in total), and \
+                             that reference is declared restrict",
+                            node.address,
+                            children[0].address,
+                            def.name,
+                            children.len(),
+                        )))
+                    }
+
+                    ReferentialAction::SetNull => {
+                        for child in children {
+                            let cleared = Self::with_field_null(&child, &def.field)
+                                .map_err(TransactionError::Invalid)?;
+
+                            lowered.push(Operation::Archive(HistoryEntry::now(
+                                child.clone(),
+                            )));
+
+                            staged.insert(
+                                cleared.address.clone(),
+                                Some(cleared.clone()),
+                            );
+
+                            lowered.push(Operation::Insert(cleared));
+                        }
+                    }
+                }
+            }
+
+            // Checked at the *end* of the iteration, because the node's
+            // own archive and removal are not everything one iteration
+            // stages: a `set_null` reference adds an archive and a
+            // rewrite for each child on top of them. A bound checked
+            // before those bounds nothing — which is how deleting one
+            // parent with enough `set_null` children used to walk
+            // straight past the refusal below and stage 2N+2 mutations
+            // in a frame that admits far fewer.
+            //
+            // Every operation this loop appends is appended inside this
+            // body, so a check here is a check on the whole lowered
+            // result — the same thing `execute_transaction` checks after
+            // `lower_transaction`, for the same reason: lowering is
+            // where the real size becomes known.
+            if lowered.len() > bound {
+                return Err(TransactionError::Invalid(format!(
+                    "delete refused, nothing applied: deleting {} cascades to \
+                     more than the {} mutations this engine will stage in one \
+                     frame. A cascade is atomic or it is not a cascade, so it \
+                     is refused rather than split. Delete the referencing \
+                     nodes in batches first, or raise \
+                     {MAX_TRANSACTION_OPS_ENV}.",
+                    node.address, bound,
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The same node with one `data` field set to `null`.
+    ///
+    /// Set to `null` rather than removed so the field keeps existing:
+    /// a caller reading the row sees that it *has* a reference field and
+    /// that it currently points at nothing, which is the distinction
+    /// `set_null` is for. Removing the key would make a cleared
+    /// reference indistinguishable from a kind that never had one.
+    fn with_field_null(node: &Node, field: &str) -> Result<Node, String> {
+        let mut data: serde_json::Value = serde_json::from_str(&node.data)
+            .map_err(|e| {
+                format!(
+                    "cannot clear {}.{}: its data is not a JSON object ({e})",
+                    node.address, field,
+                )
+            })?;
+
+        let Some(object) = data.as_object_mut() else {
+            return Err(format!(
+                "cannot clear {}.{}: its data is not a JSON object",
+                node.address, field,
+            ));
+        };
+
+        object.insert(field.to_string(), serde_json::Value::Null);
+
+        let mut cleared = node.clone();
+        cleared.data = data.to_string();
+
+        Ok(cleared)
+    }
+
+    /// Refuse a batch that would leave a node referencing something that
+    /// is not there.
+    ///
+    /// The delete half of referential integrity is enforced where a
+    /// delete is *lowered*, because it produces mutations. This is the
+    /// insert half, which only ever refuses — so it runs here, beside
+    /// [`Self::check_unique`], before the WAL and for the same reason:
+    /// a record that becomes durable and is then refused would be
+    /// replayed into the same refusal on every subsequent start.
+    ///
+    /// # Deferred, like SQL's
+    ///
+    /// The whole batch's net effect is computed before anything is
+    /// checked, so a transaction that inserts a comment before the post
+    /// it belongs to is accepted. Checking in order would make the
+    /// constraint depend on the order a caller happened to serialize its
+    /// writes in, which is not a property of the data.
+    fn check_references(&self, operations: &[Operation]) -> Result<(), String> {
+        if self.references.is_empty() {
+            return Ok(());
+        }
+
+        // The batch's net effect: what it leaves present, and what it
+        // leaves gone. Built in operation order so a batch that deletes
+        // and re-creates an address ends up with the re-creation.
+        let mut inserted: HashMap<&str, &Node> = HashMap::new();
+        let mut deleted: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+
+        for operation in operations {
+            match operation {
+                Operation::Insert(node) => {
+                    inserted.insert(&node.address, node);
+                    deleted.remove(node.address.as_str());
+                }
+
+                Operation::Delete(address) => {
+                    inserted.remove(address.as_str());
+                    deleted.insert(address);
+                }
+
+                _ => {}
+            }
+        }
+
+        // The keys the batch's own writes make referenceable, per
+        // reference, built the first time a reference is consulted.
+        //
+        // Without it this is quadratic: every child would scan every
+        // insert looking for its parent, so a bulk load of n rows costs
+        // n² inside the writer lock — and a bulk load is exactly when
+        // this check runs most. One pass per reference instead.
+        let mut satisfied: HashMap<String, std::collections::HashSet<String>> =
+            HashMap::new();
+
+        for node in inserted.values() {
+            for def in self.references.for_child(&node.kind) {
+                let Some(key) = Self::referencing_key(node, &def) else {
+                    continue;
+                };
+
+                if !satisfied.contains_key(&def.name) {
+                    let keys = inserted
+                        .values()
+                        .filter(|candidate| candidate.kind == def.parent_kind)
+                        .filter_map(|candidate| Self::referenced_key(candidate, &def))
+                        .map(|value| value.to_string())
+                        .collect();
+
+                    satisfied.insert(def.name.clone(), keys);
+                }
+
+                // A parent this batch writes satisfies the reference
+                // whether or not it existed before — that is the whole
+                // point of checking the net effect rather than the
+                // starting state.
+                if satisfied[&def.name].contains(&key.to_string()) {
+                    continue;
+                }
+
+                if self.resolves_committed(&def, &key, &deleted)? {
+                    continue;
+                }
+
+                return Err(format!(
+                    "reference {:?}: {} holds {}={} which is not a live {}",
+                    def.name, node.address, def.field, key, def.parent_kind,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// [`Self::resolves_live`], minus the parents this batch is
+    /// removing.
+    ///
+    /// The parents it is *adding* are answered before this is called —
+    /// see the memo in [`Self::check_references`] — so this only has to
+    /// consult committed state and subtract.
+    fn resolves_committed(
+        &self,
+        def: &ReferenceDef,
+        key: &serde_json::Value,
+        deleted: &std::collections::HashSet<&str>,
+    ) -> Result<bool, String> {
+        match &def.parent_field {
+            None => {
+                let Some(address) = key.as_str() else {
+                    return Ok(false);
+                };
+
+                if deleted.contains(address) {
+                    return Ok(false);
+                }
+
+                self.resolves_live(def, key)
+            }
+
+            Some(field) => {
+                let index = self
+                    .indexes
+                    .data_find(&def.parent_kind, field)
+                    .ok_or_else(|| {
+                        format!(
+                            "reference {:?} cannot be enforced: the unique \
+                             index over {}.{} it resolves through is gone",
+                            def.name, def.parent_kind, field,
+                        )
+                    })?;
+
+                let prefix = keys::encode_order_value(Some(key));
+                let mut found = false;
+
+                index
+                    .tree
+                    .for_each_range(&prefix, None, false, |entry, _value| {
+                        let Some(raw) = keys::address_from_data_key(entry) else {
+                            return Ok(true);
+                        };
+
+                        let address = String::from_utf8_lossy(raw);
+
+                        // A holder this batch is removing does not
+                        // satisfy anything.
+                        if deleted.contains(address.as_ref()) {
+                            return Ok(true);
+                        }
+
+                        found = true;
+                        Ok(false)
+                    })
+                    .map_err(io_message)?;
+
+                Ok(found)
+            }
+        }
+    }
+
+    /// Refuse a definition whose backfill could not be applied, before
+    /// the create is logged. See [`Self::create_index`].
+    fn check_backfill_admissible(&self, def: &IndexDef) -> Result<(), String> {
+        let mut failure: Option<String> = None;
+
+        // For a unique index, the rows that already exist have to satisfy
+        // the rule being declared. Accepting the declaration and then
+        // enforcing it only on later writes would leave the constraint
+        // false the moment it was created — and every read that trusted
+        // it wrong.
+        let mut seen: std::collections::HashMap<Vec<u8>, String> =
+            std::collections::HashMap::new();
+
+        self.scan_candidates(Some(&def.kind), None, None, false, |node| {
+            if let Err(e) = keys::check_data_keys(
+                std::iter::once(def),
+                &node.address,
+                &node.data,
+            ) {
+                failure = Some(format!(
+                    "cannot index {}.{}: node '{}' {}",
+                    def.kind, def.field, node.address, e
+                ));
+
+                return Ok(false);
+            }
+
+            if def.unique {
+                let data: Option<serde_json::Value> =
+                    serde_json::from_str(&node.data).ok();
+                let value = data.as_ref().and_then(|d| d.get(&def.field));
+                let encoded = keys::encode_order_value(value);
+
+                if let Some(first) = seen.get(&encoded) {
+                    failure = Some(format!(
+                        "cannot declare {}.{} unique: '{}' and '{}' already \
+                         share a value. Resolve the duplicates first — a \
+                         constraint that is false when it is created is worse \
+                         than none, because reads start trusting it.",
+                        def.kind, def.field, first, node.address,
+                    ));
+
+                    return Ok(false);
+                }
+
+                seen.insert(encoded, node.address.clone());
+            }
+
+            Ok(true)
+        })
+        .map_err(io_message)?;
+
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// Persists a new user record.
     ///
     /// Only the token hash is persisted. Plaintext tokens are never
     /// stored in the engine. One durable record, so this stays
     /// standalone under the rule in [`Self::apply_atomic`].
-    pub fn insert_user(&mut self, record: UserRecord) -> Result<(), String> {
-        self.apply_atomic(vec![Operation::InsertUser(record)])
+    /// Put an identity straight into the in-memory map, with no WAL
+    /// record and no durable write.
+    ///
+    /// For tests that need a caller to authenticate as. The durable path
+    /// is [`StorageEngine::insert_user`], which is what a running server
+    /// uses; this exists so a test does not have to fake one.
+    #[cfg(test)]
+    pub(crate) fn seed_user(&self, record: UserRecord) {
+        self.users_write().insert(record.token_hash.clone(), record);
+    }
+
+    pub fn insert_user(&self, record: UserRecord) -> Result<(), String> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = {
+            let _writer = self.write_lock();
+
+            self.apply_atomic(vec![Operation::InsertUser(record)])
+        };
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
     }
 
     /// Revokes a user by token hash. One durable record, standalone.
-    pub fn revoke_user(&mut self, token_hash: &str) -> Result<(), String> {
-        self.apply_atomic(vec![Operation::RevokeUser(token_hash.to_string())])
+    pub fn revoke_user(&self, token_hash: &str) -> Result<(), String> {
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = {
+            let _writer = self.write_lock();
+
+            self.apply_atomic(vec![Operation::RevokeUser(token_hash.to_string())])
+        };
+
+        wal::sync_pending().map_err(|e| e.to_string())?;
+
+        outcome
     }
 
     /// Rewrite `facetql.users` as one `Put` per live identity, when the
@@ -2334,20 +5020,22 @@ impl StorageEngine {
     ///
     /// A failure is reported and non-fatal. The old log is still intact
     /// and still correct; the only cost is that it stays long.
-    pub fn compact_user_log(&mut self) -> io::Result<()> {
+    pub fn compact_user_log(&self) -> io::Result<()> {
+        let _writer = self.write_lock();
+
         // Rewriting costs one pass over the identities, so it should be
         // rare relative to appends. Four times the live count means an
         // idle database never rewrites and a heavily-rotated one
         // amortizes to a constant factor. The floor keeps a database
         // with a handful of users from rewriting on every restart.
-        let threshold = (self.users.len() * 4).max(64);
+        let threshold = (self.users_read().len() * 4).max(64);
 
-        if self.user_log_records <= threshold {
+        if self.user_log_records.load(Ordering::Relaxed) <= threshold {
             return Ok(());
         }
 
         let live: Vec<UserOpRecord> = self
-            .users
+            .users_read()
             .values()
             .cloned()
             .map(UserOpRecord::Put)
@@ -2355,21 +5043,21 @@ impl StorageEngine {
 
         binary::rewrite_records(&binary::users_path(), &live)?;
 
-        self.user_log_records = live.len();
+        self.user_log_records.store(live.len(), Ordering::Relaxed);
 
         Ok(())
     }
 
-    pub fn find_user_by_hash(&self, token_hash: &str) -> Option<&UserRecord> {
-        self.users.get(token_hash)
+    pub fn find_user_by_hash(&self, token_hash: &str) -> Option<UserRecord> {
+        self.users_read().get(token_hash).cloned()
     }
 
     /// Returns every persistent user.
     ///
     /// Bootstrap identities that exist only in environment configuration
     /// are not represented here.
-    pub fn list_users(&self) -> Vec<&UserRecord> {
-        self.users.values().collect()
+    pub fn list_users(&self) -> Vec<UserRecord> {
+        self.users_read().values().cloned().collect()
     }
 
     // ---------------------------------------------------------------------
@@ -2404,7 +5092,7 @@ impl StorageEngine {
         Ok(EngineStats {
             node_count: self.indexes.primary.len(),
             edge_count: self.indexes.edge_out.len(),
-            user_count: self.users.len() as u64,
+            user_count: self.users_read().len() as u64,
             history_entries: self.indexes.history.len(),
             kinds: by_kind
                 .into_iter()
@@ -2413,6 +5101,9 @@ impl StorageEngine {
             reads_total: self.reads_total.load(Ordering::Relaxed),
             writes_total: self.writes_total.load(Ordering::Relaxed),
             storage: self.storage_stats(),
+            version: env!("CARGO_PKG_VERSION"),
+            runtime: metrics::snapshot(),
+            cells: metrics::cell_stats(&self.cells),
         })
     }
 
@@ -2460,36 +5151,57 @@ impl StorageEngine {
     /// marker is durable, since at that instant the batch is already
     /// promised to recovery.
     pub fn execute_transaction(
-        &mut self,
+        &self,
         ops: Vec<TxOperation>,
     ) -> Result<(), TransactionError> {
-        let lowered = self.lower_transaction(ops)?;
+        // The durable flush deliberately happens *after* this block,
+        // outside the writer lock. Holding the lock across the fsync
+        // means the next writer cannot even begin, so there is never a
+        // second writer to share the flush with — see `wal::sync_pending`.
+        let outcome = (|| {
+            let _writer = self.write_lock();
 
-        // Checked after lowering, because lowering is where a batch's
-        // real size becomes known — see `max_transaction_ops`. Checked
-        // before `commit`, because past that point the first record is
-        // durable and the batch can no longer be refused.
-        if lowered.len() > max_transaction_ops() {
-            return Err(TransactionError::Invalid(format!(
-                "transaction failed, nothing applied: it resolves to {} \
-                 mutations, over the {} this engine will stage in one \
-                 frame. Split the batch, or raise {MAX_TRANSACTION_OPS_ENV}.",
-                lowered.len(),
-                max_transaction_ops()
-            )));
-        }
+            let lowered = self.lower_transaction(ops)?;
 
-        let declared = self.index_definitions();
+            // Checked after lowering, because lowering is where a batch's
+            // real size becomes known — see `max_transaction_ops`. Checked
+            // before `commit`, because past that point the first record is
+            // durable and the batch can no longer be refused.
+            if lowered.len() > max_transaction_ops() {
+                return Err(TransactionError::Invalid(format!(
+                    "transaction failed, nothing applied: it resolves to {} \
+                     mutations, over the {} this engine will stage in one \
+                     frame. Split the batch, or raise {MAX_TRANSACTION_OPS_ENV}.",
+                    lowered.len(),
+                    max_transaction_ops()
+                )));
+            }
 
-        let transaction = Transaction::from_operations(lowered);
+            // Before the frame opens, for the same reason the size bound
+            // is checked here: past `commit` the first record is durable
+            // and the batch can no longer be refused.
+            self.check_unique(&lowered)
+                .map_err(TransactionError::Invalid)?;
 
-        let sequence = transaction
-            .commit(&declared, |operation| self.apply_committed(operation))
-            .map_err(|e| TransactionError::Storage(e.to_string()))?;
+            self.check_references(&lowered)
+                .map_err(TransactionError::Invalid)?;
 
-        self.note_applied(sequence);
+            let declared = self.declared_indexes();
 
-        Ok(())
+            let transaction = Transaction::from_operations(lowered);
+
+            let sequence = transaction
+                .commit(&declared, |operation| self.apply_committed(operation))
+                .map_err(|e| TransactionError::Storage(e.to_string()))?;
+
+            self.note_applied(sequence);
+
+            Ok(())
+        })();
+
+        wal::sync_pending().map_err(|e| TransactionError::Storage(e.to_string()))?;
+
+        outcome
     }
 
     /// Validate a batch and lower it into the concrete mutations it
@@ -2561,13 +5273,17 @@ impl StorageEngine {
                     }
 
                     match self.staged_node(&staged, &address).map_err(storage)? {
-                        // Archive the value being removed, as the
+                        // Archives the value being removed, as the
                         // standalone delete path does — a deleted node's
                         // final state is exactly the one an operator
-                        // comes looking for.
-                        Some(node) => {
-                            lowered.push(Operation::Archive(HistoryEntry::now(node)))
-                        }
+                        // comes looking for — and expands whatever the
+                        // declared references make this delete entail.
+                        Some(node) => self.lower_delete_closure(
+                            vec![node],
+                            &mut lowered,
+                            &mut staged,
+                        )?,
+
                         None => {
                             return Err(TransactionError::Invalid(format!(
                                 "transaction failed, nothing applied: \
@@ -2575,10 +5291,6 @@ impl StorageEngine {
                             )))
                         }
                     }
-
-                    staged.insert(address.clone(), None);
-
-                    lowered.push(Operation::Delete(address));
                 }
 
                 TxOperation::ClearKind { kind, owner, is_admin } => {
@@ -2746,16 +5458,26 @@ impl StorageEngine {
             .staged_selection(staged, kind, where_, owner, is_admin)
             .map_err(TransactionError::Invalid)?;
 
-        for address in targets {
-            if let Some(node) =
-                self.staged_node(staged, &address).map_err(storage)?
-            {
-                lowered.push(Operation::Archive(HistoryEntry::now(node)));
-            }
+        let mut seeds = Vec::with_capacity(targets.len());
 
-            staged.insert(address.clone(), None);
-            lowered.push(Operation::Delete(address));
+        for address in targets {
+            match self.staged_node(staged, &address).map_err(storage)? {
+                Some(node) => seeds.push(node),
+
+                // A selected address that resolves to nothing can only
+                // come from a race with the overlay; removing it is
+                // still the right answer and costs one no-op record.
+                None => {
+                    staged.insert(address.clone(), None);
+                    lowered.push(Operation::Delete(address));
+                }
+            }
         }
+
+        // A bulk delete is a delete: it cascades, restricts and clears
+        // exactly like the single one, because it lowers through the
+        // same function.
+        self.lower_delete_closure(seeds, lowered, staged)?;
 
         Ok(())
     }
@@ -2874,13 +5596,13 @@ impl StorageEngine {
     /// therefore also retract the old membership, which is why the
     /// previous version is read before the new one is written.
     pub(crate) fn apply_committed(
-        &mut self,
+        &self,
         operation: &Operation,
     ) -> Result<(), String> {
         self.apply_operation(operation).map_err(io_message)
     }
 
-    fn apply_operation(&mut self, operation: &Operation) -> io::Result<()> {
+    fn apply_operation(&self, operation: &Operation) -> io::Result<()> {
         match operation {
             Operation::Archive(entry) => {
                 let location = self.store.append(&HeapRecord::History(entry.clone()))?;
@@ -2948,17 +5670,20 @@ impl StorageEngine {
                 // wrote.
                 if let Some(previous_node) = &previous_node {
                     self.retract_data_keys(previous_node)?;
+                    self.retract_text_keys(previous_node)?;
                 }
 
                 self.assert_data_keys(node)?;
+                self.assert_text_keys(node)?;
 
                 if let Some(location) = previous {
                     self.store.mark_obsolete(location);
                 }
 
-                self.cache.put(&node.address, Arc::new(node.clone()));
+                self.cache.put(location, Arc::new(node.clone()));
 
                 self.writes_total.fetch_add(1, Ordering::Relaxed);
+                self.cells.record_write(node.coordinate, node.data.len() as u64);
             }
 
             // Removing the primary index entry is what makes the node
@@ -2966,8 +5691,12 @@ impl StorageEngine {
             // path can reach the record even though its bytes are still
             // in the heap until compaction reclaims them.
             Operation::Delete(address) => {
+                let mut coordinate = None;
+
                 if let Some(location) = self.node_location(address)? {
                     let node = self.node_at(location)?;
+
+                    coordinate = Some((node.coordinate, node.data.len() as u64));
 
                     self.indexes.primary.remove(address.as_bytes())?;
                     self.indexes
@@ -2978,13 +5707,25 @@ impl StorageEngine {
                         .remove(&keys::owner_key(&node.owner, address))?;
 
                     self.retract_data_keys(&node)?;
+                    self.retract_text_keys(&node)?;
 
                     self.store.mark_obsolete(location);
+                    self.cache.invalidate(location);
                 }
 
-                self.cache.invalidate(address);
-
                 self.writes_total.fetch_add(1, Ordering::Relaxed);
+
+                // A delete of an address that was already gone still
+                // counts as a mutation — `writes_total` has always
+                // counted it — but there is no record, so there is no
+                // coordinate. It goes to the unattributed counter rather
+                // than to a guess.
+                match coordinate {
+                    Some((coordinate, bytes)) => {
+                        self.cells.record_write(coordinate, bytes)
+                    }
+                    None => self.cells.record_unattributed_write(),
+                }
             }
 
             Operation::InsertEdge(edge) => {
@@ -3001,6 +5742,12 @@ impl StorageEngine {
                 self.indexes.edge_in.put(&in_key, &location.encode())?;
 
                 self.writes_total.fetch_add(1, Ordering::Relaxed);
+
+                // An edge is not addressed by a coordinate — it is a
+                // relation between two addresses, and the two can live
+                // in different cells. Charging it to either one would be
+                // an invention, so it is counted as unattributed.
+                self.cells.record_unattributed_write();
             }
 
             Operation::DeleteEdge(id) => {
@@ -3015,6 +5762,7 @@ impl StorageEngine {
                 self.indexes.edge_in.remove(&in_key)?;
 
                 self.writes_total.fetch_add(1, Ordering::Relaxed);
+                self.cells.record_unattributed_write();
             }
 
             // Users keep their own append-only log: they are fully
@@ -3026,9 +5774,9 @@ impl StorageEngine {
                     &UserOpRecord::Put(record.clone()),
                 )?;
 
-                self.user_log_records += 1;
+                self.user_log_records.fetch_add(1, Ordering::Relaxed);
 
-                self.users.insert(record.token_hash.clone(), record.clone());
+                self.users_write().insert(record.token_hash.clone(), record.clone());
             }
 
             Operation::RevokeUser(token_hash) => {
@@ -3037,9 +5785,9 @@ impl StorageEngine {
                     &UserOpRecord::Revoke(token_hash.clone()),
                 )?;
 
-                self.user_log_records += 1;
+                self.user_log_records.fetch_add(1, Ordering::Relaxed);
 
-                self.users.remove(token_hash);
+                self.users_write().remove(token_hash);
             }
 
             // Declaration, tree and contents in one operation, in that
@@ -3066,6 +5814,54 @@ impl StorageEngine {
 
                 self.indexes.drop_data(name)?;
             }
+
+            // Log first, then the resident set — the same order as an
+            // index, so a crash between them leaves a rule that is
+            // durable but not yet enforced, which the next start
+            // replays into place. The reverse order would enforce a
+            // rule no restart can remember.
+            Operation::CreateReference(def) => {
+                binary::append_record(
+                    &crate::storage::reference::definitions_path(),
+                    &ReferenceOpRecord::Put(def.clone()),
+                )?;
+
+                self.references.put(def.clone());
+            }
+
+            Operation::DropReference(name) => {
+                binary::append_record(
+                    &crate::storage::reference::definitions_path(),
+                    &ReferenceOpRecord::Drop(name.clone()),
+                )?;
+
+                self.references.remove(name);
+            }
+
+            // Declaration, tree and postings in one operation, in that
+            // order, for exactly the reasons `CreateIndex` does it that
+            // way — with one extra consequence: a search index that is
+            // declared but not backfilled does not merely answer slowly,
+            // it answers "no such row" for everything written before it.
+            Operation::CreateTextIndex(def) => {
+                binary::append_record(
+                    &text::definitions_path(),
+                    &TextIndexOpRecord::Put(def.clone()),
+                )?;
+
+                self.indexes.open_text(def.clone())?;
+
+                self.backfill_text_index(&def.name)?;
+            }
+
+            Operation::DropTextIndex(name) => {
+                binary::append_record(
+                    &text::definitions_path(),
+                    &TextIndexOpRecord::Drop(name.clone()),
+                )?;
+
+                self.indexes.drop_text(name)?;
+            }
         }
 
         Ok(())
@@ -3081,8 +5877,103 @@ impl StorageEngine {
     /// paths a backfill needs. The empty check comes first so a database
     /// with no declared indexes does not decode a node's JSON on every
     /// write to discover there was nothing to index.
+    /// Refuse a batch that would break a declared uniqueness rule.
+    ///
+    /// Runs **before the WAL**, like every other admissibility check, and
+    /// for the same reason: a record that becomes durable and is then
+    /// refused by the indexes would be replayed into the same refusal on
+    /// every subsequent start.
+    ///
+    /// Two sources of conflict, and both matter:
+    ///
+    /// * **the index** — some other node already holds the value; and
+    /// * **the batch itself** — two inserts in one transaction claim the
+    ///   same value. Checking only the index would let those through,
+    ///   because neither is committed yet when the other is checked.
+    ///
+    /// A value freed earlier in the same batch is not a conflict: a batch
+    /// that deletes the old holder and inserts a new one is exactly how a
+    /// unique value is *moved*, and refusing it would make the constraint
+    /// unusable rather than strict.
+    fn check_unique(&self, operations: &[Operation]) -> Result<(), String> {
+        // Addresses this batch removes, so a value they hold is free.
+        let mut released: Vec<&str> = Vec::new();
+
+        for operation in operations {
+            match operation {
+                Operation::Delete(address) => released.push(address),
+                Operation::Insert(node) => released.push(&node.address),
+                _ => {}
+            }
+        }
+
+        // (index name, encoded value) → the address claiming it here.
+        let mut claimed: Vec<(String, Vec<u8>, &str)> = Vec::new();
+
+        for operation in operations {
+            let Operation::Insert(node) = operation else {
+                continue;
+            };
+
+            let declared = self.indexes.data_for_kind(&node.kind);
+            let data: Option<serde_json::Value> =
+                serde_json::from_str(&node.data).ok();
+
+            for index in declared.iter().filter(|i| i.def.unique) {
+                let value = data.as_ref().and_then(|d| d.get(&index.def.field));
+                let prefix = keys::encode_order_value(value);
+
+                if let Some((_, _, other)) = claimed.iter().find(|(name, key, _)| {
+                    *name == index.def.name && *key == prefix
+                }) {
+                    return Err(format!(
+                        "unique index {:?}: this batch gives both {:?} and {:?}                          the same {:?}",
+                        index.def.name, other, node.address, index.def.field,
+                    ));
+                }
+
+                let mut conflict: Option<String> = None;
+
+                index
+                    .tree
+                    .for_each_range(&prefix, None, false, |key, _| {
+                        let holder = keys::address_from_data_key(key)
+                            .map(|raw| String::from_utf8_lossy(raw).into_owned());
+
+                        match holder {
+                            // The node updating itself, or one this batch
+                            // is removing, does not conflict.
+                            Some(address)
+                                if address == node.address
+                                    || released.iter().any(|r| *r == address) =>
+                            {
+                                Ok(true)
+                            }
+                            Some(address) => {
+                                conflict = Some(address);
+                                Ok(false)
+                            }
+                            None => Ok(true),
+                        }
+                    })
+                    .map_err(io_message)?;
+
+                if let Some(holder) = conflict {
+                    return Err(format!(
+                        "unique index {:?}: {:?} is already held by {:?}",
+                        index.def.name, index.def.field, holder,
+                    ));
+                }
+
+                claimed.push((index.def.name.clone(), prefix, &node.address));
+            }
+        }
+
+        Ok(())
+    }
+
     fn assert_data_keys(&self, node: &Node) -> io::Result<()> {
-        let declared: Vec<_> = self.indexes.data_for_kind(&node.kind).collect();
+        let declared = self.indexes.data_for_kind(&node.kind);
 
         if declared.is_empty() {
             return Ok(());
@@ -3104,7 +5995,7 @@ impl StorageEngine {
 
     /// Remove this node's entry from every index declared over its kind.
     fn retract_data_keys(&self, node: &Node) -> io::Result<()> {
-        let declared: Vec<_> = self.indexes.data_for_kind(&node.kind).collect();
+        let declared = self.indexes.data_for_kind(&node.kind);
 
         if declared.is_empty() {
             return Ok(());
@@ -3122,6 +6013,100 @@ impl StorageEngine {
         }
 
         Ok(())
+    }
+
+    /// Write this node's postings into every inverted index declared
+    /// over its kind.
+    ///
+    /// One `put` per distinct trigram of the field's text. Idempotent by
+    /// key, which is what makes a replayed insert converge instead of
+    /// duplicating.
+    fn assert_text_keys(&self, node: &Node) -> io::Result<()> {
+        let declared = self.indexes.text_for_kind(&node.kind);
+
+        if declared.is_empty() {
+            return Ok(());
+        }
+
+        let data: Option<serde_json::Value> =
+            serde_json::from_str(&node.data).ok();
+
+        for index in declared {
+            let Some(value) = text::indexed_text(data.as_ref(), &index.def.field)
+            else {
+                continue;
+            };
+
+            for gram in text::grams(value) {
+                index.tree.put(&text::key(&gram, &node.address), &[])?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove this node's postings from every inverted index declared
+    /// over its kind.
+    ///
+    /// Driven by the node's *own* text, which is why the caller must
+    /// hand it the version being replaced rather than the one replacing
+    /// it: the postings on disk are the ones the old text produced, and
+    /// a retraction computed from the new text would leave every
+    /// trigram the edit removed still pointing at the row. That is the
+    /// stale posting that resurrects deleted content into a search
+    /// result — the one failure mode this whole index has to be designed
+    /// against.
+    fn retract_text_keys(&self, node: &Node) -> io::Result<()> {
+        let declared = self.indexes.text_for_kind(&node.kind);
+
+        if declared.is_empty() {
+            return Ok(());
+        }
+
+        let data: Option<serde_json::Value> =
+            serde_json::from_str(&node.data).ok();
+
+        for index in declared {
+            let Some(value) = text::indexed_text(data.as_ref(), &index.def.field)
+            else {
+                continue;
+            };
+
+            for gram in text::grams(value) {
+                index.tree.remove(&text::key(&gram, &node.address))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Populate a freshly declared inverted index from the rows that
+    /// already exist.
+    ///
+    /// Reads through the `kind` index, so it costs the kind rather than
+    /// the database. Every write is a `put` keyed by `(gram, address)`,
+    /// which is what makes running it twice — as recovery does — land on
+    /// the keys the interrupted pass already wrote.
+    fn backfill_text_index(&self, name: &str) -> io::Result<()> {
+        let Some(index) = self.indexes.text_get(name) else {
+            return Ok(());
+        };
+
+        let kind = index.def.kind.clone();
+        let field = index.def.field.clone();
+
+        self.scan_candidates(Some(&kind), None, None, false, |node| {
+            let data: Option<serde_json::Value> =
+                serde_json::from_str(&node.data).ok();
+
+            if let Some(value) = text::indexed_text(data.as_ref(), &field) {
+                for gram in text::grams(value) {
+                    index.tree.put(&text::key(&gram, &node.address), &[])?;
+                }
+            }
+
+            Ok(true)
+        })
     }
 
     /// Populate a freshly declared index from the rows that already
@@ -3278,6 +6263,28 @@ fn compare_order_keys(
     keys::compare_order_values(a.as_ref(), b.as_ref())
 }
 
+/// How many values one `count_by` may be asked about at once.
+///
+/// `values` exists so a caller can ask about the rows a page renders
+/// rather than the whole kind, so the bound is set by what a page is: far
+/// past any feed, and small enough that the reply is a handful of
+/// kilobytes and the work is a handful of index range scans.
+const MAX_GROUP_VALUES: usize = 1_000;
+
+/// One distinct value of a grouped field, and how many nodes carry it.
+///
+/// `value` keeps the field's own JSON type rather than being stringified
+/// into a map key: `17` and `"17"` are different values to every other
+/// part of this engine, and a reply that could not tell them apart would
+/// make a caller guess which one it had counted. `null` here means the
+/// field was absent or explicitly null — the same conflation the
+/// ordering makes, for the same reason.
+#[derive(Debug, Serialize)]
+pub struct GroupCount {
+    pub value: Option<serde_json::Value>,
+    pub count: u64,
+}
+
 /// One page of `query_where` results plus the opaque keyset cursor for
 /// the following page. `next` is `""` when this was the last page.
 ///
@@ -3290,6 +6297,26 @@ fn compare_order_keys(
 pub struct QueryPage {
     pub nodes: Vec<Node>,
     pub next: String,
+
+    /// How many candidate nodes the plan actually read and tested to
+    /// produce this page.
+    ///
+    /// The one number that distinguishes a plan from its answer. Twenty
+    /// rows can come back from an index scan that stopped at the page or
+    /// from a read of every node of the kind, and the rows are identical
+    /// either way — the difference only shows in what it cost, which is
+    /// exactly what a regression can silently change.
+    ///
+    /// Reported rather than inferred from a stopwatch because a clock
+    /// measures the machine as much as the plan: a timing assertion
+    /// fails on a loaded CI box and passes on a quiet one, whatever the
+    /// query planner is doing. This is the same quantity Postgres
+    /// reports as `EXPLAIN ANALYZE`'s "Rows Removed by Filter" plus the
+    /// rows returned, and it is a fact about the plan alone.
+    ///
+    /// Serialized with the page, so it is also the operator's answer to
+    /// "why is this query slow" without a second endpoint.
+    pub examined: u64,
 }
 
 /// Physical storage statistics, produced by
@@ -3338,6 +6365,37 @@ pub struct EngineStats {
     /// whose health cannot be observed is a subsystem that fails
     /// silently.
     pub storage: StorageStats,
+
+    /// This server's build, from `CARGO_PKG_VERSION` — the same string
+    /// `cargo` stamps on the binary, read at compile time rather than
+    /// restated as a literal that could drift from `Cargo.toml`.
+    ///
+    /// Here because a fleet is not homogeneous and a control plane has
+    /// to know what it is talking to: a rollout is half-done for a
+    /// while, and a decision made on the assumption that every instance
+    /// speaks the same dialect is a decision made on a guess. Consumers
+    /// previously had to register instances as `"unknown"`, since the
+    /// only other place the version appeared was a human-readable
+    /// banner nobody should be string-matching.
+    pub version: &'static str,
+
+    /// What the process is *doing*: request throughput, latency
+    /// percentiles over the most recent observation window, writer-queue
+    /// contention, and this process's own CPU and memory use.
+    ///
+    /// Everything above this line is a census of stored data. None of it
+    /// can say whether the server is under pressure — a database holding
+    /// ten nodes can be saturated and one holding a billion can be idle.
+    /// See [`crate::metrics`] for how each figure is measured and, just
+    /// as importantly, which ones are `null` because they could not be
+    /// measured honestly.
+    pub runtime: RuntimeStats,
+
+    /// The same traffic, attributed to the coordinates it touched.
+    ///
+    /// Bounded and lock-free, and explicit about what it could not
+    /// attribute — see [`crate::metrics::CellTable`].
+    pub cells: CellAttribution,
 }
 
 /// Longest `after` cursor this server will look at.
@@ -4887,6 +7945,7 @@ mod data_index_tests {
             name: name.to_string(),
             kind: kind.to_string(),
             field: field.to_string(),
+            unique: false,
         }
     }
 
@@ -5744,5 +8803,1373 @@ mod data_index_tests {
         );
 
         assert_eq!(got, vec!["dixnum:float", "dixnum:int"]);
+    }
+}
+
+#[cfg(test)]
+mod text_index_tests {
+    //! The inverted index over a `data` field's text.
+    //!
+    //! One property is under test throughout, and it is the same one the
+    //! ordered indexes are held to: **equivalence**. A `contains` served
+    //! by postings must return exactly the rows the row-by-row test
+    //! returns — not a subset, which would be a silently short answer,
+    //! and not a superset, which would be a wrong one. Everything else
+    //! here (the maintenance cases, the restart) exists because a
+    //! derived structure that drifts breaks that property in a way no
+    //! amount of speed makes up for.
+    //!
+    //! Like every other module here, these share one data directory with
+    //! the rest of the binary's tests, so each test works in its own
+    //! `kind` and its own index name.
+
+    use super::*;
+    use crate::core::coordinate::Coordinate;
+    use crate::core::node::{Node, Visibility};
+    use crate::storage::engine::test_support::disk_guard;
+    use crate::storage::text::TextIndexDef;
+
+    fn reopen(engine: StorageEngine) -> StorageEngine {
+        drop(engine);
+
+        let mut recovered = StorageEngine::load().expect("reopen storage engine");
+
+        crate::storage::recovery::recover(&mut recovered).expect("wal recovery");
+
+        recovered
+    }
+
+    fn node(kind: &str, address: &str, body: &str) -> Node {
+        let mut n = Node::new(
+            Coordinate::new(0, 0, 0, 0),
+            address.to_string(),
+            kind.to_string(),
+            "owner".to_string(),
+        );
+
+        n.data = serde_json::json!({ "body": body }).to_string();
+        n.visibility = Visibility::Public;
+
+        n
+    }
+
+    fn def(name: &str, kind: &str) -> TextIndexDef {
+        TextIndexDef {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            field: "body".to_string(),
+        }
+    }
+
+    fn substring(op: &str, literal: &str) -> Expr {
+        serde_json::from_value(serde_json::json!({
+            "kind": "bin",
+            "op": op,
+            "l": {
+                "kind": "get",
+                "field": "body",
+                "obj": { "kind": "ref", "name": "item" },
+            },
+            "r": { "kind": "lit", "val": literal },
+        }))
+        .expect("build predicate")
+    }
+
+    /// Every address the query returns, paged all the way through, plus
+    /// how many candidates the plan read to produce them.
+    fn search(engine: &StorageEngine, kind: &str, op: &str, literal: &str)
+        -> (Vec<String>, u64)
+    {
+        let predicate = substring(op, literal);
+
+        let mut addresses = Vec::new();
+        let mut examined = 0u64;
+        let mut after: Option<String> = None;
+
+        loop {
+            let page = engine
+                .query_where(
+                    Some(kind), None, None, Some(&predicate), "item",
+                    None, false, after.as_deref(), 3, 0,
+                )
+                .expect("query");
+
+            examined += page.examined;
+            addresses.extend(page.nodes.iter().map(|n| n.address.clone()));
+
+            if page.next.is_empty() {
+                break;
+            }
+
+            after = Some(page.next);
+        }
+
+        (addresses, examined)
+    }
+
+    /// The answer computed the only way that cannot be wrong: read every
+    /// node of the kind and run Rust's own `str` test on it.
+    fn by_brute_force(
+        engine: &StorageEngine,
+        kind: &str,
+        op: &str,
+        literal: &str,
+    ) -> Vec<String> {
+        let mut addresses: Vec<String> = engine
+            .query(Some(kind), None, None, 10_000, 0)
+            .expect("list")
+            .into_iter()
+            .filter(|n| {
+                let data: serde_json::Value =
+                    serde_json::from_str(&n.data).expect("json");
+
+                let Some(body) = data.get("body").and_then(|v| v.as_str()) else {
+                    return false;
+                };
+
+                match op {
+                    "contains" => body.contains(literal),
+                    "starts_with" => body.starts_with(literal),
+                    "ends_with" => body.ends_with(literal),
+                    other => panic!("unknown op {other}"),
+                }
+            })
+            .map(|n| n.address)
+            .collect();
+
+        addresses.sort();
+        addresses
+    }
+
+    /// A corpus chosen to break a lazy implementation:
+    ///
+    /// * `"hello"` holds `"ell"` *inside* a word, which a token index
+    ///   would miss;
+    /// * `"abcxbcd"` holds the trigrams `abc` and `bcd` but not the
+    ///   substring `"abcd"` — a false candidate the intersection cannot
+    ///   remove and the recheck must;
+    /// * `"HELLO"` differs from `"hello"` only in case, which the
+    ///   folded postings cannot tell apart and the recheck must;
+    /// * one node whose `body` is a number rather than a string, which
+    ///   has no postings and matches no substring test.
+    fn seed(engine: &StorageEngine, kind: &str) {
+        for (address, body) in [
+            ("a", "hello world"),
+            ("b", "HELLO WORLD"),
+            ("c", "abcxbcd"),
+            ("d", "abcd"),
+            ("e", "the quick brown fox"),
+            ("f", "well hello there"),
+        ] {
+            engine
+                .insert(node(kind, &format!("{kind}:{address}"), body))
+                .expect("insert");
+        }
+
+        let mut numeric = node(kind, &format!("{kind}:g"), "");
+        numeric.data = r#"{"body": 42}"#.to_string();
+        engine.insert(numeric).expect("insert");
+    }
+
+    /// The whole claim, checked against the only oracle there is.
+    #[test]
+    fn the_index_returns_exactly_what_the_row_by_row_test_returns() {
+        let _g = disk_guard();
+        let e = StorageEngine::open().expect("open storage engine");
+
+        seed(&e, "TixEq");
+
+        let probes = [
+            ("contains", "ell"),      // inside a word
+            ("contains", "abcd"),     // the scattered-trigram false candidate
+            ("contains", "hello"),    // case-sensitive against "HELLO"
+            ("contains", "HELLO"),
+            ("contains", "quick brown"), // a phrase, spaces and all
+            ("contains", "zzz"),      // nothing at all
+            ("contains", "el"),       // shorter than one window: the scan
+            ("starts_with", "hello"),
+            ("ends_with", "world"),
+        ];
+
+        // Before the index: this is the scan, and it is the answer every
+        // later comparison is made against.
+        for (op, literal) in probes {
+            assert_eq!(
+                sorted(search(&e, "TixEq", op, literal).0),
+                by_brute_force(&e, "TixEq", op, literal),
+                "the scan itself disagrees with `str::{op}` for {literal:?}",
+            );
+        }
+
+        e.create_text_index(def("tix_eq", "TixEq"))
+            .expect("declare text index");
+
+        for (op, literal) in probes {
+            assert_eq!(
+                sorted(search(&e, "TixEq", op, literal).0),
+                by_brute_force(&e, "TixEq", op, literal),
+                "the index and the scan disagree on `{op}` {literal:?}",
+            );
+        }
+    }
+
+    fn sorted(mut addresses: Vec<String>) -> Vec<String> {
+        addresses.sort();
+        addresses
+    }
+
+    /// What the index is *for*: the plan stops reading the kind and
+    /// starts reading the matches. `examined` is how an operator sees
+    /// that, so it has to move.
+    #[test]
+    fn the_index_reads_the_matches_and_not_the_kind() {
+        let _g = disk_guard();
+        let e = StorageEngine::open().expect("open storage engine");
+
+        // One needle in a thousand rows of hay. The hay deliberately
+        // shares a prefix with the needle, so a rarer trigram than the
+        // first one has to be the seed for this to pay off.
+        for n in 0..1_000 {
+            e.insert(node(
+                "TixCost",
+                &format!("TixCost:{n:04}"),
+                &format!("post number {n} about ordinary things"),
+            ))
+            .expect("insert");
+        }
+
+        e.insert(node(
+            "TixCost",
+            "TixCost:needle",
+            "post number 1000 about xylophones",
+        ))
+        .expect("insert");
+
+        let (before, scanned) = search(&e, "TixCost", "contains", "xylophone");
+
+        assert_eq!(before, vec!["TixCost:needle".to_string()]);
+        assert_eq!(
+            scanned, 1_001,
+            "without an index every node of the kind is read",
+        );
+
+        e.create_text_index(def("tix_cost", "TixCost"))
+            .expect("declare text index");
+
+        let (after, read) = search(&e, "TixCost", "contains", "xylophone");
+
+        assert_eq!(after, before, "the index changed the cost, not the answer");
+        assert_eq!(
+            read, 1,
+            "the postings should have narrowed this to the one row that \
+             matches; read {read} of 1001",
+        );
+    }
+
+    /// An update has to retract the *old* text's postings. Leaving them
+    /// is the failure mode this index is designed against: the row keeps
+    /// answering a search for words it no longer contains.
+    #[test]
+    fn an_update_retracts_the_postings_of_the_text_it_replaced() {
+        let _g = disk_guard();
+        let e = StorageEngine::open().expect("open storage engine");
+
+        e.insert(node("TixUpd", "TixUpd:1", "alpha centauri"))
+            .expect("insert");
+
+        e.create_text_index(def("tix_upd", "TixUpd"))
+            .expect("declare text index");
+
+        assert_eq!(
+            search(&e, "TixUpd", "contains", "alpha").0,
+            vec!["TixUpd:1".to_string()],
+        );
+
+        e.insert(node("TixUpd", "TixUpd:1", "bravo cluster"))
+            .expect("overwrite");
+
+        assert!(
+            search(&e, "TixUpd", "contains", "alpha").0.is_empty(),
+            "the replaced text is still answering searches",
+        );
+
+        assert_eq!(
+            search(&e, "TixUpd", "contains", "bravo").0,
+            vec!["TixUpd:1".to_string()],
+        );
+
+        // And the postings the two texts share — "a c" appears in both —
+        // must survive the retract-then-assert, not be removed by it.
+        assert_eq!(
+            search(&e, "TixUpd", "contains", "o cl").0,
+            vec!["TixUpd:1".to_string()],
+        );
+    }
+
+    /// Every path that removes a row has to remove its postings: the
+    /// single delete, the predicated bulk delete, and the whole-kind
+    /// clear. A posting that outlives its row is a deleted node
+    /// resurrected into a search result.
+    #[test]
+    fn no_delete_path_leaves_a_posting_behind() {
+        let _g = disk_guard();
+        let e = StorageEngine::open().expect("open storage engine");
+
+        for (address, body) in [
+            ("TixDel:1", "singular removal"),
+            ("TixDel:2", "predicated removal"),
+            ("TixDel:3", "wholesale removal"),
+        ] {
+            e.insert(node("TixDel", address, body)).expect("insert");
+        }
+
+        e.create_text_index(def("tix_del", "TixDel"))
+            .expect("declare text index");
+
+        assert_eq!(search(&e, "TixDel", "contains", "removal").0.len(), 3);
+
+        e.delete("TixDel:1").expect("single delete");
+
+        e.execute_transaction(vec![TxOperation::DeleteWhere {
+            kind: "TixDel".to_string(),
+            where_: Some(substring("contains", "predicated")),
+            owner: "owner".to_string(),
+            is_admin: true,
+        }])
+        .expect("delete_where commits");
+
+        assert_eq!(
+            search(&e, "TixDel", "contains", "removal").0,
+            vec!["TixDel:3".to_string()],
+            "a deleted row is still reachable through its postings",
+        );
+
+        e.execute_transaction(vec![TxOperation::ClearKind {
+            kind: "TixDel".to_string(),
+            owner: "owner".to_string(),
+            is_admin: true,
+        }])
+        .expect("clear_kind commits");
+
+        assert!(
+            search(&e, "TixDel", "contains", "removal").0.is_empty(),
+            "clearing the kind left its postings behind",
+        );
+
+        // A row written after the kind was cleared must be found, which
+        // it cannot be if the clear also took the tree with it.
+        e.insert(node("TixDel", "TixDel:4", "later removal"))
+            .expect("insert after clear");
+
+        assert_eq!(
+            search(&e, "TixDel", "contains", "removal").0,
+            vec!["TixDel:4".to_string()],
+        );
+    }
+
+    /// The definition and the postings both have to survive a restart —
+    /// a definition whose tree did not come back is a search that
+    /// silently returns nothing, which is worse than having no index.
+    #[test]
+    fn a_text_index_survives_a_restart() {
+        let _g = disk_guard();
+        let e = StorageEngine::open().expect("open storage engine");
+
+        e.insert(node("TixRec", "TixRec:1", "durable haystack"))
+            .expect("insert");
+
+        e.create_text_index(def("tix_rec", "TixRec"))
+            .expect("declare text index");
+
+        let e = reopen(e);
+
+        assert!(
+            e.list_text_indexes().iter().any(|d| d.name == "tix_rec"),
+            "the definition did not survive",
+        );
+
+        assert_eq!(
+            search(&e, "TixRec", "contains", "haystack").0,
+            vec!["TixRec:1".to_string()],
+            "the postings did not survive",
+        );
+
+        // Still maintained on the far side of the restart — the part a
+        // replayed definition gets wrong by opening the tree without
+        // registering it.
+        e.insert(node("TixRec", "TixRec:2", "later haystack"))
+            .expect("insert after restart");
+
+        assert_eq!(
+            sorted(search(&e, "TixRec", "contains", "haystack").0),
+            vec!["TixRec:1".to_string(), "TixRec:2".to_string()],
+        );
+
+        // And a delete on the far side retracts through the reopened
+        // tree rather than a fresh empty one.
+        e.delete("TixRec:1").expect("delete");
+
+        assert_eq!(
+            search(&e, "TixRec", "contains", "haystack").0,
+            vec!["TixRec:2".to_string()],
+        );
+    }
+
+    /// A count and its query are answered through the same access path,
+    /// so they cannot disagree — including when that path is a posting
+    /// intersection.
+    #[test]
+    fn a_count_agrees_with_the_query_it_counts() {
+        let _g = disk_guard();
+        let e = StorageEngine::open().expect("open storage engine");
+
+        seed(&e, "TixCount");
+
+        e.create_text_index(def("tix_count", "TixCount"))
+            .expect("declare text index");
+
+        for literal in ["ell", "abcd", "hello", "zzz"] {
+            let predicate = substring("contains", literal);
+
+            assert_eq!(
+                e.count_where(Some("TixCount"), None, None, Some(&predicate), "item")
+                    .expect("count") as usize,
+                by_brute_force(&e, "TixCount", "contains", literal).len(),
+                "count and scan disagree on {literal:?}",
+            );
+        }
+    }
+
+    /// Ordering by another field still selects through the postings and
+    /// still returns the sorted answer the scan would have.
+    #[test]
+    fn an_ordering_on_another_field_still_selects_through_the_index() {
+        let _g = disk_guard();
+        let e = StorageEngine::open().expect("open storage engine");
+
+        for (address, rank, body) in [
+            ("TixOrd:a", 3, "findable alpha"),
+            ("TixOrd:b", 1, "findable bravo"),
+            ("TixOrd:c", 2, "findable charlie"),
+            ("TixOrd:d", 0, "missing delta"),
+        ] {
+            let mut n = node("TixOrd", address, body);
+            n.data = serde_json::json!({ "body": body, "rank": rank }).to_string();
+            e.insert(n).expect("insert");
+        }
+
+        e.create_text_index(def("tix_ord", "TixOrd"))
+            .expect("declare text index");
+
+        let predicate = substring("contains", "findable");
+
+        let page = e
+            .query_where(
+                Some("TixOrd"), None, None, Some(&predicate), "item",
+                Some("rank"), false, None, 10, 0,
+            )
+            .expect("ordered query");
+
+        assert_eq!(
+            page.nodes.iter().map(|n| n.address.clone()).collect::<Vec<_>>(),
+            vec![
+                "TixOrd:b".to_string(),
+                "TixOrd:c".to_string(),
+                "TixOrd:a".to_string(),
+            ],
+            "ordered by rank, selected through the postings",
+        );
+
+        assert_eq!(
+            page.examined, 3,
+            "the sorted plan should have read the three candidates, not the \
+             kind; read {}",
+            page.examined,
+        );
+    }
+
+    /// Both index kinds live under one name space and one drop, because
+    /// `DELETE /admin/indexes/:name` names exactly one index.
+    #[test]
+    fn one_name_names_one_index_and_a_drop_finds_either() {
+        let _g = disk_guard();
+        let e = StorageEngine::open().expect("open storage engine");
+
+        e.create_text_index(def("tix_name", "TixName"))
+            .expect("declare text index");
+
+        let clash = e.create_index(IndexDef {
+            name: "tix_name".to_string(),
+            kind: "TixName".to_string(),
+            field: "other".to_string(),
+            unique: false,
+        });
+
+        assert!(
+            clash.is_err_and(|e| e.contains("already exists")),
+            "an ordered index must not be able to take a text index's name",
+        );
+
+        // The same field may carry both kinds, under two names: they
+        // answer different questions and neither subsumes the other.
+        e.create_index(IndexDef {
+            name: "tix_name_ordered".to_string(),
+            kind: "TixName".to_string(),
+            field: "body".to_string(),
+            unique: false,
+        })
+        .expect("an ordered index over the same field is not a conflict");
+
+        e.drop_index("tix_name").expect("one drop finds either kind");
+
+        assert!(
+            !e.list_text_indexes().iter().any(|d| d.name == "tix_name"),
+            "the text index is still declared after being dropped",
+        );
+
+        // Dropped means the queries it served fall back, not break.
+        e.insert(node("TixName", "TixName:1", "still searchable"))
+            .expect("insert");
+
+        assert_eq!(
+            search(&e, "TixName", "contains", "searchable").0,
+            vec!["TixName:1".to_string()],
+        );
+    }
+}
+
+#[cfg(test)]
+mod count_tests {
+    //! `count_where`, and the one property that makes it trustworthy: it
+    //! must equal the number of rows the same selection actually
+    //! returns. A count is a summary of a query, so a count that
+    //! disagrees with its query is worse than no count at all — it is a
+    //! number a caller will act on without being able to see it is wrong.
+    //!
+    //! It has three access paths (index keys only, an equality prefix, a
+    //! candidate scan), and the tests below drive each of them and then
+    //! compare against paging the query to exhaustion.
+
+    use super::*;
+    use crate::core::coordinate::Coordinate;
+    use crate::core::node::{Node, Visibility};
+    use crate::storage::engine::test_support::disk_guard;
+    use crate::storage::index::IndexDef;
+
+    fn node(kind: &str, address: &str, owner: &str, data: &str, public: bool) -> Node {
+        let mut n = Node::new(
+            Coordinate::new(0, 0, 0, 0),
+            address.to_string(),
+            kind.to_string(),
+            owner.to_string(),
+        );
+
+        n.data = data.to_string();
+
+        if public {
+            n.visibility = Visibility::Public;
+        }
+
+        n
+    }
+
+    fn author_is(who: &str) -> Expr {
+        serde_json::from_value(serde_json::json!({
+            "kind": "bin",
+            "op": "==",
+            "l": {
+                "kind": "get",
+                "field": "author",
+                "obj": { "kind": "ref", "name": "item" }
+            },
+            "r": { "kind": "lit", "val": who, "vtype": "text" }
+        }))
+        .expect("valid predicate")
+    }
+
+    /// Page the equivalent query to exhaustion and count what comes back.
+    /// This is the number `count_where` has to agree with.
+    fn rows_returned(
+        engine: &StorageEngine,
+        kind: Option<&str>,
+        owner: Option<&str>,
+        requester: Option<&str>,
+        predicate: Option<&Expr>,
+    ) -> u64 {
+        let mut total = 0u64;
+        let mut after: Option<String> = None;
+
+        for _ in 0..10_000 {
+            let page = engine
+                .query_where(
+                    kind, owner, requester, predicate, "item", None, false,
+                    after.as_deref(), 7, 0,
+                )
+                .expect("query_where ok");
+
+            total += page.nodes.len() as u64;
+
+            if page.next.is_empty() {
+                return total;
+            }
+
+            after = Some(page.next);
+        }
+
+        panic!("paging did not terminate");
+    }
+
+    fn seed(engine: &mut StorageEngine, kind: &str, tag: &str) {
+        for i in 0..40 {
+            let author = if i % 4 == 0 { "alice" } else { "bob" };
+
+            // A third of the rows are private and owned by someone else,
+            // so the visibility filter has something to do.
+            let (owner, public) = if i % 3 == 0 {
+                ("carol", false)
+            } else {
+                ("alice", true)
+            };
+
+            engine
+                .insert(node(
+                    kind,
+                    &format!("{tag}:{i:02}"),
+                    owner,
+                    &format!(r#"{{"author": "{author}", "n": {i}}}"#),
+                    public,
+                ))
+                .expect("insert");
+        }
+    }
+
+    /// Path 1: no predicate and no visibility filtering, so nothing needs
+    /// to be read — the answer is how many entries the kind index holds.
+    #[test]
+    fn counting_a_kind_reads_no_records() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, "CountKind", "ck");
+
+        assert_eq!(
+            e.count_where(Some("CountKind"), None, None, None, "item")
+                .expect("count ok"),
+            40
+        );
+
+        assert_eq!(
+            e.count_where(Some("CountKind"), None, None, None, "item")
+                .expect("count ok"),
+            rows_returned(&e, Some("CountKind"), None, None, None),
+            "the fast path disagrees with the query it summarises"
+        );
+    }
+
+    /// Path 3: the general scan, with a predicate the index cannot serve.
+    #[test]
+    fn counting_with_a_predicate_matches_the_query() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, "CountScan", "cs");
+
+        let predicate = author_is("alice");
+
+        assert_eq!(
+            e.count_where(Some("CountScan"), None, None, Some(&predicate), "item")
+                .expect("count ok"),
+            rows_returned(&e, Some("CountScan"), None, None, Some(&predicate))
+        );
+    }
+
+    /// Path 2: an index over the pinned field. The answer must not change
+    /// when the access path does — that is the whole claim an index makes.
+    #[test]
+    fn an_index_changes_the_path_and_not_the_answer() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, "CountIndexed", "ci");
+
+        let predicate = author_is("alice");
+
+        let unindexed = e
+            .count_where(Some("CountIndexed"), None, None, Some(&predicate), "item")
+            .expect("count ok");
+
+        e.create_index(IndexDef {
+            name: "ci_author".to_string(),
+            kind: "CountIndexed".to_string(),
+            field: "author".to_string(),
+    unique: false,
+})
+        .expect("create index");
+
+        let indexed = e
+            .count_where(Some("CountIndexed"), None, None, Some(&predicate), "item")
+            .expect("count ok");
+
+        assert_eq!(indexed, unindexed, "the index changed the count");
+        assert_eq!(
+            indexed,
+            rows_returned(&e, Some("CountIndexed"), None, None, Some(&predicate))
+        );
+    }
+
+    /// A count is a summary of what the caller may read, not of what
+    /// exists. Counting rows a requester cannot see would leak their
+    /// existence — the number is a side channel like any other.
+    #[test]
+    fn a_count_never_includes_a_row_the_caller_cannot_read() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, "CountVisible", "cv");
+
+        let everything = e
+            .count_where(Some("CountVisible"), None, None, None, "item")
+            .expect("count ok");
+
+        let as_dave = e
+            .count_where(Some("CountVisible"), None, Some("dave"), None, "item")
+            .expect("count ok");
+
+        assert!(
+            as_dave < everything,
+            "the private rows were counted for someone who cannot read them"
+        );
+
+        assert_eq!(
+            as_dave,
+            rows_returned(&e, Some("CountVisible"), None, Some("dave"), None),
+            "the count and the query disagree about what dave may see"
+        );
+
+        // And with an index in play, so the prefix path is held to the
+        // same rule.
+        e.create_index(IndexDef {
+            name: "cv_author".to_string(),
+            kind: "CountVisible".to_string(),
+            field: "author".to_string(),
+    unique: false,
+})
+        .expect("create index");
+
+        let predicate = author_is("alice");
+
+        assert_eq!(
+            e.count_where(
+                Some("CountVisible"),
+                None,
+                Some("dave"),
+                Some(&predicate),
+                "item"
+            )
+            .expect("count ok"),
+            rows_returned(&e, Some("CountVisible"), None, Some("dave"), Some(&predicate)),
+            "the indexed count leaks what the indexed query does not"
+        );
+    }
+
+    /// An empty answer is zero, not an error — and a kind nobody has ever
+    /// written is empty rather than missing.
+    #[test]
+    fn nothing_matching_counts_zero() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        e.insert(node("CountZero", "cz:1", "alice", r#"{"author":"alice"}"#, true))
+            .expect("insert");
+
+        assert_eq!(
+            e.count_where(Some("CountNeverWritten"), None, None, None, "item")
+                .expect("count ok"),
+            0
+        );
+
+        assert_eq!(
+            e.count_where(
+                Some("CountZero"),
+                None,
+                None,
+                Some(&author_is("nobody")),
+                "item"
+            )
+            .expect("count ok"),
+            0
+        );
+    }
+
+    /// A predicate the engine cannot push down is an error, not a wrong
+    /// number. Answering 0 would be indistinguishable from "nothing
+    /// matched", which is the failure mode a count must never have.
+    #[test]
+    fn an_unpushable_predicate_errors_rather_than_counting_zero() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        e.insert(node("CountBad", "cb:1", "alice", r#"{"author":"alice"}"#, true))
+            .expect("insert");
+
+        let nonsense: Expr = serde_json::from_value(serde_json::json!({
+            "kind": "wat"
+        }))
+        .expect("parses as an Expr");
+
+        assert!(
+            e.count_where(Some("CountBad"), None, None, Some(&nonsense), "item")
+                .is_err(),
+            "an unevaluatable predicate produced a number"
+        );
+    }
+
+    /// Selecting through an index must not require the ordering to come
+    /// from that index too.
+    ///
+    /// Conflating the two cost 714x. With `idx_Tweet_author` declared,
+    /// `where author == 'u7'` was 2.4 ms unordered and **1.83 s** ordered
+    /// by `created` over fifty thousand rows: the ordering disqualified
+    /// the index for *selection* as well, so the query fell back to
+    /// reading the whole kind to find a hundred rows it could have looked
+    /// up. Selecting through the index and sorting what comes back is
+    /// what a planner does.
+    ///
+    /// The assertion is equality of answers, not speed — a timing test is
+    /// a flake, and the bug this guards against is a plan that is slow
+    /// *and* still correct. What pins the plan is that the answer must
+    /// not move when the index appears.
+    #[test]
+    fn an_ordering_on_another_field_still_selects_through_the_index() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        for i in 0..60 {
+            let mut n = Node::new(
+                Coordinate::new(0, 0, 0, 0),
+                format!("sel:{i:03}"),
+                "SelKind".to_string(),
+                "owner".to_string(),
+            );
+
+            n.data = format!(
+                r#"{{"author": "u{}", "created": {}}}"#,
+                i % 5,
+                // Deliberately not the address order: sorting by `created`
+                // must reorder the rows, so a plan that quietly returned
+                // index order would fail.
+                1_000_000 - i
+            );
+            n.visibility = Visibility::Public;
+
+            e.insert(n).expect("insert");
+        }
+
+        let predicate = author_is("u3");
+
+        let page = |engine: &StorageEngine| -> Vec<String> {
+            engine
+                .query_where(
+                    Some("SelKind"),
+                    None,
+                    None,
+                    Some(&predicate),
+                    "item",
+                    Some("created"),
+                    true,
+                    None,
+                    5,
+                    0,
+                )
+                .expect("query_where ok")
+                .nodes
+                .iter()
+                .map(|n| n.address.clone())
+                .collect()
+        };
+
+        let scanned = page(&e);
+
+        assert_eq!(scanned.len(), 5, "expected a full page of u3's rows");
+
+        e.create_index(IndexDef {
+            name: "sel_author".to_string(),
+            kind: "SelKind".to_string(),
+            field: "author".to_string(),
+    unique: false,
+})
+        .expect("create index");
+
+        assert_eq!(
+            page(&e),
+            scanned,
+            "selecting through the index changed the ordered answer"
+        );
+    }
+}
+
+#[cfg(test)]
+mod count_by_tests {
+    //! Grouped counting, held to one rule: **every group must equal the
+    //! count you would get by asking for that value on its own.**
+    //!
+    //! That is the whole contract. `count_by` exists to replace N calls
+    //! to `count_where` with one, so the moment the two disagree the
+    //! optimization has become a wrong answer — and a wrong answer that
+    //! arrives faster, which is the worst kind. Each test below computes
+    //! the answer both ways and compares.
+
+    use super::*;
+    use crate::core::coordinate::Coordinate;
+    use crate::core::node::{Node, Visibility};
+    use crate::storage::engine::test_support::disk_guard;
+    use crate::storage::index::IndexDef;
+
+    fn like(address: &str, tweet: i64, owner: &str, public: bool) -> Node {
+        let mut n = Node::new(
+            Coordinate::new(0, 0, 0, 0),
+            address.to_string(),
+            "GbLike".to_string(),
+            owner.to_string(),
+        );
+
+        n.data = format!(r#"{{"tweet": {tweet}}}"#);
+
+        if public {
+            n.visibility = Visibility::Public;
+        }
+
+        n
+    }
+
+    /// The shape the feed actually asks: likes per tweet. Assert every
+    /// group against the single-value count it replaces.
+    fn assert_groups_match_individual_counts(
+        engine: &StorageEngine,
+        requester: Option<&str>,
+    ) {
+        let groups = engine
+            .count_by(Some("GbLike"), None, requester, None, "item", "tweet", None)
+            .expect("count_by ok");
+
+        assert!(!groups.is_empty(), "no groups at all");
+
+        for group in &groups {
+            let value = group.value.clone().expect("a tweet id");
+
+            let predicate: Expr = serde_json::from_value(serde_json::json!({
+                "kind": "bin",
+                "op": "==",
+                "l": {
+                    "kind": "get",
+                    "field": "tweet",
+                    "obj": { "kind": "ref", "name": "item" }
+                },
+                "r": { "kind": "lit", "val": value }
+            }))
+            .expect("valid predicate");
+
+            let individually = engine
+                .count_where(
+                    Some("GbLike"),
+                    None,
+                    requester,
+                    Some(&predicate),
+                    "item",
+                )
+                .expect("count_where ok");
+
+            assert_eq!(
+                group.count, individually,
+                "group {:?} counted {} but counting it on its own gives {}",
+                group.value, group.count, individually
+            );
+        }
+    }
+
+    /// 3 likes on tweet 1, 2 on tweet 2, 1 on tweet 3. Two of them belong
+    /// to carol, and `carol_public` decides whether anyone else can see
+    /// them — which is what gives the visibility filter something to do.
+    fn seed(engine: &mut StorageEngine, carol_public: bool) {
+        let rows: &[(&str, i64, &str, bool)] = &[
+            ("gb:1", 1, "alice", true),
+            ("gb:2", 1, "alice", true),
+            ("gb:3", 1, "carol", carol_public),
+            ("gb:4", 2, "alice", true),
+            ("gb:5", 2, "carol", carol_public),
+            ("gb:6", 3, "alice", true),
+        ];
+
+        for (address, tweet, owner, public) in rows {
+            engine
+                .insert(like(address, *tweet, owner, *public))
+                .expect("insert");
+        }
+    }
+
+    /// The scan path.
+    #[test]
+    fn a_grouped_count_equals_the_individual_counts() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, true);
+
+        let groups = e
+            .count_by(Some("GbLike"), None, None, None, "item", "tweet", None)
+            .expect("count_by ok");
+
+        assert_eq!(
+            groups.iter().map(|g| g.count).collect::<Vec<_>>(),
+            vec![3, 2, 1],
+            "groups should be ordered by value: tweet 1, 2, 3"
+        );
+
+        assert_groups_match_individual_counts(&e, None);
+    }
+
+    /// The index path. Adjacency in the index is the grouping, and only
+    /// one record per group is read — so this is the path most able to
+    /// drift from the scan, and the one most worth pinning.
+    #[test]
+    fn the_indexed_path_gives_the_same_groups_as_the_scan() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, true);
+
+        let scanned = e
+            .count_by(Some("GbLike"), None, None, None, "item", "tweet", None)
+            .expect("count_by ok");
+
+        e.create_index(IndexDef {
+            name: "gb_tweet".to_string(),
+            kind: "GbLike".to_string(),
+            field: "tweet".to_string(),
+    unique: false,
+})
+        .expect("create index");
+
+        let indexed = e
+            .count_by(Some("GbLike"), None, None, None, "item", "tweet", None)
+            .expect("count_by ok");
+
+        assert_eq!(
+            indexed.iter().map(|g| (g.value.clone(), g.count)).collect::<Vec<_>>(),
+            scanned.iter().map(|g| (g.value.clone(), g.count)).collect::<Vec<_>>(),
+            "the index changed the grouping"
+        );
+
+        assert_groups_match_individual_counts(&e, None);
+    }
+
+    /// Two index runs that cannot name their value must still be one
+    /// group.
+    ///
+    /// This is the state a delete racing the walk leaves: the run was
+    /// counted from the index, and by the time the value is recovered
+    /// the one record it would have been recovered from is gone. Two
+    /// runs in that state used to emit two entries with `value: None`,
+    /// and every caller that indexes the reply by value — fct's
+    /// `countBy` builds a map straight out of it — kept only the last
+    /// of them and lost the other count entirely. Staged by hand,
+    /// because a real race cannot be scheduled.
+    #[test]
+    fn runs_that_cannot_name_their_value_are_one_group() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, true);
+
+        e.create_index(IndexDef {
+            name: "gb_vanished".to_string(),
+            kind: "GbLike".to_string(),
+            field: "tweet".to_string(),
+            unique: false,
+        })
+        .expect("create index");
+
+        let index = e
+            .indexes
+            .data_find("GbLike", "tweet")
+            .expect("the index just declared");
+
+        for (tweet, address) in [(7i64, "gb:gone-a"), (8, "gb:gone-b")] {
+            index
+                .tree
+                .put(
+                    &keys::data_key(Some(&serde_json::json!(tweet)), address),
+                    &[],
+                )
+                .expect("stage an entry whose record is gone");
+        }
+
+        let groups = e
+            .count_by(Some("GbLike"), None, None, None, "item", "tweet", None)
+            .expect("count_by ok");
+
+        let unnamed: Vec<&GroupCount> =
+            groups.iter().filter(|g| g.value.is_none()).collect();
+
+        assert_eq!(
+            unnamed.len(),
+            1,
+            "one entry per value, `null` included: {groups:?}"
+        );
+
+        assert_eq!(unnamed[0].count, 2, "both runs belong in the total");
+
+        // The invariant the caller depends on, asserted over the whole
+        // reply rather than only over the entries this test staged.
+        for (i, a) in groups.iter().enumerate() {
+            for b in &groups[i + 1..] {
+                assert_ne!(
+                    keys::compare_order_values(a.value.as_ref(), b.value.as_ref()),
+                    std::cmp::Ordering::Equal,
+                    "two entries for one value: {a:?} and {b:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            groups.iter().map(|g| g.count).sum::<u64>(),
+            8,
+            "the 6 seeded rows plus the 2 whose records are gone"
+        );
+    }
+
+    /// A group must never count a row the caller cannot read — and the
+    /// grouped answer must agree with the individual one about that too,
+    /// because the two take different paths to decide it.
+    #[test]
+    fn grouping_respects_visibility() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, false); // carol's two likes are private
+
+        let everything = e
+            .count_by(Some("GbLike"), None, None, None, "item", "tweet", None)
+            .expect("count_by ok");
+
+        let as_dave = e
+            .count_by(Some("GbLike"), None, Some("dave"), None, "item", "tweet", None)
+            .expect("count_by ok");
+
+        let total = |gs: &[GroupCount]| gs.iter().map(|g| g.count).sum::<u64>();
+
+        assert!(
+            total(&as_dave) < total(&everything),
+            "private rows were counted for someone who cannot read them"
+        );
+
+        assert_groups_match_individual_counts(&e, Some("dave"));
+    }
+
+    /// A field the rows do not have groups as one `null` bucket rather
+    /// than vanishing — a row that exists has to be counted somewhere, or
+    /// the totals stop adding up.
+    #[test]
+    fn rows_missing_the_field_group_under_null() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, true);
+
+        let groups = e
+            .count_by(Some("GbLike"), None, None, None, "item", "nosuchfield", None)
+            .expect("count_by ok");
+
+        assert_eq!(groups.len(), 1, "expected one bucket, got {groups:?}");
+        assert_eq!(groups[0].value, None);
+        assert_eq!(groups[0].count, 6, "every row must land somewhere");
+    }
+
+    /// The grouped total must equal the ungrouped count. If it does not,
+    /// a row was double-counted or dropped.
+    #[test]
+    fn the_groups_sum_to_the_plain_count() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, true);
+
+        let grouped: u64 = e
+            .count_by(Some("GbLike"), None, None, None, "item", "tweet", None)
+            .expect("count_by ok")
+            .iter()
+            .map(|g| g.count)
+            .sum();
+
+        let plain = e
+            .count_where(Some("GbLike"), None, None, None, "item")
+            .expect("count ok");
+
+        assert_eq!(grouped, plain);
+    }
+
+    /// Asking about the values a page renders must give the same answers
+    /// as asking about each one alone — and must include a zero for a
+    /// value with no rows, because the caller asked and an absent key is
+    /// indistinguishable from one the engine forgot.
+    #[test]
+    fn restricting_to_named_values_answers_exactly_those() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, true);
+
+        let wanted = vec![
+            serde_json::json!(3),
+            serde_json::json!(1),
+            serde_json::json!(99), // nothing has this
+        ];
+
+        for indexed in [false, true] {
+            if indexed {
+                e.create_index(IndexDef {
+                    name: "gb_named".to_string(),
+                    kind: "GbLike".to_string(),
+                    field: "tweet".to_string(),
+    unique: false,
+})
+                .expect("create index");
+            }
+
+            let got = e
+                .count_by(
+                    Some("GbLike"),
+                    None,
+                    None,
+                    None,
+                    "item",
+                    "tweet",
+                    Some(&wanted),
+                )
+                .expect("count_by ok");
+
+            let mut pairs: Vec<(i64, u64)> = got
+                .iter()
+                .map(|g| {
+                    (
+                        g.value.as_ref().and_then(|v| v.as_i64()).unwrap_or(-1),
+                        g.count,
+                    )
+                })
+                .collect();
+            pairs.sort();
+
+            assert_eq!(
+                pairs,
+                vec![(1, 3), (3, 1), (99, 0)],
+                "indexed={indexed}: wrong answers for the named values"
+            );
+        }
+    }
+
+    /// The same value named twice is one question, on both paths.
+    ///
+    /// A page can render the same row in two places, so the `values`
+    /// list it builds holds a duplicate. The indexed fast path used to
+    /// answer each name separately and reply with two entries for one
+    /// value — a shape the caller cannot represent, since it reads the
+    /// reply into a map keyed by value — while the scan path had always
+    /// merged them. `1` and `1.0` are the same duplicate: they are one
+    /// key in the index, so they are one group everywhere.
+    #[test]
+    fn a_value_named_twice_is_answered_once() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, true);
+
+        let wanted = vec![
+            serde_json::json!(1),
+            serde_json::json!(1),
+            serde_json::json!(1.0),
+            serde_json::json!(2),
+        ];
+
+        let scanned = e
+            .count_by(
+                Some("GbLike"),
+                None,
+                None,
+                None,
+                "item",
+                "tweet",
+                Some(&wanted),
+            )
+            .expect("count_by ok");
+
+        e.create_index(IndexDef {
+            name: "gb_twice".to_string(),
+            kind: "GbLike".to_string(),
+            field: "tweet".to_string(),
+            unique: false,
+        })
+        .expect("create index");
+
+        let indexed = e
+            .count_by(
+                Some("GbLike"),
+                None,
+                None,
+                None,
+                "item",
+                "tweet",
+                Some(&wanted),
+            )
+            .expect("count_by ok");
+
+        let pairs = |groups: &[GroupCount]| {
+            groups
+                .iter()
+                .map(|g| (g.value.clone(), g.count))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            pairs(&scanned),
+            vec![
+                (Some(serde_json::json!(1)), 3),
+                (Some(serde_json::json!(2)), 2),
+            ],
+            "the scan answered a repeated value more than once"
+        );
+
+        assert_eq!(
+            pairs(&indexed),
+            pairs(&scanned),
+            "the index answered a repeated value differently from the scan"
+        );
+    }
+
+    /// The restriction must not become a way to smuggle in an unbounded
+    /// request: a caller naming more values than a page could render is
+    /// asking for the grouped form and should say so.
+    #[test]
+    fn too_many_named_values_is_refused() {
+        let _g = disk_guard();
+        let mut e = StorageEngine::open().expect("open storage engine");
+
+        seed(&mut e, true);
+
+        let far_too_many: Vec<serde_json::Value> =
+            (0..MAX_GROUP_VALUES as i64 + 1).map(|i| serde_json::json!(i)).collect();
+
+        assert!(
+            e.count_by(
+                Some("GbLike"),
+                None,
+                None,
+                None,
+                "item",
+                "tweet",
+                Some(&far_too_many),
+            )
+            .is_err(),
+            "an unbounded value list was accepted"
+        );
     }
 }

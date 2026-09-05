@@ -400,21 +400,31 @@ impl RecordStore {
         Ok((segment, page_id, slot as u16))
     }
 
+    /// Retire the active segment and make a fresh, empty one active.
+    ///
+    /// Returns the new segment's id. It has no pages yet — the caller
+    /// decides how many to claim, because the two callers want different
+    /// things: the ordinary path takes exactly one page, and the
+    /// overflow path takes as many as its chain needs.
+    fn roll(&self) -> u32 {
+        self.catalog.update(|data| {
+            let id = data.next_segment;
+
+            data.next_segment += 1;
+            data.active_segment = id;
+            data.segments.push(SegmentMeta { id, pages: 0, obsolete_bytes: 0 });
+
+            id
+        })
+    }
+
     /// Add a page to the active segment, rolling to a fresh segment
     /// first if this one is full.
     fn grow(&self, segment: u32, pages: u32) -> Result<(u32, u32, Arc<Pager>)> {
         if pages >= MAX_PAGES_PER_SEGMENT {
-            let fresh = self.catalog.update(|data| {
-                let id = data.next_segment;
-
-                data.next_segment += 1;
-                data.active_segment = id;
-                data.segments.push(SegmentMeta { id, pages: 0, obsolete_bytes: 0 });
-
-                id
-            });
-
+            let fresh = self.roll();
             let pager = self.pager(fresh)?;
+
             self.set_pages(fresh, 1);
 
             return Ok((fresh, 0, pager));
@@ -441,7 +451,32 @@ impl RecordStore {
     /// chain and stub — stays inside one segment, so compacting that
     /// segment moves all of it or none of it.
     fn append_overflow(&self, frame: &[u8]) -> Result<RecordLocation> {
-        let (segment, mut pages) = self.active_segment();
+        let (active, active_pages) = self.active_segment();
+
+        // The segment cap has to be applied *before* the first chunk is
+        // written, because once the chain has begun the segment is
+        // committed: a record is never split across segments, so there is
+        // no legal place to roll after this point.
+        //
+        // Without this check the cap was enforced on exactly one path.
+        // `grow` is the only caller that consults
+        // `MAX_PAGES_PER_SEGMENT`, and nothing in this function reaches
+        // it — the chain calls `extend` directly and the stub passes
+        // `allow_roll = false`. So a workload made of oversized records
+        // never rolled at all: one segment grew without bound, and
+        // because `compaction_candidates` excludes whichever segment is
+        // active, that same segment could never be compacted either. A
+        // database of large records therefore reclaimed no space, ever.
+        //
+        // Oversized records are not exotic for the workloads this engine
+        // is for — a post body, a JSON payload, a media manifest — so
+        // this was the ordinary case on that path, not the edge one.
+        let (segment, mut pages) = if active_pages >= MAX_PAGES_PER_SEGMENT {
+            (self.roll(), 0)
+        } else {
+            (active, active_pages)
+        };
+
         let pager = self.pager(segment)?;
 
         let mut next: u32 = 0;

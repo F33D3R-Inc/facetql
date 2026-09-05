@@ -270,10 +270,35 @@ ENOCHIAN_MASTER_KEY="$(openssl rand -hex 32)" \
 facetql start --port 8080
 ```
 
-With neither variable set the server still starts, and says so loudly:
-it uses the token `dev-local-key-change-me` (owner `dev`, role Admin) and
-an **all-zero** encryption key. Both are public, known values. Do not put
-real data behind them.
+### It will not start without those
+
+The default posture is **production**, and in production the server
+refuses to start rather than fall back to a development credential. Three
+things are checked before anything is opened:
+
+* `ENOCHIAN_TOKENS` — unset, unparseable, or containing the published
+  `dev-local-key-change-me` token means the only credential accepted
+  would be a public one;
+* `ENOCHIAN_MASTER_KEY` — unset, malformed, or all-zero means the entire
+  database is encrypted under a value anyone can type;
+* TLS — no identity configured and no explicit acknowledgement that TLS
+  is terminated in front of this process means every `x-api-key` crosses
+  the network in the clear.
+
+A refusal exits **7**, distinct from every other exit code this binary
+uses, and prints exactly which variable to set. Set
+`FACETQL_ALLOW_PLAINTEXT=1` when a reverse proxy terminates TLS.
+
+For local work, declare it:
+
+```bash
+FACETQL_ENV=development facetql start
+```
+
+That restores the old behaviour — the token `dev-local-key-change-me`
+(owner `dev`, role Admin) and an **all-zero** encryption key, both public
+known values — and prints them as findings on the way up. Do not put real
+data behind them.
 
 `ENOCHIAN_MASTER_KEY` must be 64 hex characters (32 bytes). It is not
 recoverable and not derived from anything — lose it and the data is
@@ -313,6 +338,18 @@ own. An `Admin` bypasses ownership and visibility on every path, the way
 a Postgres superuser bypasses row-level security. Nothing in a request
 body can influence the identity a write is attributed to.
 
+The per-endpoint matrix — every route, who may call it, and the
+per-object rule its handler applies — is compiled into the binary and
+printed by:
+
+```bash
+facetql routes          # add --json for the machine-readable form
+```
+
+It is the same table `api::routes::ROUTES` that the authorization tests
+drive through the real router, so what it prints is what this build
+enforces.
+
 `GET /events` is audience-filtered: an event about a private node reaches
 its owner and admins only, and `POST /publish` broadcasts to everyone
 only for an admin — anyone else's publish is scoped to their own
@@ -329,7 +366,19 @@ subscribers (`src/database.rs:286-327`, `src/api/routes.rs:1203-1273`).
 | `ENOCHIAN_MASTER_KEY` | all-zero dev key | AES-256-GCM key for pages, WAL, logs |
 | `ENOCHIAN_TOKENS` | one dev admin token | bootstrap identities |
 | `ENOCHIAN_TLS_IDENTITY` / `_PASSWORD` | — | PKCS#12 identity for HTTPS |
+| `FACETQL_ENV` | `production` | `development`/`dev`/`test` permits dev credentials and plaintext; anything else (including unset) refuses them |
+| `FACETQL_ALLOW_PLAINTEXT` | unset | set to any value to acknowledge that TLS is terminated in front of this process |
+| `FACETQL_ALLOWED_ORIGINS` | none in production, any in development | comma-separated browser origins, or `*` |
 | `FACETQL_MAX_BODY_BYTES` | 4 MiB | largest request body |
+| `FACETQL_REQUEST_TIMEOUT_SECS` | 30 | per-request deadline (never applied to `GET /events`) |
+| `FACETQL_MAX_CONCURRENT_REQUESTS` | 512 | in-flight requests before 503 |
+| `FACETQL_MAX_CONNECTIONS` | 2048 | accepted TLS connections before the socket is dropped |
+| `FACETQL_MAX_SUBSCRIBERS` | 256 | concurrent `GET /events` streams |
+| `FACETQL_RATE_READ` | `600:300` | per-identity `burst[:per_second]`, or `off` |
+| `FACETQL_RATE_WRITE` | `300:150` | as above, for durable mutations |
+| `FACETQL_RATE_BULK` | `120:60` | as above, for `POST /nodes/query` and `POST /transaction` |
+| `FACETQL_RATE_ADMIN` | `60:30` | as above, for `/admin/*` and `/stats` |
+| `FACETQL_RATE_SUBSCRIBE` | `30:5` | as above, for opening `GET /events` |
 | `FACETQL_MAX_SCAN_ROWS` | 100 000 | rows one request may materialize |
 | `FACETQL_MAX_TRANSACTION_OPS` | 50 000 | mutations one lowered batch may stage |
 | `FACETQL_MAX_QUERY_OFFSET` | 10 000 | deepest `offset` (use the cursor instead) |
@@ -449,9 +498,17 @@ Honest list. Each item is absent from the code, not merely unpolished.
 * **No composite or multi-field indexes**, no indexes on nested paths
   (declared indexes cover exactly one top-level `data` field of one
   kind), and none on `coordinate`.
-* **No index-driven predicates.** A declared index accelerates `order`
-  only. A `where` predicate is still evaluated row by row over the
-  candidate set.
+* **Only equality predicates reach an index.** A `where` that pins a
+  declared-index field to a literal with `==` is served as a prefix scan
+  (`equality_prefix_plan`); every other comparison — `<`, `>`, `!=`, or
+  anything under an `||` — is evaluated row by row over the candidate
+  set. The restriction is deliberate: narrowing on `<` would make the
+  indexed and unindexed paths disagree, because an unindexed `<` against
+  a missing or non-numeric field errors the query rather than skipping
+  the row.
+* **Index selection is by name, not by selectivity.** With two
+  applicable indexes the engine takes the alphabetically first, so the
+  choice is deterministic rather than good. There are no statistics.
 * **No joins, no aggregation, no graph traversal beyond one hop.**
   `edges/out` and `edges/in` return one node's adjacency; multi-hop is
   the client's loop.
@@ -470,22 +527,29 @@ Honest list. Each item is absent from the code, not merely unpolished.
 **Authorization**
 * **Two roles and one owner per record.** No ACLs, no groups, no
   per-field permissions.
-* **`POST /node` does not check ownership on overwrite.** Writing to an
-  address another identity owns silently replaces their node and
-  transfers ownership to the caller. `PUT`, `DELETE` and every
-  transaction op *do* check; this one path does not
-  (`create_node` in `src/api/routes.rs:330`; `StorageEngine::insert`).
+* **No shared or delegated write access.** A record has exactly one
+  owner, and only that owner (or an admin) may overwrite or delete it —
+  enforced in the engine, on every path including `POST /node`
+  (`insert_with_edges`). There is no way to grant another identity write
+  access to a record you own.
 * **No token expiry or rotation policy.** A token is valid until it is
   explicitly revoked, and bootstrap tokens cannot be revoked at all
   without a restart.
-* **CORS is wide open** (`Access-Control-Allow-Origin: *`), for browser
-  development. Narrow it before exposing this publicly
-  (`src/api/routes.rs:244`).
+* **CORS is closed by default in production.** Browser origins must be
+  listed in `FACETQL_ALLOWED_ORIGINS`; the permissive
+  `Access-Control-Allow-Origin: *` applies only in a Development
+  deployment or when that variable is explicitly set to `*`
+  (`cors_layer` in `src/api/routes.rs`). A server-to-server client sends
+  no `Origin`, so CORS never applies to it.
 
 **Operations**
-* **No rate limiting and no connection limits.** The bounds that exist
-  are per-request (body size, scan rows, batch size, offset depth), not
-  per-client.
+* **Rate limits are per identity and per process, not per cluster.**
+  A token bucket over five endpoint classes (read, write, bulk, admin,
+  subscribe), plus caps on body size, request timeout, in-flight
+  requests, open connections and SSE subscribers (`src/api/limits.rs`).
+  The bucket map is capped at 10,000 identities, and none of it is
+  shared between processes — two instances behind a load balancer each
+  enforce their own budget.
 * **No structured logging, metrics export, or tracing.** `GET /stats` is
   the whole observability surface: counts, per-kind breakdown, process
   lifetime read/write counters, and physical heap statistics.
@@ -499,10 +563,13 @@ Honest list. Each item is absent from the code, not merely unpolished.
   and its previous states remain readable through
   `GET /node/:address/history`.
 
-[`CURRENT_ARCHITECTURE.md`](./CURRENT_ARCHITECTURE.md) maps the engine
-subsystem by subsystem, and
-[`facetql-status-checklist.md`](./facetql-status-checklist.md) tracks
-what is implemented, tested, partial or absent.
+The engine's own doc comments are the architecture reference — every
+bound carries a paragraph on the failure it closes and why the number is
+the number it is. `CURRENT_ARCHITECTURE.md` and
+`facetql-status-checklist.md` used to sit here; both had fallen several
+versions behind the code and were removed rather than half-corrected. A
+checklist that lists shipped features as missing is worse than no
+checklist: someone plans a rewrite of something that already works.
 
 `SECURITY_NOTES.md` predates this engine and is **not** currently
 accurate. Among other things it states that `Database::new()` seeds a

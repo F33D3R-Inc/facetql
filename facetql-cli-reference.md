@@ -79,6 +79,7 @@ could use.
 
 ```
 facetql index create post_created --kind Post --field created_at --token <admin-token>
+facetql index create handle --kind User --field handle --unique
 facetql index list
 facetql index drop post_created
 ```
@@ -100,6 +101,14 @@ the name becomes part of the index's filename on disk, so anything that
 could be read as a path is rejected — before the request is sent, as a
 usage error (exit 2).
 
+`--unique` makes the index a **constraint**: a write that would give two
+nodes of that kind the same value for the field is refused, checked
+inside the writer lock ahead of the WAL so two callers racing for one
+value cannot both win. Declaring it over data that already contains a
+duplicate is refused rather than silently created false. It is also what
+`reference create --parent-field` resolves through — a value two nodes
+can hold names neither of them.
+
 ### `facetql index list`
 
 Prints every declared index as a `NAME` / `KIND` / `FIELD` table, or the
@@ -119,6 +128,7 @@ success.
 |---|---|---|---|
 | `--kind` | `create` only | — | Node `kind` the index covers |
 | `--field` | `create` only | — | Top-level `data` field to keep ordered |
+| `--unique` | no | off | `create` only — refuse duplicate values for the field |
 | `--yes` | no | off | `drop` only — skip the confirmation prompt |
 | `--url` / `FACETQL_URL` | no | `http://localhost:8080` | Server to talk to |
 | `--token` / `FACETQL_TOKEN` | yes | — | Admin token, sent as `x-api-key` |
@@ -127,6 +137,79 @@ success.
 Exit codes match every other client command: `2` for a usage mistake (bad
 name, missing token), `1` for a transport failure or a non-2xx response,
 `3` when a confirmation prompt is declined.
+
+## `facetql reference <action>`
+
+Declares, lists and drops **references between kinds** — admin only, and
+a client of a *running* server (`POST/GET/DELETE /admin/references`).
+
+An index changes what a read costs. A reference changes what a **delete
+means**. It is the durable statement that one `data` field of one kind
+points at another kind, plus what deleting the referenced node does to
+the nodes referencing it:
+
+- `cascade` — delete them too, and whatever references *them*, in the
+  same frame.
+- `restrict` — refuse the delete while any remain.
+- `set-null` — clear the field and keep the rows.
+
+The whole closure is expanded before anything is written and committed
+as one transaction, which is the part an application cannot do for
+itself: parent in one request and children in the next is two
+transactions, and a crash between them leaves rows pointing at a node
+that is gone.
+
+```
+facetql reference create post_comments --kind Comment --field post \
+    --parent-kind Post --on-delete cascade --token <admin-token>
+
+facetql reference create post_author --kind Post --field author_id \
+    --parent-kind User --parent-field id --on-delete restrict
+
+facetql reference list
+facetql reference drop post_comments
+```
+
+### `facetql reference create <name> --kind <Kind> --field <field> --parent-kind <Kind> --on-delete <action>`
+
+Refused unless the access paths that make the rule cheap already exist:
+
+- an index over `<kind>.<field>`, because otherwise every delete of a
+  referenced node is a scan of the whole referencing kind;
+- with `--parent-field`, a **unique** index over
+  `<parent-kind>.<parent-field>`, because a reference has to name exactly
+  one node. Without `--parent-field` the reference is by address, which
+  is unique by construction and needs nothing declared.
+
+Also refused when the existing data already breaks the rule (HTTP 400,
+naming the row) — a constraint that is false the moment it is created is
+worse than no constraint. Declaring the identical reference again is a
+successful no-op; a different rule under the same name is a 409.
+
+### `facetql reference list`
+
+Prints every declared reference as a `NAME` / `REFERENCE` / `ON DELETE`
+table — the rule as one arrow, `Comment.post -> Post` — or the raw
+server JSON under `--json`.
+
+### `facetql reference drop <name> [--yes]`
+
+Stops the enforcement. The rows it governed are untouched, which is
+exactly why it prompts: from that moment a delete of a referenced node
+leaves whatever pointed at it behind, with nothing to point those rows
+out again.
+
+| Flag / env var | Required? | Default | What it does |
+|---|---|---|---|
+| `--kind` | `create` only | — | The kind that holds the reference |
+| `--field` | `create` only | — | The `data` field carrying the referenced key |
+| `--parent-kind` | `create` only | — | The kind being referenced |
+| `--parent-field` | no | the parent's address | Parent `data` field the value matches (needs a unique index) |
+| `--on-delete` | `create` only | — | `cascade`, `restrict` or `set-null` |
+| `--yes` | no | off | `drop` only — skip the confirmation prompt |
+| `--url` / `FACETQL_URL` | no | `http://localhost:8080` | Server to talk to |
+| `--token` / `FACETQL_TOKEN` | yes | — | Admin token, sent as `x-api-key` |
+| `--json` | no | off | Emit the server's raw JSON instead of a table |
 
 ## `facetql import postgres`
 

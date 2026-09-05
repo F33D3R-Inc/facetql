@@ -31,6 +31,137 @@ impl AuthIdentity {
 const DEV_TOKEN: &str = "dev-local-key-change-me";
 const DEV_OWNER: &str = "dev";
 
+pub const TOKENS_ENV: &str = "ENOCHIAN_TOKENS";
+
+/// Why the bootstrap credential store must not be used as configured.
+///
+/// [`static_token_map`] has always had a fallback — an admin identity
+/// under a token whose value is published in this file, in the README
+/// and in every copy of this source — and it has always announced that
+/// fallback with a `warning:` on stderr and served traffic anyway. That
+/// is not a control. It is invisible to a supervisor that only captures
+/// stdout, it scrolls past in the first seconds of a busy start, and no
+/// code downstream behaves differently because of it. A server that
+/// took the fallback is a server anybody on the network is an
+/// administrator of.
+///
+/// This type is what lets that be a *refusal* instead. It reports the
+/// finding; the deployment posture (`config::deployment`) decides
+/// whether the finding is fatal, and `main` renders it. Splitting it
+/// that way keeps the knowledge of "what counts as a development
+/// credential" in the module that owns the credentials, rather than
+/// spreading a string constant into a start-up check that would then
+/// have to be kept in step with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialDefect {
+    /// `ENOCHIAN_TOKENS` is unset, so the published dev admin token is
+    /// the only credential this server accepts.
+    NoTokensConfigured,
+
+    /// `ENOCHIAN_TOKENS` is set but nothing in it parsed into a usable
+    /// `token:owner[:role]` entry — a trailing comma, a missing colon, a
+    /// value that survived a shell mangling. The map ends up empty,
+    /// which is the same outcome as not setting it at all except that it
+    /// *looks* configured.
+    TokensConfiguredButEmpty,
+
+    /// A configured entry hands out the published dev token. Setting
+    /// `ENOCHIAN_TOKENS` does not help if the token inside it is the one
+    /// printed in this file.
+    DevTokenConfigured,
+}
+
+impl std::fmt::Display for CredentialDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialDefect::NoTokensConfigured => write!(
+                f,
+                "{TOKENS_ENV} is not set, so the only credential this server \
+                 would accept is the built-in development admin token — a \
+                 value published in this source file"
+            ),
+
+            CredentialDefect::TokensConfiguredButEmpty => write!(
+                f,
+                "{TOKENS_ENV} is set but no entry in it parsed as \
+                 `token:owner[:admin]`, which leaves the credential store \
+                 empty and falls back to the built-in development admin token"
+            ),
+
+            CredentialDefect::DevTokenConfigured => write!(
+                f,
+                "{TOKENS_ENV} hands out the built-in development admin \
+                 token, whose value is published in this source file"
+            ),
+        }
+    }
+}
+
+/// What is wrong with the bootstrap credentials, if anything.
+///
+/// Deliberately reads the environment directly rather than inspecting
+/// [`static_token_map`]. The map is a `OnceLock` that prints its warning
+/// on first use, and a pre-flight check must be able to run *before*
+/// anything has authenticated without itself being the thing that
+/// initialises — and silently blesses — the fallback.
+pub fn credential_defect() -> Option<CredentialDefect> {
+    credential_defect_in(std::env::var(TOKENS_ENV).ok().as_deref())
+}
+
+/// The judgement itself, separated from where the string came from.
+///
+/// An environment variable is process-wide state shared by every test in
+/// the binary, so a test that set one would be testing the harness as
+/// much as the rule. This split is the same one `limits::parse_rate_from`
+/// makes, for the same reason.
+fn credential_defect_in(raw: Option<&str>) -> Option<CredentialDefect> {
+    let raw = match raw {
+        Some(raw) => raw,
+        None => return Some(CredentialDefect::NoTokensConfigured),
+    };
+
+    let entries = parse_token_entries(raw);
+
+    if entries.is_empty() {
+        return Some(CredentialDefect::TokensConfiguredButEmpty);
+    }
+
+    if entries.iter().any(|(token, ..)| token == DEV_TOKEN) {
+        return Some(CredentialDefect::DevTokenConfigured);
+    }
+
+    None
+}
+
+/// One parse of `ENOCHIAN_TOKENS`, shared by the credential store and
+/// the pre-flight check above.
+///
+/// It matters that there is exactly one. The check's whole claim is
+/// "the store you are about to build is unsafe", and a second parser
+/// that disagreed with the first — about a trailing comma, about
+/// whitespace, about how many colons make a role — would make that
+/// claim false in precisely the cases nobody tests.
+///
+/// Returns the plaintext token deliberately: the caller that builds the
+/// store immediately hashes it and drops it, and the caller that checks
+/// the configuration has to compare against a known value. Neither
+/// retains it.
+fn parse_token_entries(raw: &str) -> Vec<(String, String, Role)> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let mut parts = entry.splitn(3, ':');
+            let token = parts.next()?.trim().to_string();
+            let owner = parts.next()?.trim().to_string();
+            let role = match parts.next().map(str::trim) {
+                Some("admin") => Role::Admin,
+                _ => Role::User,
+            };
+
+            (!token.is_empty() && !owner.is_empty()).then_some((token, owner, role))
+        })
+        .collect()
+}
+
 /// Hashes a token with SHA-256 for comparison against persistent user
 /// records. Tokens are bearer credentials — treated the same way a
 /// password would be, not stored or logged in plaintext anywhere past
@@ -79,23 +210,10 @@ pub fn hash_token(token: &str) -> String {
 fn static_token_map() -> &'static HashMap<String, (String, Role)> {
     static MAP: OnceLock<HashMap<String, (String, Role)>> = OnceLock::new();
     MAP.get_or_init(|| {
-        match std::env::var("ENOCHIAN_TOKENS") {
-            Ok(raw) => raw
-                .split(',')
-                .filter_map(|entry| {
-                    let mut parts = entry.splitn(3, ':');
-                    let token = parts.next()?.trim().to_string();
-                    let owner = parts.next()?.trim().to_string();
-                    let role = match parts.next().map(str::trim) {
-                        Some("admin") => Role::Admin,
-                        _ => Role::User,
-                    };
-                    if token.is_empty() || owner.is_empty() {
-                        None
-                    } else {
-                        Some((hash_token(&token), (owner, role)))
-                    }
-                })
+        match std::env::var(TOKENS_ENV) {
+            Ok(raw) => parse_token_entries(&raw)
+                .into_iter()
+                .map(|(token, owner, role)| (hash_token(&token), (owner, role)))
                 .collect(),
             Err(_) => {
                 eprintln!(
@@ -177,5 +295,76 @@ pub async fn auth_middleware(
             next.run(req).await
         }
         None => (StatusCode::UNAUTHORIZED, "invalid x-api-key").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod credential_posture_tests {
+    //! What counts as a development credential. Each case here is one
+    //! the production pre-flight in `main` must refuse, and the last one
+    //! is the case it must not.
+    use super::*;
+
+    #[test]
+    fn an_unset_variable_is_a_defect() {
+        assert_eq!(
+            credential_defect_in(None),
+            Some(CredentialDefect::NoTokensConfigured)
+        );
+    }
+
+    /// The case that looks configured and is not: a value that parses to
+    /// nothing leaves the store empty, which falls back to the dev token
+    /// exactly as an unset variable does.
+    #[test]
+    fn a_variable_that_parses_to_nothing_is_a_defect() {
+        for raw in ["", "   ", ",,,", "no-colon-here", ":owner", "token:"] {
+            assert_eq!(
+                credential_defect_in(Some(raw)),
+                Some(CredentialDefect::TokensConfiguredButEmpty),
+                "{raw:?} should have been recognised as an empty store"
+            );
+        }
+    }
+
+    /// Setting the variable does not help if the token inside it is the
+    /// published one.
+    #[test]
+    fn configuring_the_dev_token_is_still_a_defect() {
+        assert_eq!(
+            credential_defect_in(Some(&format!("{DEV_TOKEN}:root:admin"))),
+            Some(CredentialDefect::DevTokenConfigured)
+        );
+
+        // …including when it is hiding among real entries.
+        assert_eq!(
+            credential_defect_in(Some(&format!("realtoken:alice,{DEV_TOKEN}:root:admin"))),
+            Some(CredentialDefect::DevTokenConfigured)
+        );
+    }
+
+    #[test]
+    fn a_real_credential_is_not_a_defect() {
+        assert_eq!(
+            credential_defect_in(Some("9f2c4a:root:admin,7b1e:alice")),
+            None
+        );
+    }
+
+    /// The store and the check must parse identically, or the check
+    /// describes a store that was never built. One function, exercised
+    /// from both directions.
+    #[test]
+    fn the_check_and_the_store_agree_on_what_parses() {
+        let entries = parse_token_entries("a:alice,b:bob:admin, c : carol ,,d");
+
+        assert_eq!(
+            entries,
+            vec![
+                ("a".to_string(), "alice".to_string(), Role::User),
+                ("b".to_string(), "bob".to_string(), Role::Admin),
+                ("c".to_string(), "carol".to_string(), Role::User),
+            ]
+        );
     }
 }

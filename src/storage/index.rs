@@ -16,7 +16,14 @@
 //!   what does this node point at?             edge_out
 //!   what points at this node?                 edge_in
 //!   what did this node used to be?            history
+//!   whose text contains this substring?       text
 //! ```
+//!
+//! The last of those is not a sorted question, so it is not a sorted
+//! structure — see [`crate::storage::text`]. It is opened, maintained,
+//! checkpointed and recovered here beside the others because it is one
+//! of the database's access paths, and an access path that lives
+//! somewhere else is one a mutation can forget to maintain.
 //!
 //! # Key encoding
 //!
@@ -44,6 +51,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::io::Result;
 use std::path::PathBuf;
 
@@ -52,6 +60,7 @@ use serde_json::Value;
 
 use crate::config;
 use crate::storage::btree::BTree;
+use crate::storage::text::{TextIndex, TextIndexDef};
 
 /// The six built-in access paths plus every operator-declared one,
 /// opened together.
@@ -95,7 +104,29 @@ pub struct Indexes {
     /// is how an index ends up open with no definition (invisible, still
     /// maintained) or defined with no tree (planned for, absent at read
     /// time) — the exact drift that makes a derived structure lie.
-    data: HashMap<String, DataIndex>,
+    /// Behind a lock, and holding `Arc`s rather than values, because
+    /// declaring or dropping an index is the only structural change a
+    /// live database makes to its own set of access paths — and it now
+    /// has to be possible while readers are walking those paths, without
+    /// an exclusive borrow of the whole engine. Handing out an `Arc`
+    /// rather than a reference is what keeps a guard from escaping into
+    /// every caller's signature.
+    data: RwLock<HashMap<String, Arc<DataIndex>>>,
+
+    /// Operator-declared inverted indexes over a `data` field, keyed by
+    /// name.
+    ///
+    /// A second map rather than a second flavour of value in `data`,
+    /// because the two answer different questions with different key
+    /// encodings and different maintenance: an ordered index writes one
+    /// key per node, an inverted index writes one per trigram of the
+    /// node's text. Merging them would mean every consumer of `data`
+    /// asking "but which sort is this one" before it could use the tree.
+    ///
+    /// Names are still unique across both — `DELETE /admin/indexes/:name`
+    /// names exactly one index — which [`crate::storage::engine`]
+    /// enforces at declaration time.
+    text: RwLock<HashMap<String, Arc<TextIndex>>>,
 }
 
 /// One operator-declared access path over a `data` field.
@@ -127,6 +158,92 @@ pub struct IndexDef {
     /// serve — an index on a path the query language cannot name would
     /// be an index no query could use.
     pub field: String,
+
+    /// Refuse a write that would give two nodes of this kind the same
+    /// value for this field.
+    ///
+    /// Declared on the index rather than as a separate object because it
+    /// *is* the index: the check is a prefix scan of the entries already
+    /// there, so a uniqueness rule with no access path behind it would
+    /// be a full scan on every write. Postgres makes the same
+    /// identification — a unique constraint is a unique index.
+    ///
+    /// `#[serde(default)]` so an index declared before this field
+    /// existed replays from the log as non-unique, which is what it was.
+    #[serde(default)]
+    pub unique: bool,
+}
+
+/// Every index declaration one mutation has to be admissible against.
+///
+/// Carried as one value rather than two arguments because the two kinds
+/// of index are one question — "what access paths will this write have
+/// to maintain, and can it?" — and a signature that takes them
+/// separately is one a third kind of index would have to widen again.
+///
+/// Snapshotted before the write path runs, because validating a batch
+/// needs to know which indexes a node's keys will land in while the
+/// apply pass needs the engine.
+pub struct Declared {
+    pub data: Vec<IndexDef>,
+    pub text: Vec<TextIndexDef>,
+}
+
+impl Declared {
+    /// The ordered indexes covering this kind.
+    pub fn data_for(&self, kind: &str) -> impl Iterator<Item = &IndexDef> {
+        self.data.iter().filter(move |def| def.kind == kind)
+    }
+
+    /// The inverted indexes covering this kind.
+    pub fn text_for(&self, kind: &str) -> impl Iterator<Item = &TextIndexDef> {
+        self.text.iter().filter(move |def| def.kind == kind)
+    }
+}
+
+/// One declared index as an operator sees it, whichever kind it is.
+///
+/// The listing endpoint answers for both kinds, and an operator reading
+/// it is asking one question — "is the field I care about covered, and
+/// covered how?" — so they arrive as one table with a `mode` column
+/// rather than two lists the reader has to merge. Serialize-only: the
+/// durable shapes are [`IndexDef`] and [`TextIndexDef`], and this is the
+/// view over them.
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexInfo {
+    pub name: String,
+    pub kind: String,
+    pub field: String,
+
+    /// Always `false` for an inverted index — it stores windows of a
+    /// value, so it has no whole value to be unique about.
+    pub unique: bool,
+
+    /// `"ordered"` or `"text"`. Additive on the wire: a client that
+    /// predates it sees the three fields it always saw.
+    pub mode: &'static str,
+}
+
+impl IndexInfo {
+    pub fn ordered(def: &IndexDef) -> IndexInfo {
+        IndexInfo {
+            name: def.name.clone(),
+            kind: def.kind.clone(),
+            field: def.field.clone(),
+            unique: def.unique,
+            mode: "ordered",
+        }
+    }
+
+    pub fn text(def: &TextIndexDef) -> IndexInfo {
+        IndexInfo {
+            name: def.name.clone(),
+            kind: def.kind.clone(),
+            field: def.field.clone(),
+            unique: false,
+            mode: "text",
+        }
+    }
 }
 
 /// One operation in `facetql.indexes`, the index-definition log.
@@ -213,7 +330,8 @@ impl Indexes {
             edge_out: BTree::open(&index_path("edge_out"))?,
             edge_in: BTree::open(&index_path("edge_in"))?,
             history: BTree::open(&index_path("history"))?,
-            data: HashMap::new(),
+            data: RwLock::new(HashMap::new()),
+            text: RwLock::new(HashMap::new()),
         })
     }
 
@@ -222,13 +340,24 @@ impl Indexes {
     /// Idempotent by name: re-opening a definition that is already
     /// present replaces the definition and keeps the tree, which is what
     /// makes replaying a `CreateIndex` record harmless.
-    pub fn open_data(&mut self, def: IndexDef) -> Result<()> {
-        let tree = match self.data.remove(&def.name) {
-            Some(existing) if existing.def == def => existing.tree,
-            Some(_) | None => BTree::open(&data_index_path(&def.name))?,
+    pub fn open_data(&self, def: IndexDef) -> Result<()> {
+        let mut data = self.data();
+
+        let existing = data.remove(&def.name);
+
+        // Re-opening an unchanged definition keeps the tree it already
+        // has, so a replayed `CreateIndex` costs nothing and — more
+        // importantly — does not swap the tree out from under a reader
+        // holding an `Arc` to it.
+        let index = match existing {
+            Some(existing) if existing.def == def => existing,
+            Some(_) | None => Arc::new(DataIndex {
+                tree: BTree::open(&data_index_path(&def.name))?,
+                def: def.clone(),
+            }),
         };
 
-        self.data.insert(def.name.clone(), DataIndex { def, tree });
+        data.insert(def.name.clone(), index);
 
         Ok(())
     }
@@ -237,8 +366,13 @@ impl Indexes {
     ///
     /// Dropping an index it does not have is not an error: recovery
     /// replays a drop against a database that already applied it.
-    pub fn drop_data(&mut self, name: &str) -> Result<()> {
-        self.data.remove(name);
+    pub fn drop_data(&self, name: &str) -> Result<()> {
+        // A reader mid-scan may still hold an `Arc` to this index. It
+        // keeps working against the tree it already has — the file is
+        // unlinked, not truncated, so the open descriptor stays valid
+        // until the last holder drops it. The index is gone from the
+        // catalog immediately, which is what "dropped" means.
+        self.data().remove(name);
 
         match std::fs::remove_file(data_index_path(name)) {
             Ok(()) => Ok(()),
@@ -247,31 +381,116 @@ impl Indexes {
         }
     }
 
-    pub fn data_get(&self, name: &str) -> Option<&DataIndex> {
-        self.data.get(name)
+    /// Open (or create) the tree backing one declared inverted index.
+    ///
+    /// Idempotent by name, exactly like [`Self::open_data`] and for the
+    /// same reason: replaying a `CreateTextIndex` record must not swap
+    /// the tree out from under a reader holding an `Arc` to it.
+    pub fn open_text(&self, def: TextIndexDef) -> Result<()> {
+        let mut text = self.text();
+
+        let existing = text.remove(&def.name);
+
+        let index = match existing {
+            Some(existing) if existing.def == def => existing,
+            Some(_) | None => Arc::new(TextIndex {
+                tree: BTree::open(&crate::storage::text::index_path(&def.name))?,
+                def: def.clone(),
+            }),
+        };
+
+        text.insert(def.name.clone(), index);
+
+        Ok(())
+    }
+
+    /// Forget one declared inverted index and remove its file.
+    ///
+    /// Dropping one it does not have is not an error: recovery replays a
+    /// drop against a database that already applied it.
+    pub fn drop_text(&self, name: &str) -> Result<()> {
+        self.text().remove(name);
+
+        match std::fs::remove_file(crate::storage::text::index_path(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn text(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Arc<TextIndex>>> {
+        self.text.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn text_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<TextIndex>>> {
+        self.text.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn text_get(&self, name: &str) -> Option<Arc<TextIndex>> {
+        self.text_read().get(name).cloned()
+    }
+
+    /// Every declared inverted index, in name order so listings and
+    /// plans are stable rather than following hash iteration order.
+    pub fn text_all(&self) -> Vec<Arc<TextIndex>> {
+        let mut all: Vec<Arc<TextIndex>> = self.text_read().values().cloned().collect();
+        all.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+        all
+    }
+
+    /// The inverted indexes a node of this kind must maintain.
+    pub fn text_for_kind(&self, kind: &str) -> Vec<Arc<TextIndex>> {
+        self.text_read()
+            .values()
+            .filter(|i| i.def.kind == kind)
+            .cloned()
+            .collect()
+    }
+
+    /// The inverted index over exactly this `(kind, field)`, if one was
+    /// declared.
+    pub fn text_find(&self, kind: &str, field: &str) -> Option<Arc<TextIndex>> {
+        self.text_read()
+            .values()
+            .find(|i| i.def.kind == kind && i.def.field == field)
+            .cloned()
+    }
+
+    fn data(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Arc<DataIndex>>> {
+        self.data.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn data_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<DataIndex>>> {
+        self.data.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn data_get(&self, name: &str) -> Option<Arc<DataIndex>> {
+        self.data_read().get(name).cloned()
     }
 
     /// Every declared index, in name order so listings are stable.
-    pub fn data_all(&self) -> Vec<&DataIndex> {
-        let mut all: Vec<&DataIndex> = self.data.values().collect();
+    pub fn data_all(&self) -> Vec<Arc<DataIndex>> {
+        let mut all: Vec<Arc<DataIndex>> = self.data_read().values().cloned().collect();
         all.sort_by(|a, b| a.def.name.cmp(&b.def.name));
         all
     }
 
     /// The indexes a node of this kind must maintain.
-    pub fn data_for_kind<'a>(
-        &'a self,
-        kind: &'a str,
-    ) -> impl Iterator<Item = &'a DataIndex> {
-        self.data.values().filter(move |i| i.def.kind == kind)
+    pub fn data_for_kind(&self, kind: &str) -> Vec<Arc<DataIndex>> {
+        self.data_read()
+            .values()
+            .filter(|i| i.def.kind == kind)
+            .cloned()
+            .collect()
     }
 
     /// The access path serving `order by <field>` on this kind, if one
     /// was declared. The planner's whole question.
-    pub fn data_find(&self, kind: &str, field: &str) -> Option<&DataIndex> {
-        self.data
+    pub fn data_find(&self, kind: &str, field: &str) -> Option<Arc<DataIndex>> {
+        self.data_read()
             .values()
             .find(|i| i.def.kind == kind && i.def.field == field)
+            .cloned()
     }
 
     /// Publish every index's pending generation.
@@ -290,7 +509,11 @@ impl Indexes {
         self.edge_in.commit()?;
         self.history.commit()?;
 
-        for index in self.data.values() {
+        for index in self.data_read().values() {
+            index.tree.commit()?;
+        }
+
+        for index in self.text_read().values() {
             index.tree.commit()?;
         }
 
@@ -441,7 +664,7 @@ use crate::storage::btree::MAX_KEY_LEN;
 /// In practice `MAX_KEY_LEN` is far smaller and fires first.
 pub const MAX_COMPONENT_LEN: usize = u16::MAX as usize;
 
-fn check_component(name: &str, value: &str) -> std::result::Result<(), String> {
+pub(crate) fn check_component(name: &str, value: &str) -> std::result::Result<(), String> {
     if value.len() > MAX_COMPONENT_LEN {
         return Err(format!(
             "{name} is {} bytes; the maximum is {MAX_COMPONENT_LEN}",
@@ -660,6 +883,32 @@ fn append_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
 ///
 /// Also the exact prefix of every entry holding that value, which is
 /// what makes "the rows where this field equals X" a range scan.
+/// The key prefix shared by every entry whose string value begins with
+/// `prefix`.
+///
+/// The same encoding as [`encode_order_value`] but stopping before the
+/// terminator: a value's encoded form is `rank · escaped bytes ·
+/// 0x00 0x00`, so the escaped bytes of a prefix are a byte prefix of
+/// every longer value's key. That is what turns `starts_with` into a
+/// range scan instead of a scan of the kind — typeahead over a handle is
+/// the query this exists for.
+pub fn encode_string_prefix(prefix: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + 2);
+
+    out.push(type_rank(Some(&Value::String(String::new()))));
+
+    for &b in prefix.as_bytes() {
+        if b == 0x00 {
+            out.push(0x00);
+            out.push(0xFF);
+        } else {
+            out.push(b);
+        }
+    }
+
+    out
+}
+
 pub fn encode_order_value(value: Option<&Value>) -> Vec<u8> {
     let mut body = Vec::new();
     encode_value_body(value, &mut body);

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::config;
 
@@ -69,6 +69,32 @@ fn fences() -> &'static Mutex<BTreeSet<u64>> {
     FENCES.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
+/// The fence set, recovered rather than abandoned if the lock is
+/// poisoned.
+///
+/// Every other lock in the storage layer takes its guard this way
+/// (`wal::handle_slot`, `wal::sync_state`), and here the reason is
+/// sharper than consistency. The three critical sections this lock
+/// protects are an insert, a remove and reading the minimum — none of
+/// which can leave a `BTreeSet<u64>` half-updated — so a poisoned lock
+/// here means a panic happened *elsewhere* on a thread that merely held
+/// this one, and the set behind it is intact.
+///
+/// The previous form swallowed the poison with `.ok()`, which turned
+/// that into the worst possible outcome: `begin_fence` would silently
+/// not fence, `min_fence` would silently report "no open transaction",
+/// and [`advance`] would then be free to write a checkpoint into the
+/// middle of a live `BEGIN … COMMIT` frame. Recovery filters on
+/// `sequence > checkpoint`, so the next start would read a frame with
+/// its opening record missing — the one shape
+/// `recovery::classify_transaction` cannot resolve without either
+/// losing an acknowledged batch or applying half of one. A durability
+/// fence that stops fencing without saying so is worse than one that
+/// panics, and this one has no reason to do either.
+fn fence_set() -> MutexGuard<'static, BTreeSet<u64>> {
+    fences().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Register a checkpoint fence at an open transaction's BEGIN sequence.
 ///
 /// Must be called immediately after the BEGIN record is durable and
@@ -78,9 +104,7 @@ fn fences() -> &'static Mutex<BTreeSet<u64>> {
 /// called, so a crash while the frame is open always leaves recovery a
 /// full copy of the transaction's WAL records to discard.
 pub fn begin_fence(begin_sequence: u64) {
-    if let Ok(mut set) = fences().lock() {
-        set.insert(begin_sequence);
-    }
+    fence_set().insert(begin_sequence);
 }
 
 /// Release a previously registered checkpoint fence.
@@ -90,16 +114,14 @@ pub fn begin_fence(begin_sequence: u64) {
 /// transaction was aborted. After release, the checkpoint may advance
 /// past the transaction's sequences on the next [`advance`] call.
 pub fn release_fence(begin_sequence: u64) {
-    if let Ok(mut set) = fences().lock() {
-        set.remove(&begin_sequence);
-    }
+    fence_set().remove(&begin_sequence);
 }
 
 /// The lowest active fence sequence, or `None` when no transaction frame
 /// is currently open. The checkpoint may advance up to (but never reach)
 /// this value.
 fn min_fence() -> Option<u64> {
-    fences().lock().ok().and_then(|set| set.iter().next().copied())
+    fence_set().iter().next().copied()
 }
 
 /// The highest checkpoint value that is currently permitted, given the

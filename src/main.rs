@@ -1,12 +1,6 @@
-mod api;
-mod core;
-mod storage;
-mod database;
-mod auth;
-mod config;
-mod crypto;
-mod tls_server;
 mod cli;
+
+use facetql::{api, auth, config, crypto, database, storage, tls_server};
 
 use api::routes::create_router;
 use database::{Database, DatabaseError};
@@ -85,6 +79,14 @@ enum Command {
         action: cli::IndexAction,
     },
 
+    /// Manage references between kinds — cascade, restrict and
+    /// set-null on delete (admin only). Talks to a *running* server
+    /// over its API — start the server first.
+    Reference {
+        #[command(subcommand)]
+        action: cli::ReferenceAction,
+    },
+
     /// Fetch a single node by address.
     Get(cli::GetArgs),
 
@@ -99,6 +101,15 @@ enum Command {
 
     /// Show node counts per kind, for the supplied token's view.
     Stats(cli::StatsArgs),
+
+    /// Print the per-endpoint authorization matrix this build enforces:
+    /// every route, who may call it, what it costs, and the per-object
+    /// rule its handler applies. Offline — no server, no token.
+    Routes {
+        /// Emit JSON instead of the aligned table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 
@@ -159,6 +170,12 @@ async fn main() {
             }
         }
 
+        Some(Command::Reference { action }) => {
+            if let Err(e) = cli::run_reference(action).await {
+                cli::report_error(e);
+            }
+        }
+
         Some(Command::Get(args)) => {
             if let Err(e) = cli::run_get(args).await {
                 cli::report_error(e);
@@ -185,6 +202,12 @@ async fn main() {
 
         Some(Command::Stats(args)) => {
             if let Err(e) = cli::run_stats(args).await {
+                cli::report_error(e);
+            }
+        }
+
+        Some(Command::Routes { json }) => {
+            if let Err(e) = cli::run_routes(json) {
                 cli::report_error(e);
             }
         }
@@ -473,6 +496,16 @@ async fn run_server(
      * permissions problem was the one failure that came out as a panic
      * instead of a diagnosis.
      */
+    /*
+     * Before anything is opened, read or bound: is this a configuration
+     * we are willing to serve with at all? A database that starts under
+     * the development credentials has already lost — the door and the
+     * disk are both open — and it starts looking exactly like a healthy
+     * one, so the check has to happen here rather than being noticed
+     * later.
+     */
+    enforce_deployment_posture(tls_identity.is_some());
+
     let db = match Database::new() {
         Ok(db) => std::sync::Arc::new(db),
 
@@ -486,13 +519,31 @@ async fn run_server(
         config::data_dir().display()
     );
 
+    /*
+     * The banner used to end with "a single admin dev token is used if
+     * ENOCHIAN_TOKENS is unset — do not run production traffic against
+     * that", which is no longer true and has not been the useful thing
+     * to say since `enforce_deployment_posture` made it impossible: in
+     * production that configuration does not start, and in development
+     * the posture block above has already listed it as a finding. So the
+     * banner states what this process will actually enforce, and points
+     * at the command that prints the rest.
+     */
     println!(
-        "Auth: requests to /node* and /edge* require header \
-         'x-api-key', mapped to an owner identity via ENOCHIAN_TOKENS \
-         (format: token1:alice,token2:bob) plus any users created via \
-         POST /admin/users. A single admin dev token is used if \
-         ENOCHIAN_TOKENS is unset — do not run production traffic \
-         against that."
+        "Auth: every route except GET / requires header 'x-api-key', \
+         resolved to an owner identity via ENOCHIAN_TOKENS \
+         (token:owner[:admin], comma-separated) or the persistent users \
+         created through POST /admin/users. Run `facetql routes` for the \
+         per-endpoint authorization matrix this build enforces."
+    );
+
+    println!(
+        "Guards: body <= {} bytes, {} s per request, <= {} in-flight \
+         requests, per-identity rate limits by endpoint class \
+         (FACETQL_RATE_READ/WRITE/BULK/ADMIN/SUBSCRIBE).",
+        api::limits::max_body_bytes(),
+        api::limits::request_timeout().as_secs(),
+        api::limits::max_concurrent_requests(),
     );
 
     let listener =
@@ -631,6 +682,122 @@ async fn run_server(
     settle(&db);
 }
 
+/// Refuse to serve with development credentials, or in the clear,
+/// unless this is declared to be a development deployment.
+///
+/// # The problem this replaces
+///
+/// Both credential defaults announced themselves and carried on:
+/// `auth.rs` printed `warning: ENOCHIAN_TOKENS not set` and admitted a
+/// published admin token, `crypto.rs` printed `warning:
+/// ENOCHIAN_MASTER_KEY not set` and encrypted the whole database under
+/// thirty-two zero bytes. Together they are total compromise —
+/// administrator at the door, plaintext at rest — reachable by doing
+/// nothing at all, and the only signal was two lines on stderr that a
+/// supervisor capturing stdout never sees and that scroll away in the
+/// first seconds of traffic. A warning changes no behaviour; that is
+/// what makes it the wrong instrument for a condition that must not be
+/// served through.
+///
+/// # Why the default posture is production
+///
+/// See [`config::Deployment`]. The short version: the alternative puts
+/// the safe behaviour behind something an operator has to remember, and
+/// forgetting then produces a running, serving, fully-compromised
+/// database. Here, forgetting produces this refusal, which names the
+/// variable to set. One of those failure modes is recoverable in
+/// seconds and the other is a breach.
+///
+/// # What is checked
+///
+/// Three things, and all findings are reported together rather than one
+/// per restart — an operator fixing a production launch should learn
+/// everything that is wrong in one pass:
+///
+///  1. the bootstrap credentials (`auth::credential_defect`),
+///  2. the at-rest key (`crypto::key_defect`),
+///  3. plaintext HTTP without the explicit acknowledgement that TLS is
+///     terminated in front of this process
+///     (`config::plaintext_acknowledged`).
+///
+/// In a development deployment the same findings are printed as
+/// warnings and the server starts, which is the behaviour that existed
+/// before — kept, because a developer running `cargo run` with no
+/// environment at all is the case the defaults were written for.
+fn enforce_deployment_posture(tls_configured: bool) {
+    let mut findings: Vec<String> = Vec::new();
+
+    if let Some(defect) = auth::credential_defect() {
+        findings.push(defect.to_string());
+    }
+
+    if let Some(defect) = crypto::key_defect() {
+        findings.push(defect.to_string());
+    }
+
+    if !tls_configured && !config::plaintext_acknowledged() {
+        findings.push(
+            "no TLS identity is configured, so every request — including \
+             the x-api-key bearer token in its header — would cross the \
+             network in the clear"
+                .to_string(),
+        );
+    }
+
+    if findings.is_empty() {
+        return;
+    }
+
+    if !config::deployment().is_production() {
+        eprintln!();
+        eprintln!(
+            "FacetQL is running in DEVELOPMENT posture ({}=development). \
+             Not safe for real data:",
+            config::ENV_VAR
+        );
+
+        for finding in &findings {
+            eprintln!("  - {finding}");
+        }
+
+        eprintln!();
+
+        return;
+    }
+
+    eprintln!();
+    eprintln!("FacetQL refused to start — the configuration is not one it will serve with.");
+    eprintln!();
+    eprintln!("  Posture: production (the default; {} is not set to `development`)", config::ENV_VAR);
+    eprintln!();
+    eprintln!("  What is wrong:");
+
+    for finding in &findings {
+        eprintln!("    - {finding}");
+    }
+
+    eprintln!();
+    eprintln!("  Next steps — set what applies, then start again:");
+    eprintln!("    1. Real bootstrap credentials, at least one of them an admin:");
+    eprintln!("         export {}=\"$(openssl rand -hex 32):root:admin\"", auth::TOKENS_ENV);
+    eprintln!("       Then create every further identity through POST /admin/users.");
+    eprintln!("    2. A real at-rest key — 64 hex characters, kept with the data it");
+    eprintln!("       encrypts, because losing it loses the database:");
+    eprintln!("         export {}=\"$(openssl rand -hex 32)\"", crypto::MASTER_KEY_ENV);
+    eprintln!("    3. TLS. Either serve it here:");
+    eprintln!("         --tls-identity <file.p12> --tls-identity-password <password>");
+    eprintln!("       or, if TLS is terminated by a proxy in front of this process,");
+    eprintln!("       say so explicitly:");
+    eprintln!("         export {}=1", config::ALLOW_PLAINTEXT_ENV);
+    eprintln!();
+    eprintln!("  If this really is a development machine and none of the above is");
+    eprintln!("  meant to be real:");
+    eprintln!("         export {}=development", config::ENV_VAR);
+    eprintln!();
+
+    std::process::exit(config::EXIT_INSECURE_CONFIGURATION);
+}
+
 /// How long a shutdown waits for open connections before stopping
 /// anyway.
 ///
@@ -741,6 +908,21 @@ mod cli_tests {
         }
     }
 
+    /// `facetql routes` takes no connection options at all — it reports
+    /// what this binary enforces, not what a server says.
+    #[test]
+    fn routes_parses_without_a_token_or_url() {
+        match parse(&["facetql", "routes"]).command {
+            Some(Command::Routes { json }) => assert!(!json),
+            other => panic!("expected Routes, got {other:?}"),
+        }
+
+        match parse(&["facetql", "routes", "--json"]).command {
+            Some(Command::Routes { json }) => assert!(json),
+            other => panic!("expected Routes, got {other:?}"),
+        }
+    }
+
     #[test]
     fn json_flag_sets_output_mode() {
         let cli = parse(&["facetql", "get", "addr1", "--json"]);
@@ -846,13 +1028,142 @@ mod cli_tests {
             "created_at", "--token", "T",
         ]);
         match cli.command {
-            Some(Command::Index { action: cli::IndexAction::Create { name, kind, field, common } }) => {
+            Some(Command::Index {
+                action:
+                    cli::IndexAction::Create {
+                        name, kind, field, unique, text, common,
+                    },
+            }) => {
                 assert_eq!(name, "post_created");
                 assert_eq!(kind, "Post");
                 assert_eq!(field, "created_at");
                 assert_eq!(common.token.as_deref(), Some("T"));
+
+                // An index is not a constraint unless it was asked to
+                // be: the flag's absence has to mean an ordinary index,
+                // or every existing declaration would start refusing
+                // duplicate values.
+                assert!(!unique, "unique is opt-in");
+
+                // And it is an ordered index unless it was asked to be
+                // an inverted one, for the same reason: the flag's
+                // absence has to keep meaning what it always meant.
+                assert!(!text, "text is opt-in");
             }
             other => panic!("expected index create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_create_takes_the_text_flag() {
+        let cli = parse(&[
+            "facetql", "index", "create", "post_body", "--kind", "Post", "--field",
+            "body", "--text",
+        ]);
+
+        match cli.command {
+            Some(Command::Index {
+                action: cli::IndexAction::Create { text, unique, .. },
+            }) => {
+                assert!(text);
+                assert!(!unique, "the two flags are independent");
+            }
+            other => panic!("expected index create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_create_takes_the_unique_flag() {
+        let cli = parse(&[
+            "facetql", "index", "create", "handle", "--kind", "User", "--field",
+            "handle", "--unique",
+        ]);
+
+        match cli.command {
+            Some(Command::Index {
+                action: cli::IndexAction::Create { unique, .. },
+            }) => assert!(unique),
+            other => panic!("expected index create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_create_parses_both_shapes() {
+        // By address: no --parent-field, which is the common case and
+        // the server's own default.
+        let cli = parse(&[
+            "facetql", "reference", "create", "post_comments", "--kind", "Comment",
+            "--field", "post", "--parent-kind", "Post", "--on-delete", "cascade",
+        ]);
+
+        match cli.command {
+            Some(Command::Reference {
+                action:
+                    cli::ReferenceAction::Create {
+                        name,
+                        kind,
+                        field,
+                        parent_kind,
+                        parent_field,
+                        on_delete,
+                        ..
+                    },
+            }) => {
+                assert_eq!(name, "post_comments");
+                assert_eq!(kind, "Comment");
+                assert_eq!(field, "post");
+                assert_eq!(parent_kind, "Post");
+                assert_eq!(parent_field, None);
+                assert_eq!(on_delete, "cascade");
+            }
+            other => panic!("expected reference create, got {other:?}"),
+        }
+
+        // By a data field of the parent.
+        let cli = parse(&[
+            "facetql", "reference", "create", "author", "--kind", "Post", "--field",
+            "author_id", "--parent-kind", "User", "--parent-field", "id",
+            "--on-delete", "restrict",
+        ]);
+
+        match cli.command {
+            Some(Command::Reference {
+                action: cli::ReferenceAction::Create { parent_field, on_delete, .. },
+            }) => {
+                assert_eq!(parent_field.as_deref(), Some("id"));
+                assert_eq!(on_delete, "restrict");
+            }
+            other => panic!("expected reference create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_create_rejects_an_action_that_is_not_one() {
+        // The three actions are the whole vocabulary. A typo has to be
+        // a usage error here rather than a 400 from the server after a
+        // round trip — and rather than a rule that silently does
+        // nothing.
+        let err = Cli::try_parse_from([
+            "facetql", "reference", "create", "r", "--kind", "Comment", "--field",
+            "post", "--parent-kind", "Post", "--on-delete", "delete",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn reference_drop_requires_confirmation_or_yes() {
+        let cli = parse(&["facetql", "reference", "drop", "post_comments", "--yes"]);
+
+        match cli.command {
+            Some(Command::Reference {
+                action: cli::ReferenceAction::Drop { name, yes, .. },
+            }) => {
+                assert_eq!(name, "post_comments");
+                assert!(yes);
+            }
+            other => panic!("expected reference drop, got {other:?}"),
         }
     }
 

@@ -126,6 +126,33 @@ pub enum IndexAction {
         /// would pass to `query --order`.
         #[arg(long)]
         field: String,
+        /// Refuse any write that would give two nodes of this kind the
+        /// same value for this field.
+        ///
+        /// A constraint, not a hint: it is checked inside the writer
+        /// lock ahead of the WAL, so two callers racing for one value
+        /// cannot both win. Declaring it over data that already holds a
+        /// duplicate is refused rather than silently created false —
+        /// and it is also what a reference by `--parent-field` resolves
+        /// through, since a value two nodes can hold names neither.
+        #[arg(long)]
+        unique: bool,
+        /// Build an inverted index over the field's *text* instead of an
+        /// ordered index over its value.
+        ///
+        /// This is the index a search box needs. Without it,
+        /// `contains(field, q)` reads every node of the kind, decodes
+        /// its JSON and tests it; with it, the server reads only the
+        /// rows whose text holds every three-byte window of `q` and
+        /// tests those. The answer is identical either way — the index
+        /// narrows which rows are read, it never decides which ones
+        /// match — so declaring or dropping it changes only the cost.
+        ///
+        /// It serves `contains`, `starts_with` and `ends_with`, since
+        /// all three are substring tests. It cannot be `--unique`: it
+        /// stores windows of a value, not the value.
+        #[arg(long)]
+        text: bool,
         #[command(flatten)]
         common: ClientArgs,
     },
@@ -134,12 +161,14 @@ pub enum IndexAction {
         #[command(flatten)]
         common: ClientArgs,
     },
-    /// Drop a declared index.
+    /// Drop a declared index, of either kind.
     ///
     /// Never breaks a query: one that was being served by this index
-    /// falls back to the materialize-and-sort path. It is still gated
-    /// behind a confirmation like the other removals, because rebuilding
-    /// costs another full read of the kind.
+    /// falls back to the scan it used before the index existed — the
+    /// materialize-and-sort path for an ordered index, the row-by-row
+    /// substring test for a text one. It is still gated behind a
+    /// confirmation like the other removals, because rebuilding costs
+    /// another full read of the kind.
     Drop {
         /// Name of the index to drop.
         name: String,
@@ -149,6 +178,169 @@ pub enum IndexAction {
         #[command(flatten)]
         common: ClientArgs,
     },
+}
+
+/// `facetql reference <action>` — referential integrity between kinds
+/// (admin only).
+///
+/// A reference is the operator's declaration that one `data` field of
+/// one kind points at another kind, and what deleting the referenced
+/// node does to the nodes referencing it. Unlike an index it changes
+/// what a write *means*, not what it costs: with a `cascade` declared,
+/// deleting a post removes its comments in the same frame, which is the
+/// one thing an application cannot do for itself without holding the
+/// whole graph in memory and risking a crash between two transactions.
+///
+/// Admin-only for a reason the index endpoints do not have: a reference
+/// decides what a delete does, so an application that could declare one
+/// could arrange for another owner's rows to be removed.
+#[derive(Subcommand, Debug)]
+pub enum ReferenceAction {
+    /// Declare a reference between two kinds.
+    ///
+    /// Refused unless the access paths that make it cheap already exist:
+    /// an index over `<kind>.<field>`, and — when `--parent-field` is
+    /// given — a *unique* index over `<parent-kind>.<parent-field>`.
+    /// Also refused when the data already breaks the rule, because a
+    /// constraint that is false the moment it is created is worse than
+    /// no constraint.
+    Create {
+        /// Reference name. Letters, digits, '_' and '-' only (max 64
+        /// bytes) — it becomes a URL path segment.
+        name: String,
+        /// The kind that holds the reference — the child.
+        #[arg(long)]
+        kind: String,
+        /// The `data` field on that kind carrying the referenced node's
+        /// key. Null or absent in a row means it references nothing,
+        /// which is always allowed.
+        #[arg(long)]
+        field: String,
+        /// The kind being referenced — the parent.
+        #[arg(long)]
+        parent_kind: String,
+        /// The parent's `data` field the value matches. Omit — the
+        /// usual case — to reference the parent's address.
+        #[arg(long)]
+        parent_field: Option<String>,
+        /// What deleting the parent does: `cascade` removes the
+        /// referencing nodes too, `restrict` refuses the delete while
+        /// any remain, `set-null` clears the field and keeps them.
+        #[arg(long, value_parser = ["cascade", "restrict", "set-null"])]
+        on_delete: String,
+        #[command(flatten)]
+        common: ClientArgs,
+    },
+    /// List every declared reference.
+    List {
+        #[command(flatten)]
+        common: ClientArgs,
+    },
+    /// Drop a declared reference.
+    ///
+    /// The rows it governed are untouched; what stops is the
+    /// enforcement, so a later delete of a referenced node leaves
+    /// whatever pointed at it behind. Confirmed like the other removals
+    /// because that consequence is silent.
+    Drop {
+        /// Name of the reference to drop.
+        name: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        common: ClientArgs,
+    },
+}
+
+pub async fn run_reference(action: ReferenceAction) -> Result<(), CliError> {
+    match action {
+        ReferenceAction::Create {
+            name,
+            kind,
+            field,
+            parent_kind,
+            parent_field,
+            on_delete,
+            common,
+        } => {
+            validate_index_name(&name)?;
+            validate_kind(&kind)?;
+            validate_field(&field)?;
+            validate_kind(&parent_kind)?;
+
+            if let Some(parent_field) = &parent_field {
+                validate_field(parent_field)?;
+            }
+
+            // The wire spells the action snake_case (it is a serde enum
+            // on both sides); the flag spells it the way flags are
+            // spelled. One translation, here, rather than a wire value
+            // shaped by a CLI convention.
+            let wire = on_delete.replace('-', "_");
+
+            let def = common
+                .client()?
+                .create_reference(
+                    &name,
+                    &kind,
+                    &field,
+                    &parent_kind,
+                    parent_field.as_deref(),
+                    &wire,
+                )
+                .await?;
+
+            if common.json {
+                println!("{}", output::json_pretty(&def));
+            } else {
+                let parent = match &parent_field {
+                    Some(f) => format!("{parent_kind}.{f}"),
+                    None => parent_kind.clone(),
+                };
+
+                println!(
+                    "Declared reference {name:?}: {kind}.{field} -> {parent} \
+                     on delete {on_delete}."
+                );
+            }
+
+            Ok(())
+        }
+
+        ReferenceAction::List { common } => {
+            let references = common.client()?.list_references().await?;
+
+            if common.json {
+                println!(
+                    "{}",
+                    output::json_pretty(&serde_json::Value::Array(references))
+                );
+            } else {
+                println!("{}", output::render_references(&references));
+            }
+
+            Ok(())
+        }
+
+        ReferenceAction::Drop { name, yes, common } => {
+            validate_index_name(&name)?;
+
+            confirm_or_abort(
+                yes,
+                &format!(
+                    "Drop reference {name:?}? Deletes stop cascading \
+                     immediately, so rows that referenced a deleted node are \
+                     left behind with nothing pointing them out."
+                ),
+            )?;
+
+            common.client()?.drop_reference(&name).await?;
+            println!("Dropped reference {name:?}.");
+
+            Ok(())
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -361,19 +553,47 @@ pub async fn run_user(action: UserAction) -> Result<(), CliError> {
 
 pub async fn run_index(action: IndexAction) -> Result<(), CliError> {
     match action {
-        IndexAction::Create { name, kind, field, common } => {
+        IndexAction::Create { name, kind, field, unique, text, common } => {
             validate_index_name(&name)?;
             validate_kind(&kind)?;
             validate_field(&field)?;
-            let def = common.client()?.create_index(&name, &kind, &field).await?;
+
+            // Refused here rather than round-tripped, for the reason
+            // `validate_index_name` is: it is a contradiction the client
+            // can see on its own. A text index has no whole value to
+            // hold unique.
+            if text && unique {
+                return Err(CliError::InvalidInput(
+                    "--unique cannot be combined with --text: a text index \
+                     stores windows of a value, not the value. Declare an \
+                     ordered unique index over the same field instead."
+                        .to_string(),
+                ));
+            }
+
+            let mode = if text { "text" } else { "ordered" };
+
+            let def = common
+                .client()?
+                .create_index(&name, &kind, &field, unique, mode)
+                .await?;
             if common.json {
                 println!("{}", output::json_pretty(&def));
-            } else {
-                println!("Declared index {name:?} on {kind}.{field}.");
+            } else if text {
+                println!("Declared text index {name:?} on {kind}.{field}.");
                 // Say the cost out loud: the command has already paid it
                 // by the time this prints, and an operator who did not
                 // expect a full read of the kind should learn that here
                 // rather than from a latency graph.
+                eprintln!(
+                    "Backfilled from every existing {kind} node. Searching \
+                     {field:?} with contains/starts_with/ends_with now reads \
+                     the rows whose text holds the query's three-byte windows \
+                     instead of every node of the kind."
+                );
+            } else {
+                let rule = if unique { " (unique)" } else { "" };
+                println!("Declared index {name:?} on {kind}.{field}{rule}.");
                 eprintln!(
                     "Backfilled from every existing {kind} node. Queries on \
                      this kind ordering by {field:?} now read through the \
@@ -606,4 +826,38 @@ mod tests {
         // With skip=true, no stdin is read and it must succeed.
         assert!(confirm_or_abort(true, "delete?").is_ok());
     }
+}
+
+/// `facetql routes` — print the authorization matrix this build
+/// enforces.
+///
+/// The one command in this module that is *not* a client of a running
+/// server: it reports what the binary in your hand will do, which is the
+/// question an operator has before they start it, not after. No token,
+/// no URL, no network.
+pub fn run_routes(json: bool) -> Result<(), CliError> {
+    if json {
+        let rows: Vec<serde_json::Value> = crate::api::routes::ROUTES
+            .iter()
+            .map(|spec| {
+                serde_json::json!({
+                    "method": spec.method,
+                    "path": spec.path,
+                    "caller": match spec.access {
+                        crate::api::routes::Access::Anonymous => "anonymous",
+                        crate::api::routes::Access::Authenticated => "authenticated",
+                        crate::api::routes::Access::AdminOnly => "admin",
+                    },
+                    "cost_class": format!("{:?}", spec.class).to_lowercase(),
+                    "rule": spec.objects.split_whitespace().collect::<Vec<_>>().join(" "),
+                })
+            })
+            .collect();
+
+        println!("{}", output::json_pretty(&serde_json::Value::Array(rows)));
+    } else {
+        println!("{}", output::render_routes(crate::api::routes::ROUTES));
+    }
+
+    Ok(())
 }

@@ -115,9 +115,14 @@ pub struct StagedCommit {
 impl StagedCommit {
     /// Open a new commit frame.
     ///
-    /// Allocates a fresh non-zero transaction id, appends+fsyncs the
-    /// `BEGIN` marker, and registers a checkpoint fence so the durable
+    /// Allocates a fresh non-zero transaction id, appends the `BEGIN`
+    /// marker, and registers a checkpoint fence so the durable
     /// checkpoint cannot advance into this frame while it is open.
+    ///
+    /// BEGIN is written but not synced: a frame whose COMMIT never
+    /// reaches disk is discarded by recovery whether or not its BEGIN
+    /// survived, so the frame's one `fsync` belongs at [`Self::commit`]
+    /// and covers every record written before it.
     ///
     /// Call this only after the batch has fully validated — an open
     /// frame writes a `BEGIN` to the log, and leaving one un-settled
@@ -144,8 +149,12 @@ impl StagedCommit {
     /// Stage one resolved mutation into the frame.
     ///
     /// The operation is written to the WAL as a record framed under this
-    /// transaction's id (not the standalone id `0`) and fsync'd before
-    /// returning. Returns the record's WAL sequence number.
+    /// transaction's id (not the standalone id `0`). Returns the
+    /// record's WAL sequence number.
+    ///
+    /// Written, not synced — see [`Self::open`]. The frame's durability
+    /// is established once, by [`Self::commit`], for all of its records
+    /// together.
     ///
     /// The operation MUST be a mutation. Passing a transaction-control
     /// operation (`Begin`/`Commit`/`Abort`) is a programming error — the
@@ -190,11 +199,16 @@ impl StagedCommit {
 
     /// Write the atomic COMMIT marker.
     ///
-    /// Appends+fsyncs a `Commit` WAL record for this transaction as the
-    /// final record of the frame. Once this returns `Ok`, the
-    /// transaction is durably committed: a crash from this instant
-    /// onward replays the entire frame on recovery. Returns the COMMIT
-    /// record's WAL sequence.
+    /// Appends a `Commit` WAL record for this transaction as the final
+    /// record of the frame and fsyncs **once**, which flushes BEGIN,
+    /// every staged mutation and this COMMIT together. Once this returns
+    /// `Ok`, the transaction is durably committed: a crash from this
+    /// instant onward replays the entire frame on recovery. Returns the
+    /// COMMIT record's WAL sequence.
+    ///
+    /// This is the frame's only durability boundary, and the reason a
+    /// batch is now cheaper than the same records written individually
+    /// rather than more expensive.
     ///
     /// After this succeeds the caller applies the operations to memory +
     /// physical storage and then calls [`StagedCommit::settle`]. The

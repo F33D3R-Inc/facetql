@@ -55,7 +55,7 @@
 //! descent path — and the cost is small next to the record read each
 //! scanned key leads to.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 use std::sync::Mutex;
@@ -150,6 +150,10 @@ struct TreeState {
     /// Pages already copied during the generation being built, which may
     /// therefore be modified in place.
     dirty: HashSet<u32>,
+
+    /// Generations currently pinned by live [`Snapshot`]s, and how many
+    /// readers hold each. Reclamation consults the oldest.
+    readers: BTreeMap<u64, usize>,
 }
 
 impl TreeState {
@@ -158,11 +162,77 @@ impl TreeState {
     fn building(&self) -> u64 {
         self.generation + 1
     }
+
+    /// The oldest generation any live reader is pinned to, if any.
+    fn oldest_reader(&self) -> Option<u64> {
+        self.readers.keys().next().copied()
+    }
 }
 
 pub struct BTree {
     pager: Pager,
     state: Mutex<TreeState>,
+}
+
+/// A pinned view of one committed generation of a tree.
+///
+/// Created by [`BTree::snapshot`]. While it is alive the tree will not
+/// hand any page that was live at its generation back to the allocator,
+/// so every page it descends through still holds what it held when the
+/// snapshot was taken — even while another thread commits new
+/// generations over the top.
+///
+/// Dropping it releases the pin. Holding one indefinitely does not
+/// corrupt anything; it stalls page reuse, so the file grows.
+pub struct Snapshot<'a> {
+    tree: &'a BTree,
+    generation: u64,
+    root: u32,
+}
+
+impl Snapshot<'_> {
+    /// The generation this view is pinned to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The value stored under `key` as of this snapshot.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.tree.get_at(self.root, key)
+    }
+
+    /// The entry nearest `key` as of this snapshot.
+    pub fn seek(
+        &self,
+        key: &[u8],
+        mode: SeekMode,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.tree.seek_at(self.root, key, mode)
+    }
+
+    /// Visit a key range as of this snapshot.
+    ///
+    /// Every entry comes from the same generation, however long the scan
+    /// takes and however many commits land while it runs.
+    pub fn for_each_range<F>(
+        &self,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        reverse: bool,
+        visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        self.tree
+            .for_each_range_at(self.root, prefix, start_after, reverse, visit)
+    }
+}
+
+impl Drop for Snapshot<'_> {
+    fn drop(&mut self) {
+        self.tree.release_snapshot(self.generation);
+    }
 }
 
 /// What an insert did to the subtree it was applied to.
@@ -236,6 +306,7 @@ impl BTree {
                 entries: state.entries,
                 free: state.free,
                 dirty: HashSet::new(),
+                readers: BTreeMap::new(),
             }),
         })
     }
@@ -263,6 +334,7 @@ impl BTree {
                 entries: 0,
                 free: Vec::new(),
                 dirty: HashSet::new(),
+                readers: BTreeMap::new(),
             }),
         };
 
@@ -343,14 +415,31 @@ impl BTree {
     /// Prefers a page freed at least two generations ago — by then no
     /// meta that could still be recovered references it — and grows the
     /// file only when there is none.
+    ///
+    /// # Live readers
+    ///
+    /// The two-generation rule is about *recovery*: which metas on disk
+    /// could still name the page. It says nothing about a reader that is
+    /// walking the tree right now. A [`Snapshot`] pinned at generation
+    /// `G` descends through pages that were live at `G`, and a page
+    /// released while building generation `g` was live through `g - 1` —
+    /// so it is still reachable by every reader pinned at or below
+    /// `g - 1`. Handing that page to the allocator would let a writer
+    /// overwrite a page a reader is in the middle of, and the reader
+    /// would see a structurally valid page belonging to a different part
+    /// of the tree. Not a crash: a wrong answer.
+    ///
+    /// So reuse additionally requires that the oldest live reader is at
+    /// or past the generation that freed the page. With no readers the
+    /// rule is exactly what it was.
     fn allocate(&self, state: &mut TreeState) -> u32 {
         let building = state.building();
+        let oldest = state.oldest_reader();
 
-        if let Some(index) = state
-            .free
-            .iter()
-            .position(|entry| entry.generation + 2 <= building)
-        {
+        if let Some(index) = state.free.iter().position(|entry| {
+            entry.generation + 2 <= building
+                && oldest.is_none_or(|pinned| pinned >= entry.generation)
+        }) {
             return state.free.swap_remove(index).page;
         }
 
@@ -405,10 +494,71 @@ impl BTree {
         self.lock().entries
     }
 
-    /// The value stored under `key`, if any.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let root = self.lock().root;
+    /// Whether the tree holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
+    /// Pin the current committed tree for reading.
+    ///
+    /// The returned [`Snapshot`] reads the tree as it stood at the
+    /// moment it was taken, and keeps reading it that way however many
+    /// commits happen meanwhile. Two properties come out of that:
+    ///
+    /// * **A scan is internally consistent.** `for_each_range` re-descends
+    ///   for every entry it yields (there are no leaf sibling pointers),
+    ///   so without a pinned root a commit partway through a scan would
+    ///   move the tree under it. Today the engine's global lock is what
+    ///   prevents that; a snapshot is what makes it true on its own.
+    /// * **A reader does not have to exclude a writer.** Copy-on-write
+    ///   already guarantees nothing a committed generation names is
+    ///   overwritten, so the only thing that could invalidate a pinned
+    ///   root was page *reuse* — which [`BTree::allocate`] now withholds
+    ///   while a reader is pinned below the freeing generation.
+    ///
+    /// A snapshot is cheap — two fields and a counter — but it does hold
+    /// reclamation back, so a long-lived one makes a write-heavy tree
+    /// grow its file instead of reusing pages. Take one per query, not
+    /// per connection.
+    pub fn snapshot(&self) -> Snapshot<'_> {
+        let mut state = self.lock();
+
+        let generation = state.generation;
+        let root = state.root;
+
+        *state.readers.entry(generation).or_insert(0) += 1;
+
+        Snapshot {
+            tree: self,
+            generation,
+            root,
+        }
+    }
+
+    /// Release a snapshot's pin. Called from [`Snapshot::drop`].
+    fn release_snapshot(&self, generation: u64) {
+        let mut state = self.lock();
+
+        if let std::collections::btree_map::Entry::Occupied(mut slot) =
+            state.readers.entry(generation)
+        {
+            *slot.get_mut() -= 1;
+
+            if *slot.get() == 0 {
+                slot.remove();
+            }
+        }
+    }
+
+    /// The value stored under `key`, if any.
+    ///
+    /// Reads through a fresh snapshot, so it sees the committed tree and
+    /// nothing a writer is part-way through building.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.snapshot().get(key)
+    }
+
+    fn get_at(&self, root: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let leaf = self.descend(root, key)?;
         let page = self.pager.read(leaf)?;
 
@@ -449,8 +599,15 @@ impl BTree {
         key: &[u8],
         mode: SeekMode,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let root = self.lock().root;
+        self.snapshot().seek(key, mode)
+    }
 
+    fn seek_at(
+        &self,
+        root: u32,
+        key: &[u8],
+        mode: SeekMode,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         // The descent path, as (page id, which child was taken), where
         // child 0 is the leftmost pointer and child k+1 is the k-th
         // cell's.
@@ -494,15 +651,13 @@ impl BTree {
             // `index` is the first entry >= key, so the last entry
             // <= key is at `index` when it matched and `index - 1`
             // otherwise.
-            let end = if found && mode == SeekMode::Le {
+            if found && mode == SeekMode::Le {
                 Some(index)
             } else if index > 0 {
                 Some(index - 1)
             } else {
                 None
-            };
-
-            end
+            }
         };
 
         if let Some(slot) = candidate {
@@ -617,6 +772,21 @@ impl BTree {
         prefix: &[u8],
         start_after: Option<&[u8]>,
         reverse: bool,
+        visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        self.snapshot()
+            .for_each_range(prefix, start_after, reverse, visit)
+    }
+
+    fn for_each_range_at<F>(
+        &self,
+        root: u32,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        reverse: bool,
         mut visit: F,
     ) -> Result<()>
     where
@@ -627,22 +797,19 @@ impl BTree {
         loop {
             let entry = if reverse {
                 match &cursor {
-                    Some(key) => self.seek(key, SeekMode::Lt)?,
+                    Some(key) => self.seek_at(root, key, SeekMode::Lt)?,
                     None => match prefix_upper_bound(prefix) {
-                        Some(bound) => self.seek(&bound, SeekMode::Lt)?,
+                        Some(bound) => self.seek_at(root, &bound, SeekMode::Lt)?,
                         // No upper bound means the prefix is empty (or
                         // all 0xff): the last entry in the tree is the
                         // starting point.
-                        None => {
-                            let root = self.lock().root;
-                            self.edge_entry(root, false)?
-                        }
+                        None => self.edge_entry(root, false)?,
                     },
                 }
             } else {
                 match &cursor {
-                    Some(key) => self.seek(key, SeekMode::Gt)?,
-                    None => self.seek(prefix, SeekMode::Ge)?,
+                    Some(key) => self.seek_at(root, key, SeekMode::Gt)?,
+                    None => self.seek_at(root, prefix, SeekMode::Ge)?,
                 }
             };
 
