@@ -14,6 +14,7 @@ use tokio_stream::{
 };
 
 use crate::database::{Audience, Database, LiveEvent};
+use crate::core::aggregate::{AggFunc, AggSpec};
 use crate::core::node::{Node, Visibility};
 use crate::core::edge::{Edge, EdgeId};
 use crate::core::coordinate::Coordinate;
@@ -266,6 +267,60 @@ pub struct CountByRequest {
 #[derive(Serialize)]
 struct CountByResponse {
     counts: Vec<crate::storage::engine::GroupCount>,
+}
+
+/// `POST /nodes/aggregate` — one aggregate over the rows a filter selects.
+///
+/// The selection half of [`QueryWhereRequest`] plus which aggregate to
+/// compute. `func` is `count`, `sum`, `avg`, `min` or `max`; `field`
+/// names the `data` field being aggregated, and is required by every
+/// function except `count` — which is refused *with* one, because a
+/// `count` that quietly ignored the field the caller named would be
+/// answering a different question than the one asked.
+///
+/// No paging, for the reason [`CountRequest`] has none: the answer is one
+/// value.
+#[derive(Deserialize)]
+pub struct AggregateRequest {
+    pub kind: Option<String>,
+    pub owner: Option<String>,
+    #[serde(rename = "where")]
+    pub where_: Option<Expr>,
+    #[serde(default = "default_item_var")]
+    pub item_var: String,
+    pub func: String,
+    pub field: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AggregateResponse {
+    result: serde_json::Value,
+}
+
+/// `POST /nodes/aggregate_by` — one aggregate per distinct value of a
+/// field.
+///
+/// [`AggregateRequest`] grouped, exactly as [`CountByRequest`] is
+/// [`CountRequest`] grouped, and with the same `values` shortcut: a page
+/// rendering twenty rows asks about those twenty values rather than
+/// grouping the whole kind.
+#[derive(Deserialize)]
+pub struct AggregateByRequest {
+    pub kind: Option<String>,
+    pub owner: Option<String>,
+    #[serde(rename = "where")]
+    pub where_: Option<Expr>,
+    #[serde(default = "default_item_var")]
+    pub item_var: String,
+    pub group_by: String,
+    pub values: Option<Vec<serde_json::Value>>,
+    pub func: String,
+    pub field: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AggregateByResponse {
+    groups: Vec<crate::storage::engine::GroupAggregate>,
 }
 
 fn default_item_var() -> String {
@@ -525,6 +580,20 @@ pub const ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: "/nodes/aggregate",
+        access: Access::Authenticated,
+        objects: "aggregates only rows can_read admits; admin sees every match",
+        class: EndpointClass::Bulk,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/nodes/aggregate_by",
+        access: Access::Authenticated,
+        objects: "aggregates only rows can_read admits; admin sees every match",
+        class: EndpointClass::Bulk,
+    },
+    RouteSpec {
+        method: "POST",
         path: "/edge",
         access: Access::Authenticated,
         objects: "can_write on `from` and can_read on `to`; admin bypasses",
@@ -689,6 +758,8 @@ pub const ROUTES: &[RouteSpec] = &[
 /// | `POST /nodes/query` | `query_nodes_where` |
 /// | `POST /nodes/count` | `count_nodes` |
 /// | `POST /nodes/count_by` | `count_nodes_by` |
+/// | `POST /nodes/aggregate` | `aggregate_nodes` |
+/// | `POST /nodes/aggregate_by` | `aggregate_nodes_by` |
 /// | `POST /edge` | `create_edge` |
 /// | `DELETE /edge` | `delete_edge` (body-addressed, see [`DeleteEdgeRequest`]) |
 /// | `POST /transaction` | `execute_transaction` |
@@ -757,6 +828,8 @@ pub fn create_router(db: Arc<Database>) -> Router {
         .route("/nodes/query", post(query_nodes_where))
         .route("/nodes/count", post(count_nodes))
         .route("/nodes/count_by", post(count_nodes_by))
+        .route("/nodes/aggregate", post(aggregate_nodes))
+        .route("/nodes/aggregate_by", post(aggregate_nodes_by))
         .route("/edge", post(create_edge))
         .route("/edge", delete(delete_edge))
         .route("/transaction", post(execute_transaction))
@@ -1446,6 +1519,125 @@ async fn count_nodes_by(
 
     match result {
         Ok(counts) => (StatusCode::OK, Json(CountByResponse { counts })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+    })
+    .await
+}
+
+/// `POST /nodes/aggregate` — `sum`, `avg`, `min`, `max` or `count` over
+/// the rows a filter selects, as one value.
+///
+/// Same selection and the same visibility rules as `POST /nodes/query`,
+/// including the admin bypass, so an aggregate and the query it
+/// summarises can never disagree about which rows exist for this caller.
+/// It exists for the reason `/nodes/count` does, one level up: without
+/// it, "what do these orders total" is a page of rows crossing the wire
+/// to produce a single number, and a wrong number as soon as the rows do
+/// not fit in one page.
+///
+/// The function/field pair is checked before any row is read, so a `sum`
+/// with no field is a 400 rather than a reply that aggregated nothing.
+///
+/// Classified as a `bulk` endpoint (see `api::limits`), alongside
+/// `/nodes/count` and `/nodes/query`: its cost is set by how much data
+/// the predicate has to be tested against, not by the size of the reply.
+async fn aggregate_nodes(
+    State(db): State<Arc<Database>>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(payload): Json<AggregateRequest>,
+) -> impl IntoResponse {
+    if let Some(refusal) = reject_unbounded_predicate(payload.where_.as_ref()) {
+        return refusal;
+    }
+
+    let spec = match AggFunc::parse(&payload.func)
+        .and_then(|f| AggSpec::new(f, payload.field.clone()))
+    {
+        Ok(spec) => spec,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    db.with_engine(move |engine| {
+
+    let requester = if identity.is_admin() {
+        None
+    } else {
+        Some(identity.owner.as_str())
+    };
+
+    let result = engine.aggregate_where(
+        payload.kind.as_deref(),
+        payload.owner.as_deref(),
+        requester,
+        payload.where_.as_ref(),
+        &payload.item_var,
+        &spec,
+    );
+
+    match result {
+        Ok(result) => {
+            (StatusCode::OK, Json(AggregateResponse { result })).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+    })
+    .await
+}
+
+/// `POST /nodes/aggregate_by` — one aggregate per distinct value of one
+/// `data` field.
+///
+/// The grouped form of `/nodes/aggregate`, and it exists for the reason
+/// `/nodes/count_by` does: a page showing a total per row is one grouped
+/// request, not one request per row. Moving an N+1 from SQL to HTTP does
+/// not stop it being an N+1.
+///
+/// Bounded by `FACETQL_MAX_SCAN_ROWS`, unlike the ungrouped form: the
+/// reply is a result set whose size the data chooses.
+async fn aggregate_nodes_by(
+    State(db): State<Arc<Database>>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(payload): Json<AggregateByRequest>,
+) -> impl IntoResponse {
+    if let Some(refusal) = reject_unbounded_predicate(payload.where_.as_ref()) {
+        return refusal;
+    }
+
+    if payload.group_by.is_empty() {
+        return (StatusCode::BAD_REQUEST, "group_by must name a field").into_response();
+    }
+
+    let spec = match AggFunc::parse(&payload.func)
+        .and_then(|f| AggSpec::new(f, payload.field.clone()))
+    {
+        Ok(spec) => spec,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    db.with_engine(move |engine| {
+
+    let requester = if identity.is_admin() {
+        None
+    } else {
+        Some(identity.owner.as_str())
+    };
+
+    let result = engine.aggregate_by(
+        payload.kind.as_deref(),
+        payload.owner.as_deref(),
+        requester,
+        payload.where_.as_ref(),
+        &payload.item_var,
+        &payload.group_by,
+        payload.values.as_deref(),
+        &spec,
+    );
+
+    match result {
+        Ok(groups) => {
+            (StatusCode::OK, Json(AggregateByResponse { groups })).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
     })

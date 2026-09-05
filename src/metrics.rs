@@ -277,7 +277,9 @@ fn classify(method: &Method, matched: &str) -> RequestClass {
         | "/nodes/multiget"
         | "/nodes/query"
         | "/nodes/count"
-        | "/nodes/count_by" => Read,
+        | "/nodes/count_by"
+        | "/nodes/aggregate"
+        | "/nodes/aggregate_by" => Read,
 
         "/node/:address/claim"
         | "/sequence/:name/next"

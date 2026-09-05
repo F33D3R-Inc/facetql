@@ -383,6 +383,8 @@ impl EndpointClass {
             | ["nodes", "query"]
             | ["nodes", "count"]
             | ["nodes", "count_by"]
+            | ["nodes", "aggregate"]
+            | ["nodes", "aggregate_by"]
             | ["transaction"] => {
                 EndpointClass::Bulk
             }

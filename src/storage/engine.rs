@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use serde::{Serialize, Deserialize};
 
+use crate::core::aggregate::{Accumulator, AggFunc, AggSpec};
 use crate::core::edge::{Edge, EdgeId};
 use crate::core::history::HistoryEntry;
 use crate::core::node::Node;
@@ -2420,6 +2421,13 @@ impl StorageEngine {
     /// The same `kind`/`owner`/visibility filtering and the same pushable
     /// predicate as [`Self::query_where`], answered as a number.
     ///
+    /// This is [`Self::aggregate_where`] with the fold that ignores every
+    /// field, kept as its own call because a count is the one aggregate
+    /// whose answer is an integer rather than a JSON value, and because
+    /// it is by far the most asked. It shares the traversal, which is the
+    /// part that must not fork: a count and a sum over the same filter
+    /// have to agree about which rows exist.
+    ///
     /// # Why this exists rather than "query and count the rows"
     ///
     /// A caller that wants a count and only has a paged read has two bad
@@ -2441,20 +2449,6 @@ impl StorageEngine {
     /// limit on the `bulk` endpoint class (see `api::limits`). Refusing a
     /// count because a kind is large would make `count(Post)` fail on
     /// exactly the databases where the number is most worth having.
-    ///
-    /// # The three access paths, cheapest first
-    ///
-    /// 1. **Index keys only.** With no predicate and no visibility
-    ///    filtering, the answer is how many entries the `kind` (or
-    ///    `owner`) index holds under its prefix. No record is read and no
-    ///    JSON is decoded — the count costs the index range and nothing
-    ///    else.
-    /// 2. **An equality prefix**, when the predicate pins a field a
-    ///    declared index covers: only the entries holding that value are
-    ///    walked, so a count over fifty matches in a million-row kind
-    ///    costs the fifty.
-    /// 3. **The candidate scan**, the general case: the narrowest index
-    ///    the filters allow, decoding each candidate to test it.
     pub fn count_where(
         &self,
         kind: Option<&str>,
@@ -2463,43 +2457,153 @@ impl StorageEngine {
         predicate: Option<&Expr>,
         item_var: &str,
     ) -> Result<u64, String> {
+        let mut acc = Accumulator::new(AggFunc::Count);
+
+        self.fold_where(
+            kind,
+            owner,
+            requester,
+            predicate,
+            item_var,
+            &AggSpec::count(),
+            &mut acc,
+        )?;
+
+        Ok(acc.rows())
+    }
+
+    /// One aggregate over the rows a filter selects — `sum`, `avg`,
+    /// `min`, `max`, or the `count` [`Self::count_where`] returns as an
+    /// integer.
+    ///
+    /// # Why the engine computes this rather than the caller
+    ///
+    /// For the same reason it computes the count. "The total of this
+    /// order's lines" answered by a query is a page of rows crossing the
+    /// wire — or several pages — to produce one number, and that is worse
+    /// on every axis than the scan it replaces: more bytes, more round
+    /// trips, more memory, and a total that is wrong the moment the rows
+    /// do not fit in one page. The rows never have to leave the engine.
+    ///
+    /// # What it costs
+    ///
+    /// The same three access paths [`Self::count_where`] documents, with
+    /// one exception: the cheapest of them counts index keys without
+    /// reading a single record, and an aggregate over a *field* has to
+    /// read the field. So `count` can be answered from the index alone
+    /// and `sum` cannot — see [`AggFunc::needs_field`], which is the one
+    /// place that rule is written down.
+    ///
+    /// Not bounded by `max_scan_rows`, for the reason a count is not: the
+    /// answer is one value however many rows it visits.
+    pub fn aggregate_where(
+        &self,
+        kind: Option<&str>,
+        owner: Option<&str>,
+        requester: Option<&str>,
+        predicate: Option<&Expr>,
+        item_var: &str,
+        spec: &AggSpec,
+    ) -> Result<serde_json::Value, String> {
+        let mut acc = Accumulator::new(spec.func);
+
+        self.fold_where(kind, owner, requester, predicate, item_var, spec, &mut acc)?;
+
+        Ok(acc.finish())
+    }
+
+    /// Walk the rows a filter selects and fold each one into `acc`.
+    ///
+    /// The shared body of [`Self::count_where`] and
+    /// [`Self::aggregate_where`]: the access paths live here once, so
+    /// which rows an aggregate sees is decided in one place for every
+    /// aggregate. What differs between them is entirely inside `acc`.
+    ///
+    /// # The three access paths, cheapest first
+    ///
+    /// 1. **Index keys only.** With no predicate, no visibility filtering
+    ///    and nothing to read out of each row, the answer is how many
+    ///    entries the `kind` (or `owner`) index holds under its prefix.
+    ///    No record is read and no JSON is decoded. Available to `count`
+    ///    alone — every other aggregate needs the record.
+    /// 2. **An equality prefix**, when the predicate pins a field a
+    ///    declared index covers: only the entries holding that value are
+    ///    walked, so an aggregate over fifty matches in a million-row
+    ///    kind costs the fifty.
+    /// 3. **The inverted index**, when the predicate requires a
+    ///    substring one covers: the postings hand back a superset, which
+    ///    is read and re-tested — the same access path `query_where`
+    ///    takes, which is what keeps an aggregate and its query agreeing.
+    /// 4. **The candidate scan**, the general case: the narrowest index
+    ///    the filters allow, decoding each candidate to test it.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_where(
+        &self,
+        kind: Option<&str>,
+        owner: Option<&str>,
+        requester: Option<&str>,
+        predicate: Option<&Expr>,
+        item_var: &str,
+        spec: &AggSpec,
+        acc: &mut Accumulator,
+    ) -> Result<(), String> {
         self.reads_total.fetch_add(1, Ordering::Relaxed);
 
-        let matches = |node: &Node| -> Result<bool, String> {
+        let field = spec.field.as_deref().unwrap_or("");
+
+        // One closure decodes, tests and folds, so a row's JSON is parsed
+        // at most once even when both the predicate and the aggregate
+        // need it.
+        let mut visit = |node: &Node| -> Result<(), String> {
             if let Some(k) = kind
                 && node.kind != k
             {
-                return Ok(false);
+                return Ok(());
             }
 
             if let Some(o) = owner
                 && node.owner != o
             {
-                return Ok(false);
+                return Ok(());
             }
 
             if let Some(r) = requester
                 && !node.can_read(r)
             {
-                return Ok(false);
+                return Ok(());
             }
 
-            let Some(expr) = predicate else {
-                return Ok(true);
-            };
+            if predicate.is_none() && !spec.needs_field() {
+                return acc.fold(field, None);
+            }
 
             let data: serde_json::Value =
                 serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
 
-            predicate::eval(expr, item_var, &data)
-                .map(|v| matches!(v, serde_json::Value::Bool(true)))
-                .map_err(|e| format!("predicate evaluation failed: {e}"))
+            if let Some(expr) = predicate {
+                let verdict = predicate::eval(expr, item_var, &data)
+                    .map_err(|e| format!("predicate evaluation failed: {e}"))?;
+
+                if !matches!(verdict, serde_json::Value::Bool(true)) {
+                    return Ok(());
+                }
+            }
+
+            let value = if spec.needs_field() {
+                data.get(field)
+            } else {
+                None
+            };
+
+            acc.fold(field, value)
         };
 
-        // Path 1: nothing to test per row, so nothing has to be read. The
-        // membership index already knows the answer.
+        // Path 1: nothing to test per row and nothing to read out of it,
+        // so no record is touched. The membership index already knows the
+        // answer.
         if predicate.is_none()
             && requester.is_none()
+            && !spec.needs_field()
             && let Some((index, prefix)) = match (kind, owner) {
                 (Some(k), None) => Some((&self.indexes.kind, keys::kind_prefix(k))),
                 (None, Some(o)) => Some((&self.indexes.owner, keys::owner_prefix(o))),
@@ -2515,15 +2619,16 @@ impl StorageEngine {
                 })
                 .map_err(io_message)?;
 
-            return Ok(total);
+            acc.fold_rows(total);
+
+            return Ok(());
         }
 
-        let mut total = 0u64;
         let mut failure: Option<String> = None;
 
         // Path 2: the predicate pins an indexed field. `None` for the
-        // ordering, because a count has no order to preserve — any access
-        // path that visits each matching row exactly once will do.
+        // ordering, because an aggregate has no order to preserve — any
+        // access path that visits each matching row exactly once will do.
         if let Some((index, literal)) =
             self.equality_prefix_plan(kind, None, predicate, item_var)
         {
@@ -2542,13 +2647,9 @@ impl StorageEngine {
                         return Ok(true);
                     };
 
-                    match matches(&node) {
-                        Ok(true) => total += 1,
-                        Ok(false) => {}
-                        Err(e) => {
-                            failure = Some(e);
-                            return Ok(false);
-                        }
+                    if let Err(e) = visit(&node) {
+                        failure = Some(e);
+                        return Ok(false);
                     }
 
                     Ok(true)
@@ -2557,44 +2658,35 @@ impl StorageEngine {
 
             return match failure {
                 Some(e) => Err(e),
-                None => Ok(total),
+                None => Ok(()),
             };
         }
 
-        // Path 2b: the predicate requires a substring an inverted index
+        // Path 3: the predicate requires a substring an inverted index
         // covers. The postings hand back a superset of the matching
-        // rows, so the count reads those and lets `matches` decide —
-        // the same access path and the same guarantee `query_where`
-        // gets, which is what keeps a count and its query agreeing.
+        // rows, so this reads those and lets `visit` decide — the same
+        // access path and the same guarantee `query_where` gets, which
+        // is what keeps an aggregate and its query agreeing.
         if let Some(candidates) = self
             .text_candidate_plan(kind, predicate, item_var)
             .map_err(io_message)?
         {
             for address in &candidates {
-                let Some(node) = self.read_node(address).map_err(io_message)?
-                else {
+                let Some(node) = self.read_node(address).map_err(io_message)? else {
                     continue;
                 };
 
-                match matches(&node) {
-                    Ok(true) => total += 1,
-                    Ok(false) => {}
-                    Err(e) => return Err(e),
-                }
+                visit(&node)?;
             }
 
-            return Ok(total);
+            return Ok(());
         }
 
-        // Path 3: the general scan.
+        // Path 4: the general scan.
         self.scan_candidates(kind, owner, None, false, |node| {
-            match matches(&node) {
-                Ok(true) => total += 1,
-                Ok(false) => {}
-                Err(e) => {
-                    failure = Some(e);
-                    return Ok(false);
-                }
+            if let Err(e) = visit(&node) {
+                failure = Some(e);
+                return Ok(false);
             }
 
             Ok(true)
@@ -2603,7 +2695,7 @@ impl StorageEngine {
 
         match failure {
             Some(e) => Err(e),
-            None => Ok(total),
+            None => Ok(()),
         }
     }
 
@@ -2624,41 +2716,12 @@ impl StorageEngine {
     /// instead of one per row. The caller asks "how many Likes per
     /// tweet" once and indexes the answer itself.
     ///
-    /// # Why this one IS bounded by `max_scan_rows`
-    ///
-    /// Unlike a plain count, the answer here is a result set whose size
-    /// the data chooses — one entry per distinct value — so the reason
-    /// that bound exists applies in full. A group-by over a field that
-    /// is nearly unique is a request for a copy of the table with the
-    /// rows replaced by ones. Refusing is recoverable; a multi-gigabyte
-    /// map is not.
-    ///
-    /// # The two access paths
-    ///
-    /// With a declared index over the grouped field, and nothing that
-    /// needs a record to decide — no predicate, no visibility filtering
-    /// — the index keys already carry the value: entries sharing a value
-    /// are adjacent, so the counting is a walk of the index and the only
-    /// records read are **one per distinct group**, to recover the value
-    /// in its own JSON type. Otherwise every candidate is decoded, which
-    /// is the same cost as the scan the caller was going to do anyway,
-    /// paid once instead of once per row.
-    ///
     /// # One entry per value
     ///
     /// The reply holds **at most one entry per distinct value**, on
     /// every path. A caller indexes this answer by value — fct's reads
     /// it straight into a map — so a second entry for a value is not a
     /// redundancy it can merge, it is a count it silently drops.
-    ///
-    /// That is why the index path accumulates its runs through the same
-    /// grouping the scan uses instead of emitting one entry per run: a
-    /// run whose representative record was deleted underneath the walk
-    /// cannot name its value, and two such runs would otherwise both be
-    /// reported as `null`. They are counted under `null` alongside the
-    /// rows that genuinely carry no value there — the same bucket the
-    /// scan path puts those in, and the only choice that keeps the
-    /// groups summing to the count.
     #[allow(clippy::too_many_arguments)]
     pub fn count_by(
         &self,
@@ -2670,9 +2733,109 @@ impl StorageEngine {
         group_by: &str,
         values: Option<&[serde_json::Value]>,
     ) -> Result<Vec<GroupCount>, String> {
+        let groups = self.fold_by(
+            kind,
+            owner,
+            requester,
+            predicate,
+            item_var,
+            group_by,
+            values,
+            &AggSpec::count(),
+        )?;
+
+        Ok(groups
+            .into_iter()
+            .map(|(value, acc)| GroupCount { value, count: acc.rows() })
+            .collect())
+    }
+
+    /// One aggregate per distinct value of one `data` field — the grouped
+    /// form of [`Self::aggregate_where`].
+    ///
+    /// Same reason to exist as [`Self::count_by`], one step further: a
+    /// page showing each seller's revenue is one `sum` grouped by seller,
+    /// not one `sum` per seller. The `values` argument is what makes it
+    /// cheap for a rendered page — see [`Self::count_by`] on why asking
+    /// about the twenty values a page renders is a different question
+    /// from grouping the whole kind.
+    ///
+    /// The index-only paths `count_by` can take are not available here,
+    /// for the reason stated on [`AggFunc::needs_field`]: the value being
+    /// aggregated is in the record, so the record is read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn aggregate_by(
+        &self,
+        kind: Option<&str>,
+        owner: Option<&str>,
+        requester: Option<&str>,
+        predicate: Option<&Expr>,
+        item_var: &str,
+        group_by: &str,
+        values: Option<&[serde_json::Value]>,
+        spec: &AggSpec,
+    ) -> Result<Vec<GroupAggregate>, String> {
+        let groups = self.fold_by(
+            kind, owner, requester, predicate, item_var, group_by, values, spec,
+        )?;
+
+        Ok(groups
+            .into_iter()
+            .map(|(value, acc)| GroupAggregate { value, result: acc.finish() })
+            .collect())
+    }
+
+    /// Walk the rows a filter selects, split them by `group_by`, and fold
+    /// each group.
+    ///
+    /// The shared body of [`Self::count_by`] and [`Self::aggregate_by`].
+    ///
+    /// # Why this one IS bounded by `max_scan_rows`
+    ///
+    /// Unlike a plain count, the answer here is a result set whose size
+    /// the data chooses — one entry per distinct value — so the reason
+    /// that bound exists applies in full. A group-by over a field that
+    /// is nearly unique is a request for a copy of the table with the
+    /// rows replaced by ones. Refusing is recoverable; a multi-gigabyte
+    /// map is not.
+    ///
+    /// # The two access paths
+    ///
+    /// With a declared index over the grouped field, nothing that needs
+    /// a record to decide — no predicate, no visibility filtering — and
+    /// an aggregate that reads no field, the index keys already carry
+    /// the value: entries sharing a value are adjacent, so the counting
+    /// is a walk of the index and the only records read are **one per
+    /// distinct group**, to recover the value in its own JSON type.
+    /// Otherwise every candidate is decoded, which is the same cost as
+    /// the scan the caller was going to do anyway, paid once instead of
+    /// once per row.
+    ///
+    /// The index paths accumulate their runs through the same grouping
+    /// the scan uses instead of emitting one entry per run: a run whose
+    /// representative record was deleted underneath the walk cannot name
+    /// its value, and two such runs would otherwise both be reported as
+    /// `null`. They are counted under `null` alongside the rows that
+    /// genuinely carry no value there — the same bucket the scan path
+    /// puts those in, and the only choice that keeps the groups summing
+    /// to the count.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_by(
+        &self,
+        kind: Option<&str>,
+        owner: Option<&str>,
+        requester: Option<&str>,
+        predicate: Option<&Expr>,
+        item_var: &str,
+        group_by: &str,
+        values: Option<&[serde_json::Value]>,
+        spec: &AggSpec,
+    ) -> Result<Vec<(Option<serde_json::Value>, Accumulator)>, String> {
         self.reads_total.fetch_add(1, Ordering::Relaxed);
 
         let cap = max_scan_rows();
+        let func = spec.func;
+        let field = spec.field.as_deref().unwrap_or("");
 
         // Groups are accumulated under the field value's order-preserving
         // encoding rather than under the value itself, for the same
@@ -2680,52 +2843,32 @@ impl StorageEngine {
         // hashable and its text form is not canonical, while this
         // encoding is exactly one byte string per distinct value and is
         // already what "the same value" means everywhere else here.
-        let mut groups: HashMap<Vec<u8>, GroupCount> = HashMap::new();
-
-        let mut note = |value: Option<&serde_json::Value>,
-                        by: u64|
-         -> Result<(), String> {
-            let key = keys::encode_order_value(value);
-
-            match groups.get_mut(&key) {
-                Some(entry) => entry.count += by,
-                None => {
-                    if groups.len() >= cap {
-                        return Err(scan_limit_exceeded(
-                            "grouping by a field with this many distinct values",
-                        )
-                        .to_string());
-                    }
-
-                    groups.insert(
-                        key,
-                        GroupCount {
-                            value: value.cloned(),
-                            count: by,
-                        },
-                    );
-                }
-            }
-
-            Ok(())
-        };
+        let mut groups: HashMap<
+            Vec<u8>,
+            (Option<serde_json::Value>, Accumulator),
+        > = HashMap::new();
 
         // Whichever path filled `groups`, the answer leaves through
         // here. Two paths that each shaped their own reply is how they
         // came to disagree about what a well-formed one is, so the
         // completion and the ordering are written once.
-        let finish = |mut groups: HashMap<Vec<u8>, GroupCount>| -> Vec<GroupCount> {
+        let finish = |mut groups: HashMap<
+            Vec<u8>,
+            (Option<serde_json::Value>, Accumulator),
+        >|
+         -> Vec<(Option<serde_json::Value>, Accumulator)> {
             // A requested value with no matching row still gets an
             // entry: the caller asked about it, so "no rows" is an
             // answer, and an absent key would be indistinguishable from
-            // one the engine forgot.
+            // one the engine forgot. What that entry holds is the
+            // aggregate's own empty answer — `0` for a count or a sum,
+            // `null` for an average that has nothing to average.
             if let Some(wanted) = values {
                 for value in wanted {
                     groups
                         .entry(keys::encode_order_value(Some(value)))
-                        .or_insert_with(|| GroupCount {
-                            value: Some(value.clone()),
-                            count: 0,
+                        .or_insert_with(|| {
+                            (Some(value.clone()), Accumulator::new(func))
                         });
                 }
             }
@@ -2733,10 +2876,11 @@ impl StorageEngine {
             // Sorted so the reply is deterministic — a caller diffing
             // two samples, or a test asserting one, should not be
             // reading hash iteration order.
-            let mut out: Vec<GroupCount> = groups.into_values().collect();
+            let mut out: Vec<(Option<serde_json::Value>, Accumulator)> =
+                groups.into_values().collect();
 
             out.sort_by(|a, b| {
-                keys::compare_order_values(a.value.as_ref(), b.value.as_ref())
+                keys::compare_order_values(a.0.as_ref(), b.0.as_ref())
             });
 
             out
@@ -2754,7 +2898,7 @@ impl StorageEngine {
         if let Some(wanted) = values {
             if wanted.len() > MAX_GROUP_VALUES {
                 return Err(format!(
-                    "count_by was given {} values; the maximum is \
+                    "grouping was given {} values; the maximum is \
                      {MAX_GROUP_VALUES}. Ask for the values a page actually \
                      renders, or omit `values` to group the whole kind.",
                     wanted.len()
@@ -2764,6 +2908,7 @@ impl StorageEngine {
             if predicate.is_none()
                 && requester.is_none()
                 && owner.is_none()
+                && !spec.needs_field()
                 && let Some(k) = kind
                 && let Some(index) = self.indexes.data_find(k, group_by)
             {
@@ -2795,7 +2940,8 @@ impl StorageEngine {
                     // caller asked about it, so "no rows" is an answer and
                     // an absent key would be indistinguishable from one
                     // the engine forgot.
-                    note(Some(value), count)?;
+                    group_entry(&mut groups, cap, func, Some(value))?
+                        .fold_rows(count);
                 }
 
                 return Ok(finish(groups));
@@ -2808,6 +2954,7 @@ impl StorageEngine {
         if predicate.is_none()
             && requester.is_none()
             && owner.is_none()
+            && !spec.needs_field()
             && let Some(k) = kind
             && let Some(index) = self.indexes.data_find(k, group_by)
         {
@@ -2862,13 +3009,16 @@ impl StorageEngine {
                 // vector of its own: runs are distinct by encoded key,
                 // but the values they recover need not be, and a second
                 // entry for a value is a count the caller loses.
-                note(value.as_ref(), count)?;
+                group_entry(&mut groups, cap, func, value.as_ref())?
+                    .fold_rows(count);
             }
 
             return Ok(finish(groups));
         }
 
-        let matches = |node: &Node| -> Result<bool, String> {
+        let matches = |node: &Node,
+                       data: &serde_json::Value|
+         -> Result<bool, String> {
             if let Some(k) = kind
                 && node.kind != k
             {
@@ -2891,10 +3041,7 @@ impl StorageEngine {
                 return Ok(true);
             };
 
-            let data: serde_json::Value =
-                serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
-
-            predicate::eval(expr, item_var, &data)
+            predicate::eval(expr, item_var, data)
                 .map(|v| matches!(v, serde_json::Value::Bool(true)))
                 .map_err(|e| format!("predicate evaluation failed: {e}"))
         };
@@ -2902,7 +3049,10 @@ impl StorageEngine {
         let mut failure: Option<String> = None;
 
         self.scan_candidates(kind, owner, None, false, |node| {
-            match matches(&node) {
+            let data: serde_json::Value =
+                serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
+
+            match matches(&node, &data) {
                 Ok(true) => {}
                 Ok(false) => return Ok(true),
                 Err(e) => {
@@ -2910,9 +3060,6 @@ impl StorageEngine {
                     return Ok(false);
                 }
             }
-
-            let data: serde_json::Value =
-                serde_json::from_str(&node.data).unwrap_or(serde_json::Value::Null);
 
             let value = data.get(group_by);
 
@@ -2928,7 +3075,18 @@ impl StorageEngine {
                 return Ok(true);
             }
 
-            if let Err(e) = note(value, 1) {
+            let folded = group_entry(&mut groups, cap, func, value).and_then(|acc| {
+                acc.fold(
+                    field,
+                    if spec.needs_field() {
+                        data.get(field)
+                    } else {
+                        None
+                    },
+                )
+            });
+
+            if let Err(e) = folded {
                 failure = Some(e);
                 return Ok(false);
             }
@@ -6271,6 +6429,41 @@ fn compare_order_keys(
 /// kilobytes and the work is a handful of index range scans.
 const MAX_GROUP_VALUES: usize = 1_000;
 
+/// Find (or start) the running total for one group.
+///
+/// The single place a group is created, so the cap on distinct values is
+/// enforced once rather than at each path that discovers a new one — and
+/// so an index run and a scanned row that recover the same value land in
+/// the same accumulator instead of two entries the caller cannot merge.
+fn group_entry<'a>(
+    groups: &'a mut HashMap<Vec<u8>, (Option<serde_json::Value>, Accumulator)>,
+    cap: usize,
+    func: AggFunc,
+    value: Option<&serde_json::Value>,
+) -> Result<&'a mut Accumulator, String> {
+    use std::collections::hash_map::Entry;
+
+    let key = keys::encode_order_value(value);
+    let occupied = groups.len();
+
+    match groups.entry(key) {
+        Entry::Occupied(e) => Ok(&mut e.into_mut().1),
+
+        Entry::Vacant(e) => {
+            if occupied >= cap {
+                return Err(scan_limit_exceeded(
+                    "grouping by a field with this many distinct values",
+                )
+                .to_string());
+            }
+
+            Ok(&mut e
+                .insert((value.cloned(), Accumulator::new(func)))
+                .1)
+        }
+    }
+}
+
 /// One distinct value of a grouped field, and how many nodes carry it.
 ///
 /// `value` keeps the field's own JSON type rather than being stringified
@@ -6283,6 +6476,20 @@ const MAX_GROUP_VALUES: usize = 1_000;
 pub struct GroupCount {
     pub value: Option<serde_json::Value>,
     pub count: u64,
+}
+
+/// One distinct value of a grouped field, and the aggregate over the rows
+/// carrying it.
+///
+/// `value` identifies the group exactly as [`GroupCount::value`] does;
+/// `result` is the aggregate's own JSON — an integer for a `count` or an
+/// integer `sum`, a float for an `avg`, `null` for an aggregate with
+/// nothing to fold. Its type is the *field's*, not a number the reply
+/// coerced: `min` over a text column answers with text.
+#[derive(Debug, Serialize)]
+pub struct GroupAggregate {
+    pub value: Option<serde_json::Value>,
+    pub result: serde_json::Value,
 }
 
 /// One page of `query_where` results plus the opaque keyset cursor for
