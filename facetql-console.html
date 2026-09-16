@@ -219,7 +219,6 @@
 <script>
 let serverUrl = '';
 let apiKey = '';
-let eventSource = null;
 
 function logRequest(method, path, status, body) {
   const el = document.getElementById('request-log');
@@ -315,20 +314,63 @@ async function queryNodes() {
   } catch (e) { /* already logged */ }
 }
 
+let feedAbort = null;
+let feedGeneration = 0;
+
+// Not EventSource: it can't send custom headers, which is the only reason
+// the old code put the API key in the URL (?key=) instead of the x-api-key
+// header every other request here uses — a real exposure (server logs,
+// browser history, any proxy in between). GET /events is a plain streaming
+// HTTP response, so fetch() + a manual SSE frame parser gets the same live
+// feed with the key sent the same way as everything else: in the header,
+// never in the URL.
 function startLiveFeed() {
-  if (eventSource) eventSource.close();
-  // EventSource can't send custom headers, so the key goes in the URL
-  // here specifically — see the comment on auth_middleware in
-  // src/auth.rs for the real security tradeoff this involves.
-  eventSource = new EventSource(serverUrl + '/events?key=' + encodeURIComponent(apiKey));
+  if (feedAbort) feedAbort.abort();
+  const gen = ++feedGeneration;
+  feedAbort = new AbortController();
+  runLiveFeed(gen, feedAbort);
+}
+
+async function runLiveFeed(gen, controller) {
   document.getElementById('feed-status').textContent = '';
-  eventSource.onmessage = (e) => {
-    const log = document.getElementById('feed-log');
-    log.textContent = e.data + '\n' + log.textContent;
-  };
-  eventSource.onerror = () => {
-    document.getElementById('feed-status').textContent = '(disconnected)';
-  };
+  try {
+    const res = await fetch(serverUrl + '/events', {
+      headers: { 'x-api-key': apiKey },
+      signal: controller.signal
+    });
+    if (!res.ok || !res.body) throw new Error('feed connect failed: ' + res.status);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let sep;
+      while ((sep = buf.indexOf('\n\n')) !== -1) {
+        const rawEvent = buf.slice(0, sep);
+        buf = buf.slice(sep + 2);
+        // Only `data:` lines carry a real message — keep-alive frames are
+        // comment lines (`:...`) and are silently not one of these.
+        const dataLines = rawEvent.split('\n')
+          .filter(line => line.startsWith('data:'))
+          .map(line => line.slice(5).replace(/^ /, ''));
+        if (dataLines.length) {
+          const log = document.getElementById('feed-log');
+          log.textContent = dataLines.join('\n') + '\n' + log.textContent;
+        }
+      }
+    }
+    throw new Error('feed closed');
+  } catch (e) {
+    if (e.name === 'AbortError') return; // superseded by a newer connection
+  }
+  document.getElementById('feed-status').textContent = '(disconnected)';
+  // EventSource auto-reconnects on drop; match that instead of just dying.
+  setTimeout(() => {
+    if (gen === feedGeneration) startLiveFeed();
+  }, 3000);
 }
 </script>
 

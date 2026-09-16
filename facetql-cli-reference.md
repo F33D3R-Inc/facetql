@@ -1,8 +1,10 @@
-# FacetQL — CLI Command Reference (v0.9)
+# FacetQL — CLI Command Reference
 
 Every command below is real and built into the `facetql` binary — run
 `facetql --help` or `facetql <command> --help` any time to see this
-from the tool itself.
+from the tool itself, or `facetql --version` to check what you have.
+(This doc intentionally doesn't pin a version number in its title —
+that's what went stale last time.)
 
 ## `facetql` (no subcommand)
 
@@ -80,6 +82,7 @@ could use.
 ```
 facetql index create post_created --kind Post --field created_at --token <admin-token>
 facetql index create handle --kind User --field handle --unique
+facetql index create bio --kind User --field bio --text
 facetql index list
 facetql index drop post_created
 ```
@@ -109,6 +112,15 @@ duplicate is refused rather than silently created false. It is also what
 `reference create --parent-field` resolves through — a value two nodes
 can hold names neither of them.
 
+`--text` builds an inverted index over the field's *text* instead of an
+ordered index over its value — the index a search box needs. Without
+it, `contains(field, q)` (and `starts_with`/`ends_with`) reads every
+node of the kind, decodes its JSON and tests it; with it, the server
+reads only the rows whose text holds every three-byte window of `q`.
+The answer is identical either way, only the cost changes. Cannot be
+combined with `--unique`: a text index stores windows of a value, not
+the value itself.
+
 ### `facetql index list`
 
 Prints every declared index as a `NAME` / `KIND` / `FIELD` table, or the
@@ -127,8 +139,9 @@ success.
 | Flag / env var | Required? | Default | What it does |
 |---|---|---|---|
 | `--kind` | `create` only | — | Node `kind` the index covers |
-| `--field` | `create` only | — | Top-level `data` field to keep ordered |
-| `--unique` | no | off | `create` only — refuse duplicate values for the field |
+| `--field` | `create` only | — | Top-level `data` field to keep ordered (or indexed for text search) |
+| `--unique` | no | off | `create` only — refuse duplicate values for the field. Cannot combine with `--text` |
+| `--text` | no | off | `create` only — build a text/substring index instead of an ordered one, for `contains`/`starts_with`/`ends_with`. Cannot combine with `--unique` |
 | `--yes` | no | off | `drop` only — skip the confirmation prompt |
 | `--url` / `FACETQL_URL` | no | `http://localhost:8080` | Server to talk to |
 | `--token` / `FACETQL_TOKEN` | yes | — | Admin token, sent as `x-api-key` |
@@ -211,31 +224,108 @@ out again.
 | `--token` / `FACETQL_TOKEN` | yes | — | Admin token, sent as `x-api-key` |
 | `--json` | no | off | Emit the server's raw JSON instead of a table |
 
-## `facetql import postgres`
+## `facetql user <action>`
 
-Pulls rows from an existing Postgres table in, one row = one FacetQL
-node, through the same API any other client uses. Needs a *running*
-`facetql start` to import into — it's a client of the API, not a
-direct file-level import.
+Manages identities (admin only) — a client of a *running* server
+(`POST/GET/DELETE /admin/users`).
 
 ```
-facetql import postgres \
-  --pg-url postgres://user:pass@host/dbname \
-  --table clients \
-  --kind Client \
-  --token <admin-or-user-token> \
-  --id-column id \
-  --server http://localhost:8080
+facetql user create alice --token <admin-token>
+facetql user create bob --admin --token <admin-token>
+facetql user list --token <admin-token>
+facetql user delete alice --token <admin-token>
 ```
 
-| Flag / env var | Required? | Default | What it does |
-|---|---|---|---|
-| `--pg-url` | yes | — | Postgres connection string |
-| `--table` | yes | — | Table to import |
-| `--kind` | yes | — | Node `kind` assigned to every imported row |
-| `--token` / `FACETQL_TOKEN` | yes | — | FacetQL token to authenticate the import as |
-| `--id-column` | no | `id` | Column used to build a stable node address |
-| `--server` | no | `http://localhost:8080` | FacetQL server to import into |
+### `facetql user create <owner> [--admin]`
+
+Creates an identity and prints its generated token **exactly once** —
+it cannot be retrieved again, only revoked and recreated. `--admin`
+grants the Admin role, which bypasses ownership checks the way a
+Postgres superuser bypasses `GRANT`.
+
+### `facetql user list`
+
+Lists persistent identities as an `OWNER` / `ROLE` table, or raw JSON
+under `--json`.
+
+### `facetql user delete <owner> [--yes]`
+
+Revokes every persistent token for that owner. Destructive — prompts
+for confirmation unless `--yes` is given.
+
+## `facetql get <address>`
+
+Fetches a single node by address (`GET /node/:address`).
+
+```
+facetql get post:1 --token <token>
+```
+
+## `facetql put <address> --kind <Kind> --data <json>`
+
+Writes a node at a client-supplied address (`POST /node`). `--data`
+must be a JSON document — it's parsed and re-serialized before it's
+sent, so a malformed blob is caught as a usage error, not a round trip.
+
+```
+facetql put post:1 --kind Post --data '{"title":"hello"}' --token <token>
+facetql put post:2 --kind Post --data '{"title":"public"}' --public --token <token>
+```
+
+| Flag | Required? | What it does |
+|---|---|---|
+| `--kind` | yes | Entity kind, e.g. `Post` |
+| `--data` | yes | Node payload as a JSON document — stored opaquely |
+| `--public` | no | Make the node readable by any authenticated identity |
+
+## `facetql delete <address> [--yes]`
+
+Deletes a node by address. Destructive — prompts for confirmation
+unless `--yes` is given. Doesn't erase history: the node's prior
+states stay readable via `GET /node/:address/history` until
+compaction reclaims the bytes.
+
+## `facetql query --kind <Kind>`
+
+Runs one native predicate query and exits (`POST /nodes/query`) — no
+SQL, no REPL. For anything beyond one kind's worth of rows, use the
+HTTP API directly or `facetql-console.html`.
+
+```
+facetql query --kind Post --order created_at --desc --limit 20 --token <token>
+```
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--kind` | — (required) | Entity kind to query |
+| `--limit` | server default | Maximum rows to return (server caps at 500) |
+| `--order` | — | Field within `data` to order by |
+| `--desc` | off | Order descending instead of ascending |
+
+## `facetql stats`
+
+Counts nodes per kind, scoped to what the supplied token can see (an
+admin token sees every node; a user token sees only its own and public
+ones). There's no "enumerate kinds" endpoint server-side, so this
+paginates `GET /nodes` (500 rows at a time) and tallies `kind`
+client-side — it costs proportionally to how much the token can see.
+
+```
+facetql stats --token <token>
+```
+
+## `facetql routes [--json]`
+
+Prints the per-endpoint authorization matrix this build enforces:
+every route, who may call it, its rate-limit cost class, and the
+per-object rule its handler applies. The one command in this file that
+talks to no server at all — it reports what the *binary in your hand*
+will do, offline, with no token and no URL.
+
+```
+facetql routes
+facetql routes --json
+```
 
 ## Global flag (works with every command)
 
@@ -250,7 +340,7 @@ facetql import postgres \
 | `FACETQL_TOKENS` | Bootstrap identities, e.g. `token1:alice,token2:bob:admin` (the `:admin` suffix marks that identity as Admin) |
 | `FACETQL_DATA_DIR` | Same as `--data-dir` |
 | `FACETQL_PORT` | Same as `--port` |
-| `FACETQL_TOKEN` | Default `--token` for every client command (`index`, `user`, `get`, `put`, `delete`, `query`, `stats`). Prefer it over `--token` so the token never lands in shell history |
+| `FACETQL_TOKEN` | Default `--token` for every client command (`index`, `reference`, `user`, `get`, `put`, `delete`, `query`, `stats`). Prefer it over `--token` so the token never lands in shell history |
 | `FACETQL_URL` | Default `--url` for every client command |
 | `FACETQL_MAX_SCAN_ROWS` | Ceiling on rows a sort-path query may materialize. A declared index turns that query into a range scan, so it is no longer subject to this bound |
 
@@ -259,3 +349,5 @@ facetql import postgres \
 - No `facetql stop` — it's a foreground process; stop it the normal way (Ctrl+C, or however your process manager/systemd handles it)
 - No interactive shell — there's no `psql`-style REPL. `facetql query --kind <Kind>` runs one native predicate query and exits; for anything more, use the HTTP API or `facetql-console.html`
 - No index over a nested `data` path, and no multi-field index — an index covers exactly one top-level field of one kind, which is what `query --order` can name
+- No `facetql import postgres` — an earlier version of this tool had one; it was removed, and nothing replaces it. Get rows into FacetQL through `put`/`query` scripting or the HTTP API directly
+- No `facetql sequence` — sequences (`POST /sequence/:name/next`) exist server-side but aren't exposed as a CLI subcommand yet; use the HTTP API

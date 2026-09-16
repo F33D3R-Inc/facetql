@@ -716,14 +716,14 @@ there is no way to retrieve it again. If it is lost, revoke and recreate.
 ### `GET /admin/users` — admin
 
 **200** `[ { "owner": "bob", "role": "User" }, … ]`. Never tokens or
-hashes. Does **not** include `ENOCHIAN_TOKENS` bootstrap identities.
+hashes. Does **not** include `FACETQL_TOKENS` bootstrap identities.
 
 ### `DELETE /admin/users/:owner` — admin
 
 Revokes every persistent record for that owner.
 
 **204** · **404** `no persistent user with that owner`. A bootstrap
-identity cannot be revoked this way — edit `ENOCHIAN_TOKENS` and
+identity cannot be revoked this way — edit `FACETQL_TOKENS` and
 restart.
 
 ### `POST /admin/indexes` — admin

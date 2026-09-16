@@ -28,4 +28,15 @@ pub mod metrics;
 pub mod storage;
 pub mod tls_server;
 
+/// Generated from `schema/facetql_wire.fct` (SCHEMA_IDL_SCOPE.md Tier C:
+/// FCT-as-IDL) via `./scripts/generate-wire.sh`. `#[path]`'d in from
+/// `schema/generated/` rather than living under `src/` so that
+/// `fct/integration`'s stale-binary guard (which conservatively treats any
+/// newer `.rs` file under `facetql/src/` as "rebuild needed") isn't tripped
+/// by every regeneration. DO NOT hand-edit `schema/generated/facetql_wire.rs`
+/// — the CI `wire-schema-drift` job (in the fct repo) fails the build if it
+/// goes stale relative to the schema.
+#[path = "../schema/generated/facetql_wire.rs"]
+pub mod wire;
+
 pub use database::{Database, DatabaseError};

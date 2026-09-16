@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 # Installs the latest FacetQL release binary for macOS or Linux.
-#   curl -fsSL https://raw.githubusercontent.com/FACETQL-LLC/facetql/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/F33D3R-Inc/facetql/main/install.sh | sh
 #
 # Not part of the CI build — this just needs to know the exact asset
 # names release.yml publishes, so if those names change this script
 # needs updating alongside it.
 set -euo pipefail
 
-REPO="FACETQL-LLC/facetql"
-INSTALL_DIR="${ENOCHIAN_INSTALL_DIR:-/usr/local/bin}"
+REPO="F33D3R-Inc/facetql"
+
+# ENOCHIAN_INSTALL_DIR is the pre-rename name (this engine used to be
+# called Enochian) — kept as a fallback for one release so an existing
+# deployment that still exports it keeps working until it migrates.
+if [ -z "${FACETQL_INSTALL_DIR:-}" ] && [ -n "${ENOCHIAN_INSTALL_DIR:-}" ]; then
+  echo "warning: ENOCHIAN_INSTALL_DIR is deprecated and will be removed in a future release — set FACETQL_INSTALL_DIR instead. Using its value for now." >&2
+  FACETQL_INSTALL_DIR="$ENOCHIAN_INSTALL_DIR"
+fi
+INSTALL_DIR="${FACETQL_INSTALL_DIR:-/usr/local/bin}"
 
 os="$(uname -s)"
 arch="$(uname -m)"

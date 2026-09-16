@@ -1,0 +1,15 @@
+# Config for `cargo audit` (run in CI by .github/workflows/audit.yml).
+#
+# Advisories are ignored here only when upgrading is a real migration, not a
+# version bump, and the advisory is a maintenance warning rather than an
+# exploitable vulnerability. Anything with an actual CVE/exploit path must be
+# fixed, not listed here.
+[advisories]
+ignore = [
+    # bincode 1.3.3 is unmaintained (no CVE). facetql's on-disk WAL/heap/
+    # catalog format (src/storage/{binary,catalog,heap,wal}.rs) is encoded
+    # with it; moving to bincode 3's Encode/Decode API is a real on-disk
+    # format migration, not a drop-in bump, and is out of scope for a
+    # dependency-audit pass. Tracked as follow-up work, not silently ignored.
+    "RUSTSEC-2025-0141",
+]

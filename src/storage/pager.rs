@@ -297,7 +297,7 @@ impl PagerInner {
                 ErrorKind::InvalidData,
                 format!(
                     "failed to decrypt page {id} of {}: {e} — wrong \
-                     ENOCHIAN_MASTER_KEY, or the page is damaged",
+                     FACETQL_MASTER_KEY, or the page is damaged",
                     path.display()
                 ),
             )

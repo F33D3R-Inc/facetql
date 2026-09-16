@@ -1,0 +1,38 @@
+name: Security audit
+
+# Catches the exact drift class that let openssl sit three RustSec advisories
+# behind (see AGENT_LOG.md) before anyone noticed: advisories publish on their
+# own schedule, independent of any commit here, so this runs daily as well as
+# on every change to the lockfile/manifest. Ignored advisories (maintenance
+# warnings with no fix available yet, not exploitable vulnerabilities) are
+# tracked explicitly in .cargo/audit.toml, never silenced by widening this
+# workflow.
+on:
+  push:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/audit.yml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/audit.yml"
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        run: cargo audit

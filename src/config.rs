@@ -213,3 +213,74 @@ pub const ALLOW_PLAINTEXT_ENV: &str = "FACETQL_ALLOW_PLAINTEXT";
 pub fn plaintext_acknowledged() -> bool {
     std::env::var_os(ALLOW_PLAINTEXT_ENV).is_some()
 }
+
+// ---------------------------------------------------------------------
+// ENOCHIAN_* -> FACETQL_* deprecation shim
+// ---------------------------------------------------------------------
+
+/// `(current name, deprecated name)` for every environment variable that
+/// used to carry the project's old `ENOCHIAN_` prefix (a leftover from
+/// this engine's previous name). Kept for one release as a compatibility
+/// shim: an existing deployment that still exports the old name keeps
+/// working until it migrates.
+///
+/// The four CLI-facing names are listed here as literals because they
+/// live on `clap` `#[arg(env = "...")]` attributes in `main.rs`, which
+/// require a string literal rather than a constant; `auth::TOKENS_ENV`
+/// and `crypto::MASTER_KEY_ENV` are referenced instead of duplicated so
+/// this list cannot silently drift from what those modules actually
+/// read.
+const LEGACY_ENV_ALIASES: &[(&str, &str)] = &[
+    (crate::auth::TOKENS_ENV, "ENOCHIAN_TOKENS"),
+    (crate::crypto::MASTER_KEY_ENV, "ENOCHIAN_MASTER_KEY"),
+    ("FACETQL_DATA_DIR", "ENOCHIAN_DATA_DIR"),
+    ("FACETQL_PORT", "ENOCHIAN_PORT"),
+    ("FACETQL_TLS_IDENTITY", "ENOCHIAN_TLS_IDENTITY"),
+    ("FACETQL_TLS_IDENTITY_PASSWORD", "ENOCHIAN_TLS_IDENTITY_PASSWORD"),
+];
+
+/// Applies the `ENOCHIAN_*` -> `FACETQL_*` deprecation shim: for each
+/// pair above, if the current name is unset in this process's
+/// environment and the deprecated name is set, copies the deprecated
+/// value across under the current name (and warns once on stderr).
+///
+/// After this runs, every reader downstream — `clap`'s `env`
+/// attributes in `main.rs`, and the direct `std::env::var` reads in
+/// `auth` and `crypto` — only ever needs to look at the current name;
+/// none of them need to know the old one still exists.
+///
+/// # Why `main` calls this before anything else
+///
+/// It must run before the first read of any variable in the list —
+/// `Cli::parse()` included, since that's where the `env` attributes are
+/// evaluated. `main` calls it as the very first statement, before
+/// `Cli::parse()`.
+///
+/// # Safety of the `set_var` call
+///
+/// `std::env::set_var` is `unsafe` because mutating the environment
+/// while another thread reads it is a data race. That does not apply
+/// here: this runs as the first statement of `main`, before any worker
+/// thread this process starts (Tokio's included) has had a reason to
+/// read an environment variable, and before any application code could
+/// have spawned a thread of its own.
+pub fn apply_legacy_env_aliases() {
+    for (current, deprecated) in LEGACY_ENV_ALIASES {
+        if std::env::var_os(current).is_some() {
+            continue;
+        }
+
+        if let Some(value) = std::env::var_os(deprecated) {
+            eprintln!(
+                "warning: {deprecated} is deprecated and will be removed in a \
+                 future release — set {current} instead. Using its value for now."
+            );
+
+            // SAFETY: see the doc comment above — this runs before any
+            // concurrent reader of the environment exists.
+            unsafe {
+                std::env::set_var(current, value);
+            }
+        }
+    }
+}

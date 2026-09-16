@@ -15,8 +15,8 @@ struct Cli {
     command: Option<Command>,
 
     /// Where data files live. Defaults to ~/.facetql if unset.
-    /// Also settable via ENOCHIAN_DATA_DIR.
-    #[arg(long, global = true, env = "ENOCHIAN_DATA_DIR")]
+    /// Also settable via FACETQL_DATA_DIR.
+    #[arg(long, global = true, env = "FACETQL_DATA_DIR")]
     data_dir: Option<PathBuf>,
 }
 
@@ -28,7 +28,7 @@ enum Command {
     /// Start the server. Also what running `facetql` with no
     /// subcommand does, for backward compatibility.
     Start {
-        #[arg(long, env = "ENOCHIAN_PORT", default_value_t = 8080)]
+        #[arg(long, env = "FACETQL_PORT", default_value_t = 8080)]
         port: u16,
 
         /// Path to a PKCS#12 (.p12/.pfx) file containing both the TLS
@@ -36,11 +36,11 @@ enum Command {
         /// the server speaks HTTPS instead of HTTP. Generate a dev one with:
         /// `openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"`
         /// `openssl pkcs12 -export -out identity.p12 -inkey key.pem -in cert.pem -passout pass:<password>`
-        #[arg(long, env = "ENOCHIAN_TLS_IDENTITY")]
+        #[arg(long, env = "FACETQL_TLS_IDENTITY")]
         tls_identity: Option<PathBuf>,
 
         /// Password for the PKCS#12 file above.
-        #[arg(long, env = "ENOCHIAN_TLS_IDENTITY_PASSWORD")]
+        #[arg(long, env = "FACETQL_TLS_IDENTITY_PASSWORD")]
         tls_identity_password: Option<String>,
     },
 
@@ -115,6 +115,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    // Must run before anything reads an ENOCHIAN_*/FACETQL_* variable,
+    // Cli::parse() included — see config::apply_legacy_env_aliases.
+    config::apply_legacy_env_aliases();
+
     let cli = Cli::parse();
 
     if let Some(dir) = cli.data_dir {
@@ -384,7 +388,7 @@ fn report_startup_failure(error: DatabaseError) -> ! {
             eprintln!("    2. Create it if it is genuinely absent:");
             eprintln!("       facetql init --data-dir {data_dir}");
             eprintln!("    3. If you meant a different directory, pass --data-dir or set");
-            eprintln!("       ENOCHIAN_DATA_DIR, then start again.");
+            eprintln!("       FACETQL_DATA_DIR, then start again.");
         }
 
         /*
@@ -398,13 +402,13 @@ fn report_startup_failure(error: DatabaseError) -> ! {
             eprintln!("  What failed:    a stored record did not authenticate.");
             eprintln!("  Likely cause:   in order of likelihood —");
             eprintln!("                  1. the server was started with the wrong");
-            eprintln!("                     ENOCHIAN_MASTER_KEY. Leaving it unset silently");
+            eprintln!("                     FACETQL_MASTER_KEY. Leaving it unset silently");
             eprintln!("                     uses the all-zero dev key, so an unset key looks");
             eprintln!("                     exactly like a wrong one;");
             eprintln!("                  2. failing that, the file named above is corrupt.");
             eprintln!();
             eprintln!("  Next steps:");
-            eprintln!("    1. Check ENOCHIAN_MASTER_KEY is the same 64-hex-character key");
+            eprintln!("    1. Check FACETQL_MASTER_KEY is the same 64-hex-character key");
             eprintln!("       this data was written with, then start again. A wrong key is");
             eprintln!("       not destructive — nothing has been modified.");
             eprintln!("    2. If the key is right, copy the files aside before anything");
@@ -418,13 +422,13 @@ fn report_startup_failure(error: DatabaseError) -> ! {
             eprintln!("                  checksum, or deserialization.");
             eprintln!("  Likely cause:   the file named above is damaged: bit-rot, an");
             eprintln!("                  interrupted write, or a partial copy. A wrong");
-            eprintln!("                  ENOCHIAN_MASTER_KEY can also present this way, when");
+            eprintln!("                  FACETQL_MASTER_KEY can also present this way, when");
             eprintln!("                  a record decodes but then does not parse.");
             eprintln!();
             eprintln!("  Next steps:");
             eprintln!("    1. Copy the current files aside before touching anything:");
             eprintln!("       facetql backup <dir>");
-            eprintln!("    2. Confirm ENOCHIAN_MASTER_KEY matches the key this data was");
+            eprintln!("    2. Confirm FACETQL_MASTER_KEY matches the key this data was");
             eprintln!("       written with.");
             eprintln!("    3. Restore a known-good copy into an empty data directory:");
             eprintln!("       facetql restore <dir>");
@@ -521,7 +525,7 @@ async fn run_server(
 
     /*
      * The banner used to end with "a single admin dev token is used if
-     * ENOCHIAN_TOKENS is unset — do not run production traffic against
+     * FACETQL_TOKENS is unset — do not run production traffic against
      * that", which is no longer true and has not been the useful thing
      * to say since `enforce_deployment_posture` made it impossible: in
      * production that configuration does not start, and in development
@@ -531,7 +535,7 @@ async fn run_server(
      */
     println!(
         "Auth: every route except GET / requires header 'x-api-key', \
-         resolved to an owner identity via ENOCHIAN_TOKENS \
+         resolved to an owner identity via FACETQL_TOKENS \
          (token:owner[:admin], comma-separated) or the persistent users \
          created through POST /admin/users. Run `facetql routes` for the \
          per-endpoint authorization matrix this build enforces."
@@ -688,9 +692,9 @@ async fn run_server(
 /// # The problem this replaces
 ///
 /// Both credential defaults announced themselves and carried on:
-/// `auth.rs` printed `warning: ENOCHIAN_TOKENS not set` and admitted a
+/// `auth.rs` printed `warning: FACETQL_TOKENS not set` and admitted a
 /// published admin token, `crypto.rs` printed `warning:
-/// ENOCHIAN_MASTER_KEY not set` and encrypted the whole database under
+/// FACETQL_MASTER_KEY not set` and encrypted the whole database under
 /// thirty-two zero bytes. Together they are total compromise —
 /// administrator at the door, plaintext at rest — reachable by doing
 /// nothing at all, and the only signal was two lines on stderr that a

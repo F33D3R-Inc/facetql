@@ -87,12 +87,23 @@ fn public_endpoints(
     Ok(true)
 }
 
-#[derive(Deserialize)]
-pub struct EdgeSpec {
-    pub to: String,
-    pub kind: String,
-}
+/// Generated from `schema/facetql_wire.fct` (SCHEMA_IDL_SCOPE.md Tier C) —
+/// a plain string/kind pair with no numeric or domain-type fields, so it
+/// carries no drift risk that blocks the wider request/response cutover.
+pub type EdgeSpec = crate::wire::EdgeSpec;
 
+/// NOT cut over to `crate::wire::CreateNodeRequest`: `x`/`y`/`z`/`q` are
+/// `u8` here, matching `core::coordinate::Coordinate`'s real, enforced
+/// range (a coordinate axis is bounded 0-255 by its type, not by
+/// convention). FCT's schema language has no sized/unsigned integer type
+/// yet — `int` always generates Rust `i64` — so the generated version
+/// would silently accept `-5` or `9000` and defer the failure to wherever
+/// the value is later narrowed, instead of a clean 400 at the API
+/// boundary. Same gap blocks `TxOpRequest::InsertNode` below, and is why
+/// `CreateNodeResponse`/`CreateNodeError` (which pair with this endpoint)
+/// are left alone too. A real fix is a scoped follow-up to
+/// `SCHEMA_IDL_SCOPE.md` — a bounded/sized integer schema type — not
+/// something to force here.
 #[derive(Deserialize)]
 pub struct CreateNodeRequest {
     pub address: String,
@@ -116,18 +127,12 @@ pub struct CreateNodeRequest {
     pub if_absent: bool,
 }
 
-#[derive(Deserialize)]
-pub struct UpdateNodeRequest {
-    pub data: String,
-    pub public: Option<bool>,
-}
+/// Generated (SCHEMA_IDL_SCOPE.md Tier C) — no numeric or domain-type
+/// fields, so nothing blocks matching it to the schema exactly.
+pub type UpdateNodeRequest = crate::wire::UpdateNodeRequest;
 
-#[derive(Deserialize)]
-pub struct CreateEdgeRequest {
-    pub from: String,
-    pub to: String,
-    pub kind: String,
-}
+/// Generated (SCHEMA_IDL_SCOPE.md Tier C) — plain strings, no drift risk.
+pub type CreateEdgeRequest = crate::wire::CreateEdgeRequest;
 
 /// Body for `DELETE /edge` — the edge to remove, named by the same
 /// three fields `POST /edge` creates it with.
@@ -147,13 +152,16 @@ pub struct CreateEdgeRequest {
 /// identity (see [`EdgeId`]), and the owner that matters here is the
 /// one stored on the edge, which is what authorization is checked
 /// against.
-#[derive(Deserialize)]
-pub struct DeleteEdgeRequest {
-    pub from: String,
-    pub to: String,
-    pub kind: String,
-}
+/// Generated (SCHEMA_IDL_SCOPE.md Tier C) — plain strings, no drift risk.
+pub type DeleteEdgeRequest = crate::wire::DeleteEdgeRequest;
 
+/// NOT cut over to `crate::wire::QueryParams`: `limit`/`offset` are
+/// `usize` here, and FCT's schema language has no unsigned/sized integer
+/// type yet — its `int` always generates Rust `i64`. Swapping would let a
+/// negative `limit`/`offset` deserialize successfully (previously a 400)
+/// and then need an explicit, easy-to-get-wrong cast at every use site.
+/// Left hand-written until the schema gains a real unsigned-int type;
+/// tracked in `SCHEMA_IDL_SCOPE.md`.
 #[derive(Deserialize)]
 pub struct QueryParams {
     pub kind: Option<String>,
@@ -163,6 +171,10 @@ pub struct QueryParams {
 }
 
 /// Body for `POST /sequence/:name/next` — take a block of ids.
+///
+/// NOT cut over: `count`/`first` are `u64` here (a sequence counter can
+/// legitimately approach that range over a long-lived server); FCT's
+/// schema `int` is always `i64`. Same class of gap as [`QueryParams`].
 #[derive(Deserialize)]
 pub struct SequenceRequest {
     /// How many consecutive values to allocate. One if omitted.
@@ -181,11 +193,9 @@ struct SequenceResponse {
     count: u64,
 }
 
-/// Body for `POST /nodes/multiget` — many point reads in one request.
-#[derive(Deserialize)]
-pub struct MultiGetRequest {
-    pub addresses: Vec<String>,
-}
+/// Generated (SCHEMA_IDL_SCOPE.md Tier C) — a plain string list, no
+/// numeric or domain-type fields.
+pub type MultiGetRequest = crate::wire::MultiGetRequest;
 
 /// Body for `POST /nodes/query` — a pushed-down predicate query.
 ///
@@ -199,6 +209,19 @@ pub struct MultiGetRequest {
 /// paginated. `item_var` defaults to `"item"` — FCT's compiler always
 /// sets one, but a hand-written request can rely on the default when
 /// there's only one plausible loop variable in the predicate.
+///
+/// NOT cut over to a generated type — nor is any type below it down to
+/// [`AggregateByResponse`]. Every one of them carries `Expr`
+/// (`crate::core::predicate::Expr`), which is already the single,
+/// canonical Rust implementation of the predicate AST — nothing else in
+/// this crate hand-copies it. Pointing these structs at a *generated*
+/// `Expr` would introduce a second, competing `Expr` type in Rust purely
+/// to satisfy the schema, which is the opposite of this effort's goal:
+/// the schema's own `Expr` exists so Go/TS codegen can be proven to match
+/// Rust, not to replace Rust's already-authoritative copy. `limit`/
+/// `offset` here have the same `usize`-vs-`i64` gap as [`QueryParams`],
+/// and the two response types below carry `u64` counts from
+/// `storage::engine::{GroupCount, GroupAggregate}` for the same reason.
 #[derive(Deserialize)]
 pub struct QueryWhereRequest {
     pub kind: Option<String>,
@@ -1905,6 +1928,10 @@ async fn get_edges_out(
 
 // ── transactions ────────────────────────────────────────────────────────
 
+/// NOT cut over to `crate::wire::TxOp`/`TransactionRequest`: `InsertNode`
+/// carries the same `u8` coordinate fields as [`CreateNodeRequest`], and
+/// `DeleteWhere` carries `Expr` — both real, already-documented reasons
+/// above that block a faithful generated replacement today.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TxOpRequest {
@@ -2379,10 +2406,23 @@ async fn get_edges_in(
 /// is a sign the channel is being used as a transport, which it is not.
 const MAX_EVENT_PAYLOAD: usize = 64 * 1024;
 
-#[derive(Deserialize)]
-pub struct PublishRequest {
-    pub payload: String,
-}
+/// `fct`'s caller (`runtime/cluster.go`) sends a `channel` field alongside
+/// `payload`, kept for wire parity with the Postgres `LISTEN/NOTIFY` this
+/// replaced (a channel name was part of that call). `PublishRequest` has no
+/// field for it on purpose: this handler's audience is the caller's identity
+/// (see below), never a name in the body, so serde drops an unknown
+/// `channel` exactly as it should. The one place `channel` is load-bearing
+/// is `fabric-facetql`'s frontdoor, which reads it out of the raw request
+/// body *before* forwarding to route a publish to exactly one backend by
+/// keyspace — a sharding concern one layer above this one (see
+/// `fabric/crates/fabric-facetql/src/frontdoor/plan.rs`,
+/// `a_publish_routes_by_its_channel_to_exactly_one_backend`). Giving this
+/// struct a matching field would make FacetQL a second, redundant place to
+/// interpret the same name for a purpose it was never meant to serve here.
+/// Cut over to the generated type (SCHEMA_IDL_SCOPE.md Tier C): the
+/// schema's own `PublishRequest` is payload-only too, for the same
+/// deliberate reason documented above — matches exactly.
+pub type PublishRequest = crate::wire::PublishRequest;
 
 /// Publishes an arbitrary application-level message onto the `/events`
 /// feed, alongside the messages FacetQL already sends itself for
@@ -2457,6 +2497,10 @@ async fn publish_event(
 }
 
 /// Query for `GET /events`.
+///
+/// NOT cut over: `after` is `u64` (same gap as [`QueryParams`]); a
+/// generated `i64` would accept a negative resume position instead of a
+/// clean 400.
 #[derive(Deserialize)]
 pub struct EventsQuery {
     /// Resume: deliver every retained event whose `seq` is strictly
@@ -2604,6 +2648,9 @@ async fn subscribe_events(
 }
 
 /// Query for `GET /changes`.
+///
+/// NOT cut over: `after`/`limit` are `u64`/`usize` (same gap as
+/// [`QueryParams`]/[`EventsQuery`]).
 #[derive(Deserialize)]
 pub struct ChangesQuery {
     /// Return committed changes whose position is strictly greater than
@@ -2807,28 +2854,31 @@ async fn stats(
 
 // ── admin: user management ─────────────────────────────────────────────
 
-#[derive(Deserialize)]
-pub struct CreateUserRequest {
-    pub owner: String,
-    /// "admin" or "user" (or omitted — defaults to "user"). Only an
-    /// existing admin can create another admin; enforced below, not by
-    /// trusting this field alone.
-    pub role: Option<String>,
+/// Cut over to the generated type (SCHEMA_IDL_SCOPE.md Tier C): fields
+/// match exactly (`role` is a caller-supplied free string here, validated
+/// below — not the `Role` enum, so there's no domain-type entanglement).
+pub type CreateUserRequest = crate::wire::CreateUserRequest;
+
+/// `core::user::Role` → the generated wire `Role`. Both are the same two
+/// variants (`User`/`Admin`) with the same wire text — trivial, but real:
+/// this is the one enum in the cutover where a hand-written domain type
+/// and the generated wire type genuinely coexist on purpose (the domain
+/// type is what the engine stores and checks against; the wire type is
+/// what `CreateUserResponse`/`UserSummary` serialize), so a conversion at
+/// the boundary is correct rather than a workaround.
+fn wire_role(role: Role) -> crate::wire::Role {
+    match role {
+        Role::User => crate::wire::Role::User,
+        Role::Admin => crate::wire::Role::Admin,
+    }
 }
 
-#[derive(Serialize)]
-struct CreateUserResponse {
-    owner: String,
-    role: Role,
-    /// Shown exactly once. Not retrievable again — see core/user.rs.
-    token: String,
-}
+/// Cut over (SCHEMA_IDL_SCOPE.md Tier C) — construction sites convert
+/// `core::user::Role` via [`wire_role`].
+type CreateUserResponse = crate::wire::CreateUserResponse;
 
-#[derive(Serialize)]
-struct UserSummary {
-    owner: String,
-    role: Role,
-}
+/// Cut over (SCHEMA_IDL_SCOPE.md Tier C) — see [`CreateUserResponse`].
+type UserSummary = crate::wire::UserSummary;
 
 /// A simple 32-byte random token, hex-encoded. Not derived from
 /// anything guessable (time, pid, counters) — uses the OS RNG via
@@ -2870,7 +2920,7 @@ async fn create_user(
                 Audience::Owner(identity.owner.clone()),
                 serde_json::json!({"event": "user_created", "owner": payload.owner, "created_by": identity.owner}),
             );
-            (StatusCode::CREATED, Json(CreateUserResponse { owner: payload.owner, role, token })).into_response()
+            (StatusCode::CREATED, Json(CreateUserResponse { owner: payload.owner, role: wire_role(role), token })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -2889,7 +2939,7 @@ async fn list_users(
     let users: Vec<UserSummary> = engine
         .list_users()
         .into_iter()
-        .map(|u| UserSummary { owner: u.owner.clone(), role: u.role })
+        .map(|u| UserSummary { owner: u.owner.clone(), role: wire_role(u.role) })
         .collect();
     (StatusCode::OK, Json(users)).into_response()
     })
@@ -2898,7 +2948,7 @@ async fn list_users(
 
 /// Revokes every persistent user record owned by `owner`. Note this
 /// only reaches persistent (admin-created) users — it cannot revoke a
-/// static ENOCHIAN_TOKENS bootstrap identity, since those aren't stored
+/// static FACETQL_TOKENS bootstrap identity, since those aren't stored
 /// here at all. Removing one of those means editing the env var and
 /// restarting.
 async fn revoke_user(
@@ -2950,39 +3000,17 @@ async fn revoke_user(
 // write whose cost is proportional to the data already stored, which is
 // not a cost an ordinary caller should be able to impose.
 
-#[derive(Deserialize)]
-struct CreateIndexRequest {
-    name: String,
-    kind: String,
-    field: String,
-
-    /// Declare the index unique: a write that would give two nodes of
-    /// this kind the same value for this field is refused.
-    ///
-    /// Optional and false by default, so an existing caller declaring an
-    /// ordinary index is unchanged.
-    #[serde(default)]
-    unique: bool,
-
-    /// Which question the index is being declared to answer.
-    ///
-    /// * `"ordered"` (the default) — a B+tree over the field's whole
-    ///   value: point lookups, prefixes, ranges, `order by`.
-    /// * `"text"` — an inverted index over the field's text: `contains`,
-    ///   `starts_with` and `ends_with` served from trigram postings
-    ///   instead of a scan of the kind.
-    ///
-    /// One field can carry both, under two names, because they answer
-    /// different questions and neither subsumes the other.
-    ///
-    /// Optional, so a client that predates it declares exactly the index
-    /// it always declared. The value is matched case-insensitively and
-    /// anything else is a 400 rather than a silent fall-back to
-    /// `ordered` — declaring the wrong kind of index is a mistake an
-    /// operator wants told, not absorbed.
-    #[serde(default)]
-    mode: Option<String>,
-}
+/// Cut over to the generated type (SCHEMA_IDL_SCOPE.md Tier C) — plain
+/// strings/bool, no domain-type or numeric-width entanglement.
+///
+/// `name`/`kind`/`field`: the index being declared. `unique`: refuses a
+/// write that would give two nodes of this kind the same value for this
+/// field; optional, false by default. `mode`: `"ordered"` (default) for a
+/// B+tree, or `"text"` for a trigram inverted index (`contains`/
+/// `starts_with`/`ends_with`); matched case-insensitively, and an unknown
+/// value is a 400 rather than a silent fall-back — see `create_index`
+/// below for the exact validation.
+type CreateIndexRequest = crate::wire::CreateIndexRequest;
 
 /// Declare an index over one `data` field of one kind.
 ///
@@ -3132,28 +3160,34 @@ async fn drop_index(
 // *does*. An application that could declare one on its own behalf could
 // arrange for another owner's nodes to be removed by deleting its own.
 
-#[derive(Deserialize)]
-struct CreateReferenceRequest {
-    name: String,
+/// Cut over to the generated type (SCHEMA_IDL_SCOPE.md Tier C).
+/// `name`/`kind`/`field`: the reference being declared, on the kind that
+/// holds it. `parent_kind`: the kind being referenced. `parent_field`:
+/// which value on the referenced node the field matches — omitted (the
+/// common case) means its address. `on_delete`: `cascade`/`restrict`/
+/// `set_null`, no default — this is the decision the declaration exists
+/// to record, and guessing it would guess whether a delete removes rows.
+///
+/// `on_delete`'s type here is the *generated* `wire::ReferentialAction`,
+/// not `storage::reference::ReferentialAction` — see [`domain_on_delete`]
+/// for why a conversion at the boundary is correct rather than a
+/// workaround, same reasoning as [`wire_role`] above.
+type CreateReferenceRequest = crate::wire::CreateReferenceRequest;
 
-    /// The kind holding the reference, and the `data` field on it that
-    /// carries the referenced node's key.
-    kind: String,
-    field: String,
-
-    /// The kind being referenced.
-    parent_kind: String,
-
-    /// Which value on the referenced node the field matches. Omitted —
-    /// the common case — means its address.
-    #[serde(default)]
-    parent_field: Option<String>,
-
-    /// What deleting the referenced node does: `cascade`, `restrict` or
-    /// `set_null`. No default: this is the decision the declaration
-    /// exists to record, and guessing it would guess whether a delete
-    /// removes rows.
-    on_delete: ReferentialAction,
+/// The generated wire `ReferentialAction` → `storage::reference`'s real
+/// enum, which `ReferenceDef` (and the engine's cascade/restrict/set-null
+/// logic) is built around. Both enums are the same three variants with
+/// the same wire text (`storage::reference::ReferentialAction` already
+/// has `#[serde(rename_all = "snake_case")]`) — this exists because the
+/// engine's reference-integrity logic is a domain concern the wire schema
+/// correctly doesn't own (`SCHEMA_IDL_SCOPE.md` §2), not because the two
+/// enums disagree.
+fn domain_on_delete(action: crate::wire::ReferentialAction) -> ReferentialAction {
+    match action {
+        crate::wire::ReferentialAction::Cascade => ReferentialAction::Cascade,
+        crate::wire::ReferentialAction::Restrict => ReferentialAction::Restrict,
+        crate::wire::ReferentialAction::SetNull => ReferentialAction::SetNull,
+    }
 }
 
 /// Declare a reference between two kinds.
@@ -3178,7 +3212,7 @@ async fn create_reference(
         field: request.field,
         parent_kind: request.parent_kind,
         parent_field: request.parent_field,
-        on_delete: request.on_delete,
+        on_delete: domain_on_delete(request.on_delete),
     };
 
     db.with_engine_mut(move |engine| {
@@ -3254,7 +3288,7 @@ mod stats_route_tests {
     //! one and these assertions are written to be true regardless of
     //! what else is in it: unique kinds and addresses, and `>=` on the
     //! global counters. Auth uses *persistent* user tokens (resolved via
-    //! `find_user_by_hash`), not the env `ENOCHIAN_TOKENS` bootstrap, so
+    //! `find_user_by_hash`), not the env `FACETQL_TOKENS` bootstrap, so
     //! the tests don't depend on process-wide env state.
     use super::*;
     use crate::core::coordinate::Coordinate;
@@ -5040,6 +5074,83 @@ mod migration_field_tests {
                 "{name} carried no position, so a gap is undetectable"
             );
         }
+    }
+
+    fn publish(token: &str, payload: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/publish")
+            .header("x-api-key", token)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"channel": "some-channel", "payload": payload}).to_string(),
+            ))
+            .expect("build request")
+    }
+
+    /// `POST /publish`'s real isolation is the caller's identity, not the
+    /// `channel` field a caller may send (see `PublishRequest`'s doc
+    /// comment) — this proves the identity half actually holds: a non-admin
+    /// caller's message reaches its own owner and admins, and stops there.
+    #[tokio::test]
+    async fn a_non_admin_publish_reaches_its_own_owner_and_admins_only() {
+        let _guard = disk_guard();
+        let (app, db) = app();
+
+        let from = start(&db);
+
+        let response = app
+            .oneshot(publish(USER_TOKEN, "hello from a tenant"))
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (backlog, _) = db.feed.subscribe(Some(from)).expect("resume");
+        let event = backlog
+            .into_iter()
+            .find(|e| e.payload.contains("hello from a tenant"))
+            .expect("the publish landed on the feed");
+
+        assert!(
+            event.audience.admits(USER_OWNER, false),
+            "the publishing owner must see its own message"
+        );
+        assert!(
+            event.audience.admits("some-other-owner", true),
+            "an admin must see it regardless of who published"
+        );
+        assert!(
+            !event.audience.admits("some-other-owner", false),
+            "a different, non-admin owner must not see a tenant's publish — \
+             a `channel` name in the body is not what scopes this, identity is"
+        );
+    }
+
+    /// The admin half of the same contract: a superuser's publish is a
+    /// true broadcast, matching the fact that an admin can already read
+    /// every node.
+    #[tokio::test]
+    async fn an_admin_publish_reaches_everyone() {
+        let _guard = disk_guard();
+        let (app, db) = app();
+
+        let from = start(&db);
+
+        let response = app
+            .oneshot(publish(ADMIN_TOKEN, "hello from the operator"))
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (backlog, _) = db.feed.subscribe(Some(from)).expect("resume");
+        let event = backlog
+            .into_iter()
+            .find(|e| e.payload.contains("hello from the operator"))
+            .expect("the publish landed on the feed");
+
+        assert!(event.audience.admits("nobody-in-particular", false));
     }
 }
 

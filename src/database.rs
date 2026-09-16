@@ -40,7 +40,7 @@ pub enum DatabaseError {
     ///
     /// Two very different causes land here and the file cannot tell them
     /// apart: the server was started with the wrong
-    /// `ENOCHIAN_MASTER_KEY` (common), or the file is genuinely damaged
+    /// `FACETQL_MASTER_KEY` (common), or the file is genuinely damaged
     /// (rare). `authentication` records whether the failure was
     /// specifically a decrypt/auth failure, which is the case where the
     /// wrong-key explanation should be offered first.
@@ -293,7 +293,7 @@ impl fmt::Display for DatabaseError {
                 write!(
                     f,
                     "a stored record failed authentication: {source} — most \
-                     likely the wrong ENOCHIAN_MASTER_KEY, otherwise the \
+                     likely the wrong FACETQL_MASTER_KEY, otherwise the \
                      file is corrupt"
                 )
             }

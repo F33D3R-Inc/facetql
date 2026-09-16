@@ -584,7 +584,7 @@ impl Bucket {
 /// How many `(identity, class)` buckets are tracked at once.
 ///
 /// Identities cannot be minted by an attacker — they come from the
-/// persistent user store, which is admin-only, or from `ENOCHIAN_TOKENS`
+/// persistent user store, which is admin-only, or from `FACETQL_TOKENS`
 /// — so this map is already bounded in any correct deployment. The cap
 /// is here for the deployment that is not correct, and for the property
 /// that a limiter must not itself be the memory leak it was added to

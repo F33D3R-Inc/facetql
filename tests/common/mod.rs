@@ -161,8 +161,8 @@ pub fn spawn_child_with(dir: &PathBuf, port: u16, env: &[(&str, String)]) -> Chi
     command
         .arg("start")
         .env("FACETQL_ENV", "test")
-        .env("ENOCHIAN_DATA_DIR", dir)
-        .env("ENOCHIAN_PORT", port.to_string())
+        .env("FACETQL_DATA_DIR", dir)
+        .env("FACETQL_PORT", port.to_string())
         // Rate limiting is a per-identity control against a hostile
         // caller; this harness is one identity issuing thousands of
         // requests as fast as it can, which is exactly the shape the

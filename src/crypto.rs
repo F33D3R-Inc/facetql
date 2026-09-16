@@ -3,14 +3,14 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
 use std::sync::OnceLock;
 
-/// An obviously-fake, all-zero key — used only when ENOCHIAN_MASTER_KEY
+/// An obviously-fake, all-zero key — used only when FACETQL_MASTER_KEY
 /// isn't set, so local development doesn't need any setup. Printed as a
 /// loud warning every time it's used, same pattern as the dev API token
 /// in auth.rs. Anything encrypted with this key is not secure — it's a
 /// known, public value.
 const DEV_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-pub const MASTER_KEY_ENV: &str = "ENOCHIAN_MASTER_KEY";
+pub const MASTER_KEY_ENV: &str = "FACETQL_MASTER_KEY";
 
 /// Why the at-rest key must not be used as configured.
 ///
@@ -27,7 +27,7 @@ pub const MASTER_KEY_ENV: &str = "ENOCHIAN_MASTER_KEY";
 /// knows what the development key is or what shape a real one has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyDefect {
-    /// `ENOCHIAN_MASTER_KEY` is unset, so the all-zero development key
+    /// `FACETQL_MASTER_KEY` is unset, so the all-zero development key
     /// would be used.
     NotConfigured,
 
@@ -114,21 +114,21 @@ fn cipher() -> &'static Aes256Gcm {
     CIPHER.get_or_init(|| {
         let key_hex = std::env::var(MASTER_KEY_ENV).unwrap_or_else(|_| {
             eprintln!(
-                "warning: ENOCHIAN_MASTER_KEY not set — using an all-zero dev key. \
+                "warning: FACETQL_MASTER_KEY not set — using an all-zero dev key. \
                  Data encrypted with this key is NOT secure. Generate a real key with \
-                 `openssl rand -hex 32` and set ENOCHIAN_MASTER_KEY to it before running \
+                 `openssl rand -hex 32` and set FACETQL_MASTER_KEY to it before running \
                  with real data."
             );
             DEV_KEY_HEX[..64].to_string()
         });
 
         let key_bytes = decode_hex(&key_hex).unwrap_or_else(|e| {
-            panic!("ENOCHIAN_MASTER_KEY is not valid hex: {e}")
+            panic!("FACETQL_MASTER_KEY is not valid hex: {e}")
         });
 
         if key_bytes.len() != 32 {
             panic!(
-                "ENOCHIAN_MASTER_KEY must decode to exactly 32 bytes (64 hex characters) \
+                "FACETQL_MASTER_KEY must decode to exactly 32 bytes (64 hex characters) \
                  for AES-256 — got {} bytes. Generate one with `openssl rand -hex 32`.",
                 key_bytes.len()
             );
@@ -173,7 +173,7 @@ pub fn decrypt(blob: &[u8]) -> Result<Vec<u8>, String> {
 
     cipher()
         .decrypt(nonce, ciphertext)
-        .map_err(|_| "decryption failed — wrong ENOCHIAN_MASTER_KEY, or data is corrupted/tampered".to_string())
+        .map_err(|_| "decryption failed — wrong FACETQL_MASTER_KEY, or data is corrupted/tampered".to_string())
 }
 
 /// Minimal hex codec, written by hand rather than pulling in the `hex`

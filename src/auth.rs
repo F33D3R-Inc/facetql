@@ -31,7 +31,7 @@ impl AuthIdentity {
 const DEV_TOKEN: &str = "dev-local-key-change-me";
 const DEV_OWNER: &str = "dev";
 
-pub const TOKENS_ENV: &str = "ENOCHIAN_TOKENS";
+pub const TOKENS_ENV: &str = "FACETQL_TOKENS";
 
 /// Why the bootstrap credential store must not be used as configured.
 ///
@@ -54,11 +54,11 @@ pub const TOKENS_ENV: &str = "ENOCHIAN_TOKENS";
 /// have to be kept in step with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialDefect {
-    /// `ENOCHIAN_TOKENS` is unset, so the published dev admin token is
+    /// `FACETQL_TOKENS` is unset, so the published dev admin token is
     /// the only credential this server accepts.
     NoTokensConfigured,
 
-    /// `ENOCHIAN_TOKENS` is set but nothing in it parsed into a usable
+    /// `FACETQL_TOKENS` is set but nothing in it parsed into a usable
     /// `token:owner[:role]` entry — a trailing comma, a missing colon, a
     /// value that survived a shell mangling. The map ends up empty,
     /// which is the same outcome as not setting it at all except that it
@@ -66,7 +66,7 @@ pub enum CredentialDefect {
     TokensConfiguredButEmpty,
 
     /// A configured entry hands out the published dev token. Setting
-    /// `ENOCHIAN_TOKENS` does not help if the token inside it is the one
+    /// `FACETQL_TOKENS` does not help if the token inside it is the one
     /// printed in this file.
     DevTokenConfigured,
 }
@@ -133,7 +133,7 @@ fn credential_defect_in(raw: Option<&str>) -> Option<CredentialDefect> {
     None
 }
 
-/// One parse of `ENOCHIAN_TOKENS`, shared by the credential store and
+/// One parse of `FACETQL_TOKENS`, shared by the credential store and
 /// the pre-flight check above.
 ///
 /// It matters that there is exactly one. The check's whole claim is
@@ -217,7 +217,7 @@ fn static_token_map() -> &'static HashMap<String, (String, Role)> {
                 .collect(),
             Err(_) => {
                 eprintln!(
-                    "warning: ENOCHIAN_TOKENS not set — using a single dev token \
+                    "warning: FACETQL_TOKENS not set — using a single dev token \
                      ('{DEV_TOKEN}' -> owner '{DEV_OWNER}', role Admin) so there's a way \
                      to bootstrap the first real admin via POST /admin/users. \
                      Do not run production traffic against this."

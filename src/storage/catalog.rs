@@ -199,7 +199,7 @@ fn decode(bytes: &[u8]) -> Result<CatalogData> {
             ErrorKind::InvalidData,
             format!(
                 "failed to decrypt the catalog: {e} — wrong \
-                 ENOCHIAN_MASTER_KEY, or the file is damaged"
+                 FACETQL_MASTER_KEY, or the file is damaged"
             ),
         )
     })?;

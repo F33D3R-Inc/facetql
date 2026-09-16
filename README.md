@@ -12,7 +12,7 @@ server, talk to it over HTTP.
 It exists to be the storage backend for the FCT (`.fct`) language and the
 F33D3R stack, but it has no dependency on either and runs standalone.
 
-Version `0.13.0` · Rust edition 2024 · `cargo test` = 92 passing.
+Version `0.13.0` · Rust edition 2024 · `cargo test --release` = 363 passing (2 ignored — opt-in slow tests, run with `--ignored`).
 
 ---
 
@@ -42,7 +42,7 @@ reaching them (`StorageEngine`, `src/storage/engine.rs`):
   a large database opens as fast as a small one
   (`StorageEngine::open`).
 * **Pages are encrypted at rest.** Every page is stored as
-  AES-256-GCM(body) under `ENOCHIAN_MASTER_KEY`, so index keys —
+  AES-256-GCM(body) under `FACETQL_MASTER_KEY`, so index keys —
   addresses, kinds, owners — are encrypted exactly like record payloads
   (`src/storage/pager.rs:26-38`, `src/crypto.rs`).
 * **Memory is bounded by caches, not by data.** The page cache holds 256
@@ -265,8 +265,8 @@ cargo build --release          # target/release/facetql
 ```bash
 facetql init                                    # create ~/.facetql
 
-ENOCHIAN_TOKENS="$(openssl rand -hex 32):root:admin" \
-ENOCHIAN_MASTER_KEY="$(openssl rand -hex 32)" \
+FACETQL_TOKENS="$(openssl rand -hex 32):root:admin" \
+FACETQL_MASTER_KEY="$(openssl rand -hex 32)" \
 facetql start --port 8080
 ```
 
@@ -276,10 +276,10 @@ The default posture is **production**, and in production the server
 refuses to start rather than fall back to a development credential. Three
 things are checked before anything is opened:
 
-* `ENOCHIAN_TOKENS` — unset, unparseable, or containing the published
+* `FACETQL_TOKENS` — unset, unparseable, or containing the published
   `dev-local-key-change-me` token means the only credential accepted
   would be a public one;
-* `ENOCHIAN_MASTER_KEY` — unset, malformed, or all-zero means the entire
+* `FACETQL_MASTER_KEY` — unset, malformed, or all-zero means the entire
   database is encrypted under a value anyone can type;
 * TLS — no identity configured and no explicit acknowledgement that TLS
   is terminated in front of this process means every `x-api-key` crosses
@@ -300,7 +300,7 @@ That restores the old behaviour — the token `dev-local-key-change-me`
 known values — and prints them as findings on the way up. Do not put real
 data behind them.
 
-`ENOCHIAN_MASTER_KEY` must be 64 hex characters (32 bytes). It is not
+`FACETQL_MASTER_KEY` must be 64 hex characters (32 bytes). It is not
 recoverable and not derived from anything — lose it and the data is
 unreadable; change it and startup fails with an authentication error.
 
@@ -324,7 +324,7 @@ downgrade, since a token in a URL reaches access logs.
 Two credential stores, both looked up **by SHA-256 digest** so a
 presented secret is never compared byte-for-byte against a stored one:
 
-* **Bootstrap**, from `ENOCHIAN_TOKENS`: `token:owner` or
+* **Bootstrap**, from `FACETQL_TOKENS`: `token:owner` or
   `token:owner:admin`, comma-separated. This solves the same problem
   `POSTGRES_PASSWORD` solves — something must authenticate before there
   is a user store to authenticate against. These identities cannot be
@@ -361,11 +361,11 @@ subscribers (`src/database.rs:286-327`, `src/api/routes.rs:1203-1273`).
 
 | Variable | Default | What it bounds |
 |---|---|---|
-| `ENOCHIAN_DATA_DIR` (`--data-dir`) | `~/.facetql` | where every file lives |
-| `ENOCHIAN_PORT` (`--port`) | `8080` | listen port |
-| `ENOCHIAN_MASTER_KEY` | all-zero dev key | AES-256-GCM key for pages, WAL, logs |
-| `ENOCHIAN_TOKENS` | one dev admin token | bootstrap identities |
-| `ENOCHIAN_TLS_IDENTITY` / `_PASSWORD` | — | PKCS#12 identity for HTTPS |
+| `FACETQL_DATA_DIR` (`--data-dir`) | `~/.facetql` | where every file lives |
+| `FACETQL_PORT` (`--port`) | `8080` | listen port |
+| `FACETQL_MASTER_KEY` | refuses to start unless set (production is the default posture); an all-zero dev key applies only under `FACETQL_ENV=development` | AES-256-GCM key for pages, WAL, logs |
+| `FACETQL_TOKENS` | refuses to start unless set (production is the default posture); a single dev admin token applies only under `FACETQL_ENV=development` | bootstrap identities |
+| `FACETQL_TLS_IDENTITY` / `_PASSWORD` | — | PKCS#12 identity for HTTPS |
 | `FACETQL_ENV` | `production` | `development`/`dev`/`test` permits dev credentials and plaintext; anything else (including unset) refuses them |
 | `FACETQL_ALLOW_PLAINTEXT` | unset | set to any value to acknowledge that TLS is terminated in front of this process |
 | `FACETQL_ALLOWED_ORIGINS` | none in production, any in development | comma-separated browser origins, or `*` |
@@ -518,11 +518,24 @@ Honest list. Each item is absent from the code, not merely unpolished.
 
 **Data model**
 * **`coordinate` is inert.** It is stored and returned; nothing reads it.
-* **No schema, no constraints, no uniqueness beyond `address`, no
-  foreign keys and no cascading delete.** Deleting a node leaves edges
-  that pointed at it, and leaves any id that another node's `data`
-  happens to hold.
-* **`data` is an opaque string.** It is never validated.
+* **No schema.** `data` fields are not typed or shaped beyond being
+  valid JSON — there is no per-`kind` field declaration.
+* **Constraints, uniqueness and referential integrity exist, but are
+  opt-in and per-field, not schema-derived.** `facetql index create
+  --unique` refuses a write that would duplicate a value for one
+  declared field of one kind (checked inside the writer lock, ahead of
+  the WAL). `facetql reference create --on-delete
+  cascade|restrict|set-null` declares that one field of one kind points
+  at another kind and what deleting the parent does to it — the whole
+  closure expanded and committed as one transaction. Neither is
+  automatic: a node kind with no declared index has no uniqueness
+  check, and a `data` field pointing at another node's address with no
+  declared reference leaves a dangling id on delete, exactly as before.
+  See `facetql-cli-reference.md`'s `index`/`reference` sections and
+  `API_REFERENCE.md`'s `/admin/indexes`/`/admin/references`.
+* **`data` is an opaque string.** It is never validated against a
+  schema — only against a declared unique/reference constraint, if one
+  exists for that field.
 
 **Authorization**
 * **Two roles and one owner per record.** No ACLs, no groups, no
