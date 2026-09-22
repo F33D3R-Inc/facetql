@@ -1,0 +1,26 @@
+# The build context is the crate's sources and its lockfile. Everything below
+# is either enormous (target/), host-specific, or a secret that must never be
+# baked into an image layer.
+target/
+.git/
+.gitignore
+.idea/
+Dockerfile
+.dockerignore
+*.md
+docs/
+examples/
+scripts/
+schema/
+tests/
+research_notes/
+facetql-console.html
+install.sh
+.env
+.env.*
+*.pem
+*.p12
+facetql.data
+facetql.wal
+facetql.edges
+facetql.tombstones
