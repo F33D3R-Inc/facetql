@@ -559,6 +559,19 @@ async fn run_server(
                 )
             });
 
+    /*
+     * The port the banner names is the one the kernel bound, not the
+     * one that was asked for: with `--port 0` the operating system
+     * chooses a free ephemeral port, and a supervisor (or a test
+     * harness) that started the server that way learns it from this
+     * line — the one way to get a port with no window in which another
+     * process could take it first.
+     */
+    let port = listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .unwrap_or(port);
+
     match tls_identity {
         Some(identity_path) => {
             let password =
