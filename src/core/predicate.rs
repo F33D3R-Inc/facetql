@@ -310,8 +310,73 @@ fn eval_at(
             }
         }
 
+        // The one function a predicate may call: `lower(x)`, x's text
+        // lowercased exactly as the fct language's `lower` does it (see
+        // `go_lower`) — what a case-insensitive search is written with,
+        // `contains(lower(item.body), "needle")`.
+        "call" => match expr.name.as_deref() {
+            Some("lower") => {
+                let args = expr.args.as_deref().unwrap_or(&[]);
+
+                if args.len() != 1 {
+                    return Err("lower takes exactly one argument".to_string());
+                }
+
+                let value = eval(&args[0])?;
+
+                Ok(Value::String(lower_text(&value)))
+            }
+
+            other => Err(format!(
+                "cannot evaluate a call to {other:?}: the only function a \
+                 predicate may call is lower"
+            )),
+        },
+
         other => Err(format!("cannot evaluate {other:?} expression")),
     }
+}
+
+/// `lower`'s value: a string lowercased; null as the empty text; a bool
+/// or a number as the text it writes as, lowercased.
+fn lower_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => go_lower(s),
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        other => go_lower(&other.to_string()),
+    }
+}
+
+/// Lowercase `s` exactly as the fct language's `lower` does — Go's
+/// `strings.ToLower`: every character through `unicode.ToLower`, the
+/// *simple* lowercase mapping, one character to one character.
+///
+/// Read from Go's own mapping ([`crate::core::go_lower_table`], generated
+/// by `tools/golower`), not from Rust's: `str::to_lowercase` applies the
+/// Greek final-sigma rule (`Σ` ending a word lowers to `ς`, where Go always
+/// gives `σ`), `char::to_lowercase` maps `İ` (U+0130) to two characters
+/// (`i̇`, where Go gives `i`), and Rust's tables follow the Unicode version
+/// of its standard library rather than Go's. A search has to answer as the
+/// language would, for every character.
+pub fn go_lower(s: &str) -> String {
+    use crate::core::go_lower_table::GO_LOWER;
+
+    let mut out = String::with_capacity(s.len());
+
+    for c in s.chars() {
+        if c.is_ascii() {
+            out.push(c.to_ascii_lowercase());
+            continue;
+        }
+
+        match GO_LOWER.binary_search_by(|(from, _)| from.cmp(&c)) {
+            Ok(at) => out.push(GO_LOWER[at].1),
+            Err(_) => out.push(c),
+        }
+    }
+
+    out
 }
 
 fn eval_bin_op(op: &str, l: &Value, r: &Value) -> Result<Value, String> {
@@ -641,14 +706,34 @@ fn prefix_literal_at(
 /// storage layer's is to say what it can serve.
 pub fn substring_literals(expr: &Expr, item_var: &str, field: &str) -> Vec<String> {
     let mut out = Vec::new();
-    substring_literals_at(expr, item_var, field, 0, &mut out);
+    substring_literals_at(expr, item_var, field, false, 0, &mut out);
     out
+}
+
+/// The literals a match requires `lower(item.field)` to contain — what a
+/// folded inverted index (one over the lowered text) can serve:
+/// `contains`/`starts_with`/`ends_with(lower(item.field), "literal")`.
+pub fn lowered_substring_literals(expr: &Expr, item_var: &str, field: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    substring_literals_at(expr, item_var, field, true, 0, &mut out);
+    out
+}
+
+/// `lower(item.field)`.
+fn is_lowered_field(expr: &Expr, item_var: &str, field: &str) -> bool {
+    expr.kind == "call"
+        && expr.name.as_deref() == Some("lower")
+        && expr
+            .args
+            .as_deref()
+            .is_some_and(|args| args.len() == 1 && is_field_access(&args[0], item_var, field))
 }
 
 fn substring_literals_at(
     expr: &Expr,
     item_var: &str,
     field: &str,
+    lowered: bool,
     depth: usize,
     out: &mut Vec<String>,
 ) {
@@ -662,8 +747,8 @@ fn substring_literals_at(
 
     match expr.op.as_deref() {
         Some("&&") => {
-            substring_literals_at(l, item_var, field, depth + 1, out);
-            substring_literals_at(r, item_var, field, depth + 1, out);
+            substring_literals_at(l, item_var, field, lowered, depth + 1, out);
+            substring_literals_at(r, item_var, field, lowered, depth + 1, out);
         }
 
         Some("contains" | "starts_with" | "ends_with") => {
@@ -673,7 +758,13 @@ fn substring_literals_at(
             // candidate set can come out a *subset* of the answer rather
             // than a superset — see `match_equality`, which checks the
             // same thing for the same reason.
-            if r.kind != "lit" || !is_field_access(l, item_var, field) {
+            let target = if lowered {
+                is_lowered_field(l, item_var, field)
+            } else {
+                is_field_access(l, item_var, field)
+            };
+
+            if r.kind != "lit" || !target {
                 return;
             }
 
@@ -886,6 +977,75 @@ mod bound_tests {
     /// `args` is deserialized but never evaluated, which is exactly why
     /// it has to be counted: a bound that only saw the evaluated subset
     /// would ship with a documented way around it.
+    /// `lower` answers as Go's `strings.ToLower`: no final-sigma rule, `İ`
+    /// to a single `i`, the Kelvin sign to `k`, and the table it reads is
+    /// in the order its binary search needs.
+    #[test]
+    fn lower_is_the_fct_languages_lower() {
+        assert_eq!(go_lower("HELLO Wörld"), "hello wörld");
+        assert_eq!(go_lower("ΟΔΟΣ"), "οδοσ");
+        assert_eq!(go_lower("İSTANBUL"), "istanbul");
+        assert_eq!(go_lower("\u{212A}ELVIN"), "kelvin");
+        assert_eq!(go_lower("ÉCOLE"), "école");
+
+        let table = crate::core::go_lower_table::GO_LOWER;
+        assert!(table.windows(2).all(|w| w[0].0 < w[1].0), "the table is not sorted");
+        for (from, to) in table {
+            let lowered = go_lower(&from.to_string());
+            assert_eq!(lowered, to.to_string(), "U+{:04X}", *from as u32);
+        }
+    }
+
+    #[test]
+    fn lower_evaluates_and_refuses_what_it_cannot() {
+        let data = serde_json::json!({ "body": "İSTANBUL Nights", "n": 5, "none": null });
+        let lowered = |arg: Expr| {
+            let mut call = node("call");
+            call.name = Some("lower".to_string());
+            call.args = Some(vec![arg]);
+            call
+        };
+        let field = |f: &str| {
+            let mut get = node("get");
+            get.field = Some(f.to_string());
+            let mut obj = node("ref");
+            obj.name = Some("item".to_string());
+            get.obj = Some(Box::new(obj));
+            get
+        };
+
+        assert_eq!(eval(&lowered(field("body")), "item", &data).unwrap(), Value::String("istanbul nights".into()));
+        assert_eq!(eval(&lowered(field("n")), "item", &data).unwrap(), Value::String("5".into()));
+        assert_eq!(eval(&lowered(field("none")), "item", &data).unwrap(), Value::String(String::new()));
+
+        let mut contains = node("bin");
+        contains.op = Some("contains".to_string());
+        contains.l = Some(Box::new(lowered(field("body"))));
+        contains.r = Some(Box::new(lit(serde_json::json!("istanbul n"))));
+        assert_eq!(eval(&contains, "item", &data).unwrap(), Value::Bool(true));
+
+        let mut two = lowered(field("body"));
+        two.args.as_mut().unwrap().push(field("n"));
+        assert!(eval(&two, "item", &data).unwrap_err().contains("exactly one argument"));
+
+        let mut upper = lowered(field("body"));
+        upper.name = Some("upper".to_string());
+        assert!(eval(&upper, "item", &data).unwrap_err().contains("only function"));
+
+        // the planner's literals: the lowered form for a folded index, the
+        // bare one for an unfolded index — never each other's
+        let mut both = node("bin");
+        both.op = Some("&&".to_string());
+        both.l = Some(Box::new(contains.clone()));
+        let mut bare = node("bin");
+        bare.op = Some("starts_with".to_string());
+        bare.l = Some(Box::new(field("body")));
+        bare.r = Some(Box::new(lit(serde_json::json!("İST"))));
+        both.r = Some(Box::new(bare));
+        assert_eq!(lowered_substring_literals(&both, "item", "body"), vec!["istanbul n".to_string()]);
+        assert_eq!(substring_literals(&both, "item", "body"), vec!["İST".to_string()]);
+    }
+
     #[test]
     fn nodes_eval_never_visits_are_still_counted() {
         let mut expr = node("call");

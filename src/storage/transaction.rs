@@ -240,6 +240,9 @@ impl Operation {
             Operation::DropReference(name) => {
                 WalOperation::DropReference(name.clone())
             }
+            Operation::CreateTextIndex(def) if def.folded => {
+                WalOperation::CreateFoldedTextIndex(def.clone())
+            }
             Operation::CreateTextIndex(def) => {
                 WalOperation::CreateTextIndex(def.clone())
             }

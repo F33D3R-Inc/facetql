@@ -270,6 +270,7 @@ fn an_inverted_index_reads_the_matches_not_the_kind() {
             name: "profile_bio".to_string(),
             kind: "Profile".to_string(),
             field: "bio".to_string(),
+            folded: false,
         })
         .expect("declare inverted index");
 

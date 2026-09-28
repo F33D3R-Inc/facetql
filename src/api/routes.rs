@@ -3030,7 +3030,11 @@ async fn create_index(
 
     let mode = request.mode.unwrap_or_else(|| "ordered".to_string());
 
-    if mode.eq_ignore_ascii_case("text") {
+    // `folded`: an inverted index over the field's text lowercased — the
+    // one a case-insensitive search (`contains(lower(item.f), "…")`) uses.
+    let folded = mode.eq_ignore_ascii_case("folded");
+
+    if mode.eq_ignore_ascii_case("text") || folded {
         if request.unique {
             return (
                 StatusCode::BAD_REQUEST,
@@ -3046,6 +3050,7 @@ async fn create_index(
             name: request.name,
             kind: request.kind,
             field: request.field,
+            folded,
         };
 
         return db
@@ -3070,7 +3075,7 @@ async fn create_index(
     if !mode.eq_ignore_ascii_case("ordered") {
         return (
             StatusCode::BAD_REQUEST,
-            format!("unknown index mode {mode:?}; expected \"ordered\" or \"text\""),
+            format!("unknown index mode {mode:?}; expected \"ordered\", \"text\" or \"folded\""),
         )
             .into_response();
     }

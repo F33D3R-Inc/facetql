@@ -149,7 +149,16 @@ async fn main() {
                 .await
         }
 
-        None => run_server(8080, None, None).await,
+        // No subcommand is `start` with no flags — its environment and
+        // defaults included — not a second, hard-coded configuration.
+        None => match bare_start() {
+            Command::Start {
+                port,
+                tls_identity,
+                tls_identity_password,
+            } => run_server(port, tls_identity, tls_identity_password).await,
+            other => unreachable!("`facetql start` parsed as {other:?}"),
+        },
 
         Some(Command::Backup { output_dir }) => {
             run_backup(output_dir)
@@ -216,6 +225,17 @@ async fn main() {
             }
         }
     }
+}
+
+/// What running `facetql` with no subcommand means: `facetql start`, parsed
+/// the same way — so FACETQL_PORT and the FACETQL_TLS_IDENTITY pair apply to
+/// it exactly as they do to `start`. It used to call `run_server(8080, None,
+/// None)` directly, which silently ignored all three and served plain HTTP
+/// on 8080 whatever the environment said.
+fn bare_start() -> Command {
+    Cli::parse_from(["facetql", "start"])
+        .command
+        .expect("`facetql start` names a subcommand")
 }
 
 /// Every durable file the storage layer writes, discovered rather than
@@ -908,6 +928,24 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("should parse")
+    }
+
+    /// Bare `facetql` is `facetql start`: the same port, TLS identity and
+    /// password, from the same environment and defaults.
+    #[test]
+    fn no_subcommand_starts_exactly_as_start_does() {
+        assert!(parse(&["facetql"]).command.is_none());
+        match (bare_start(), parse(&["facetql", "start"]).command) {
+            (
+                Command::Start { port, tls_identity, tls_identity_password },
+                Some(Command::Start { port: p, tls_identity: ti, tls_identity_password: tp }),
+            ) => {
+                assert_eq!(port, p);
+                assert_eq!(tls_identity, ti);
+                assert_eq!(tls_identity_password, tp);
+            }
+            other => panic!("expected two Starts, got {other:?}"),
+        }
     }
 
     #[test]

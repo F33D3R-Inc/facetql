@@ -436,6 +436,11 @@ pub enum WalOperation {
 
     /// Drop a declared inverted index.
     DropTextIndex(String),
+
+    /// Declare a folded inverted index (`TextIndexDef::folded`). Appended
+    /// at the end for the reason `CreateTextIndex` was: every existing tag
+    /// keeps its position and the format version does not move.
+    CreateFoldedTextIndex(TextIndexDef),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1213,6 +1213,11 @@ impl StorageEngine {
                     definitions.insert(def.name.clone(), def);
                 }
 
+                TextIndexOpRecord::PutFolded(mut def) => {
+                    def.folded = true;
+                    definitions.insert(def.name.clone(), def);
+                }
+
                 TextIndexOpRecord::Drop(name) => {
                     definitions.remove(&name);
                 }
@@ -3229,8 +3234,13 @@ impl StorageEngine {
                 continue;
             }
 
-            let literals =
-                predicate::substring_literals(predicate, item_var, &index.def.field);
+            // An unfolded index serves the field; a folded one, the
+            // field lowered.
+            let literals = if index.def.folded {
+                predicate::lowered_substring_literals(predicate, item_var, &index.def.field)
+            } else {
+                predicate::substring_literals(predicate, item_var, &index.def.field)
+            };
 
             if literals.is_empty() {
                 continue;
@@ -4233,7 +4243,7 @@ impl StorageEngine {
                 ));
             }
 
-            if let Some(other) = self.indexes.text_find(&def.kind, &def.field) {
+            if let Some(other) = self.indexes.text_find(&def.kind, &def.field, def.folded) {
                 return Err(format!(
                     "index '{}' already covers the text of {}.{}",
                     other.def.name, def.kind, def.field
@@ -6004,7 +6014,7 @@ impl StorageEngine {
             Operation::CreateTextIndex(def) => {
                 binary::append_record(
                     &text::definitions_path(),
-                    &TextIndexOpRecord::Put(def.clone()),
+                    &TextIndexOpRecord::put(def),
                 )?;
 
                 self.indexes.open_text(def.clone())?;
@@ -6195,7 +6205,7 @@ impl StorageEngine {
                 continue;
             };
 
-            for gram in text::grams(value) {
+            for gram in text::postings(&index.def, value) {
                 index.tree.put(&text::key(&gram, &node.address), &[])?;
             }
         }
@@ -6230,7 +6240,7 @@ impl StorageEngine {
                 continue;
             };
 
-            for gram in text::grams(value) {
+            for gram in text::postings(&index.def, value) {
                 index.tree.remove(&text::key(&gram, &node.address))?;
             }
         }
@@ -6258,7 +6268,7 @@ impl StorageEngine {
                 serde_json::from_str(&node.data).ok();
 
             if let Some(value) = text::indexed_text(data.as_ref(), &field) {
-                for gram in text::grams(value) {
+                for gram in text::postings(&index.def, value) {
                     index.tree.put(&text::key(&gram, &node.address), &[])?;
                 }
             }
@@ -9065,6 +9075,7 @@ mod text_index_tests {
             name: name.to_string(),
             kind: kind.to_string(),
             field: "body".to_string(),
+            folded: false,
         }
     }
 
@@ -9223,6 +9234,162 @@ mod text_index_tests {
     fn sorted(mut addresses: Vec<String>) -> Vec<String> {
         addresses.sort();
         addresses
+    }
+
+    /// `op(lower(item.body), literal)` — a case-insensitive substring test.
+    fn lowered_substring(op: &str, literal: &str) -> Expr {
+        serde_json::from_value(serde_json::json!({
+            "kind": "bin",
+            "op": op,
+            "l": {
+                "kind": "call",
+                "name": "lower",
+                "args": [{
+                    "kind": "get",
+                    "field": "body",
+                    "obj": { "kind": "ref", "name": "item" },
+                }],
+            },
+            "r": { "kind": "lit", "val": literal },
+        }))
+        .expect("build predicate")
+    }
+
+    /// `search` for a predicate given whole.
+    fn search_by(engine: &StorageEngine, kind: &str, predicate: &Expr) -> (Vec<String>, u64) {
+        let mut addresses = Vec::new();
+        let mut examined = 0u64;
+        let mut after: Option<String> = None;
+
+        loop {
+            let page = engine
+                .query_where(
+                    Some(kind), None, None, Some(predicate), "item",
+                    None, false, after.as_deref(), 3, 0,
+                )
+                .expect("query");
+
+            examined += page.examined;
+            addresses.extend(page.nodes.iter().map(|n| n.address.clone()));
+
+            if page.next.is_empty() {
+                break;
+            }
+
+            after = Some(page.next);
+        }
+
+        (sorted(addresses), examined)
+    }
+
+    /// A folded index answers a case-insensitive search exactly as the
+    /// row-by-row test does — over text whose lowercase is not ASCII
+    /// folding (`É`, `İ` that lowers to an ASCII `i`, the Kelvin sign that
+    /// lowers to `k`, a final `Σ`) — and reads the matches, not the kind.
+    /// An unfolded index is never used for the lowered form, nor a folded
+    /// one for the field itself.
+    #[test]
+    fn a_folded_index_answers_the_lowered_search_as_the_scan_does() {
+        let _g = disk_guard();
+        let e = StorageEngine::open().expect("open storage engine");
+
+        let bodies = [
+            ("a", "Hello World"),
+            ("b", "HELLO WORLD"),
+            ("c", "ÉCOLE Normale"),
+            ("d", "école normale"),
+            ("e", "İSTANBUL nights"),
+            ("f", "istanbul NIGHTS"),
+            ("g", "\u{212A}ELVIN scale"),
+            ("h", "kelvin Scale"),
+            ("i", "ΟΔΟΣ"),
+            ("j", "abcxbcd"),
+        ];
+
+        for (address, body) in bodies {
+            e.insert(node("TixFold", &format!("TixFold:{address}"), body))
+                .expect("insert");
+        }
+
+        for n in 0..200 {
+            e.insert(node("TixFold", &format!("TixFold:hay{n:03}"), &format!("ordinary post {n}")))
+                .expect("insert");
+        }
+
+        let probes = [
+            ("contains", "hello"),
+            ("contains", "école"),
+            ("contains", "istanbul"),
+            ("contains", "kelvin"),
+            ("contains", "οδοσ"),
+            ("contains", "abcd"),
+            ("contains", "HELLO"), // no lowered text holds capitals
+            ("contains", "zz"),    // shorter than a window: the scan
+            ("starts_with", "école"),
+            ("ends_with", "scale"),
+        ];
+
+        let brute = |op: &str, literal: &str| -> Vec<String> {
+            let mut out: Vec<String> = bodies
+                .iter()
+                .filter(|(_, body)| {
+                    let lowered = crate::core::predicate::go_lower(body);
+
+                    match op {
+                        "contains" => lowered.contains(literal),
+                        "starts_with" => lowered.starts_with(literal),
+                        _ => lowered.ends_with(literal),
+                    }
+                })
+                .map(|(a, _)| format!("TixFold:{a}"))
+                .collect();
+
+            out.sort();
+            out
+        };
+
+        let scanned: Vec<(Vec<String>, u64)> = probes
+            .iter()
+            .map(|(op, lit)| search_by(&e, "TixFold", &lowered_substring(op, lit)))
+            .collect();
+
+        for ((op, lit), (got, _)) in probes.iter().zip(&scanned) {
+            assert_eq!(got, &brute(op, lit), "the scan of {op}(lower(body), {lit:?})");
+        }
+
+        // An unfolded index does not serve the lowered form.
+        e.create_text_index(def("tix_fold_plain", "TixFold"))
+            .expect("declare text index");
+        let (plain_hits, plain_read) = search_by(&e, "TixFold", &lowered_substring("contains", "istanbul"));
+        assert_eq!(plain_hits, brute("contains", "istanbul"));
+        assert_eq!(plain_read, 210, "an unfolded index must not plan a lowered search");
+
+        let mut folded = def("tix_fold", "TixFold");
+        folded.folded = true;
+        e.create_text_index(folded).expect("declare folded index");
+
+        for ((op, lit), (before, _)) in probes.iter().zip(&scanned) {
+            let (after, read) = search_by(&e, "TixFold", &lowered_substring(op, lit));
+
+            assert_eq!(&after, before, "the folded index changed the answer of {op}(lower(body), {lit:?})");
+
+            if lit.len() >= text::GRAM_LEN && !after.is_empty() {
+                assert!(read < 20, "{op}(lower(body), {lit:?}) read {read} of 210");
+            }
+        }
+
+        // A folded index does not serve the field itself: this is the
+        // unfolded index's search, answered as before.
+        let (bare, _) = search(&e, "TixFold", "contains", "HELLO");
+        assert_eq!(sorted(bare), vec!["TixFold:b".to_string()]);
+
+        let modes: Vec<(String, &str)> = e
+            .list_all_indexes()
+            .into_iter()
+            .map(|i| (i.name, i.mode))
+            .collect();
+        assert!(modes.contains(&("tix_fold".to_string(), "folded")), "{modes:?}");
+        assert!(modes.contains(&("tix_fold_plain".to_string(), "text")), "{modes:?}");
     }
 
     /// What the index is *for*: the plan stops reading the kind and
@@ -9420,6 +9587,57 @@ mod text_index_tests {
             search(&e, "TixRec", "contains", "haystack").0,
             vec!["TixRec:2".to_string()],
         );
+    }
+
+    /// A folded index stays folded across a restart — whether its
+    /// definition comes back from the definition log (`PutFolded`) or,
+    /// with that log gone, only from the WAL (`CreateFoldedTextIndex`) —
+    /// and keeps serving the lowered search, maintained on the far side.
+    #[test]
+    fn a_folded_index_survives_a_restart_and_a_wal_replay() {
+        let _g = disk_guard();
+        let e = StorageEngine::open().expect("open storage engine");
+
+        e.insert(node("TixFoldRec", "TixFoldRec:1", "İSTANBUL Haystack"))
+            .expect("insert");
+
+        let mut folded = def("tix_fold_rec", "TixFoldRec");
+        folded.folded = true;
+        e.create_text_index(folded).expect("declare folded index");
+
+        let lowered = lowered_substring("contains", "istanbul hay");
+        let mode = |e: &StorageEngine| {
+            e.list_all_indexes()
+                .into_iter()
+                .find(|i| i.name == "tix_fold_rec")
+                .map(|i| i.mode)
+        };
+
+        let e = reopen(e);
+        assert_eq!(mode(&e), Some("folded"), "the definition log lost the fold");
+        assert_eq!(search_by(&e, "TixFoldRec", &lowered).0, vec!["TixFoldRec:1".to_string()]);
+
+        e.insert(node("TixFoldRec", "TixFoldRec:2", "istanbul HAYSTACK two"))
+            .expect("insert after restart");
+        assert_eq!(
+            search_by(&e, "TixFoldRec", &lowered),
+            (vec!["TixFoldRec:1".to_string(), "TixFoldRec:2".to_string()], 2),
+        );
+
+        // A second folded index, reopened before any checkpoint with its
+        // definition log gone: only the WAL frame can say what it is.
+        let mut wal_only = def("tix_fold_wal", "TixFoldRec");
+        wal_only.field = "note".to_string();
+        wal_only.folded = true;
+        e.create_text_index(wal_only).expect("declare folded index");
+        std::fs::remove_file(text::definitions_path()).expect("remove the definition log");
+        let e = reopen(e);
+        let wal_mode = e
+            .list_all_indexes()
+            .into_iter()
+            .find(|i| i.name == "tix_fold_wal")
+            .map(|i| i.mode);
+        assert_eq!(wal_mode, Some("folded"), "the WAL replay lost the fold");
     }
 
     /// A count and its query are answered through the same access path,

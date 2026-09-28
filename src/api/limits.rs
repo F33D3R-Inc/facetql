@@ -206,6 +206,14 @@ pub fn in_flight_requests() -> usize {
     max_concurrent_requests().saturating_sub(request_slots().available_permits())
 }
 
+/// The requests the in-flight bound does not apply to: `GET`/`HEAD` of
+/// `/stats` and of the `/` liveness probe (see [`concurrency`]).
+pub fn is_telemetry(request: &Request) -> bool {
+    let method = request.method();
+    (method == axum::http::Method::GET || method == axum::http::Method::HEAD)
+        && matches!(request.uri().path(), "/" | "/stats")
+}
+
 /// Middleware form of the in-flight bound.
 ///
 /// `try_acquire` rather than `acquire`: waiting for a permit is the
@@ -213,6 +221,17 @@ pub fn in_flight_requests() -> usize {
 /// retry, shed load, or fail over — none of which it can do while
 /// blocked inside a request it cannot see the state of.
 pub async fn concurrency(request: Request, next: Next) -> Response {
+    // Telemetry is not admitted work. `GET /stats` and the `GET /`
+    // liveness probe are how a supervisor (the fabric control plane, a
+    // load balancer) sees an instance; capping them with everything else
+    // blinds it exactly when the instance is saturated — the moment it
+    // most needs to be seen. Both are cheap reads of state the server
+    // already holds, so they take no permit and are answered while every
+    // slot is busy.
+    if is_telemetry(&request) {
+        return next.run(request).await;
+    }
+
     let permit = match Arc::clone(request_slots()).try_acquire_owned() {
         Ok(permit) => permit,
 

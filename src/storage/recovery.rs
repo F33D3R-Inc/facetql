@@ -1014,6 +1014,16 @@ fn apply_recovery_operation(
                 .map_err(storage_error)?;
         }
 
+        WalOperation::CreateFoldedTextIndex(mut def) => {
+            // the same declaration, of a folded index: the flag the
+            // definition does not carry on disk, the variant does
+            def.folded = true;
+
+            engine
+                .replay_create_text_index(def)
+                .map_err(storage_error)?;
+        }
+
         WalOperation::DropTextIndex(name) => {
             engine
                 .replay_drop_text_index(&name)

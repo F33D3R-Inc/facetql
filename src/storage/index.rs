@@ -219,7 +219,7 @@ pub struct IndexInfo {
     /// value, so it has no whole value to be unique about.
     pub unique: bool,
 
-    /// `"ordered"` or `"text"`. Additive on the wire: a client that
+    /// `"ordered"`, `"text"` or `"folded"`. Additive on the wire: a client that
     /// predates it sees the three fields it always saw.
     pub mode: &'static str,
 }
@@ -241,7 +241,7 @@ impl IndexInfo {
             kind: def.kind.clone(),
             field: def.field.clone(),
             unique: false,
-            mode: "text",
+            mode: if def.folded { "folded" } else { "text" },
         }
     }
 }
@@ -449,10 +449,13 @@ impl Indexes {
 
     /// The inverted index over exactly this `(kind, field)`, if one was
     /// declared.
-    pub fn text_find(&self, kind: &str, field: &str) -> Option<Arc<TextIndex>> {
+    /// The inverted index of this kind — folded or not — over this field:
+    /// a field may have one of each, since they serve different queries
+    /// (the text itself, and the text lowered).
+    pub fn text_find(&self, kind: &str, field: &str, folded: bool) -> Option<Arc<TextIndex>> {
         self.text_read()
             .values()
-            .find(|i| i.def.kind == kind && i.def.field == field)
+            .find(|i| i.def.kind == kind && i.def.field == field && i.def.folded == folded)
             .cloned()
     }
 

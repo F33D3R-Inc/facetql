@@ -160,6 +160,17 @@ pub struct TextIndexDef {
     /// substring tests in the evaluator, so a node carrying one has no
     /// postings and is correctly absent from every candidate set.
     pub field: String,
+
+    /// A folded index: its postings are the windows of the field's text
+    /// *lowercased* (`predicate::go_lower`, the fct language's `lower`),
+    /// and it serves `contains`/`starts_with`/`ends_with(lower(item.f),
+    /// "…")` — a case-insensitive search — where an unfolded one serves
+    /// the field itself. Not serialized: it would change the positional
+    /// bincode of every definition already written. Which kind a logged
+    /// definition is, the record says — [`TextIndexOpRecord::PutFolded`],
+    /// [`crate::storage::wal::WalOperation::CreateFoldedTextIndex`].
+    #[serde(skip)]
+    pub folded: bool,
 }
 
 /// One operation in `facetql.text_indexes`.
@@ -171,6 +182,22 @@ pub struct TextIndexDef {
 pub enum TextIndexOpRecord {
     Put(TextIndexDef),
     Drop(String),
+
+    /// A folded index's definition. Appended after the existing variants,
+    /// never between them: bincode tags variants by position, so a log
+    /// written before folded indexes existed still reads as it did.
+    PutFolded(TextIndexDef),
+}
+
+impl TextIndexOpRecord {
+    /// The record that declares `def`, of whichever kind it is.
+    pub fn put(def: &TextIndexDef) -> TextIndexOpRecord {
+        if def.folded {
+            TextIndexOpRecord::PutFolded(def.clone())
+        } else {
+            TextIndexOpRecord::Put(def.clone())
+        }
+    }
 }
 
 impl TextIndexDef {
@@ -237,6 +264,22 @@ pub fn index_path(name: &str) -> PathBuf {
 fn fold_into(text: &str, out: &mut Vec<u8>) {
     out.clear();
     out.extend(text.as_bytes().iter().map(u8::to_ascii_lowercase));
+}
+
+/// The text this index stores postings for: the value itself, or — for a
+/// folded index — the value lowercased as the fct language's `lower` does.
+pub fn indexed_form<'a>(def: &TextIndexDef, text: &'a str) -> std::borrow::Cow<'a, str> {
+    if def.folded {
+        std::borrow::Cow::Owned(crate::core::predicate::go_lower(text))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// The postings' windows of one value in one index: [`grams`] of its
+/// [`indexed_form`].
+pub fn postings(def: &TextIndexDef, text: &str) -> Vec<[u8; GRAM_LEN]> {
+    grams(&indexed_form(def, text))
 }
 
 /// Every distinct trigram of `text`, sorted.
@@ -322,9 +365,13 @@ pub fn check_text_keys<'a>(
             parsed = true;
         }
 
-        let Some(text) = indexed_text(decoded.as_ref(), &def.field) else {
+        let Some(raw) = indexed_text(decoded.as_ref(), &def.field) else {
             continue;
         };
+
+        // the bound is on what the index stores: a folded index stores
+        // the lowered text, whose length can differ from the value's
+        let text = indexed_form(def, raw);
 
         if text.len() > MAX_TEXT_VALUE_LEN {
             return Err(format!(

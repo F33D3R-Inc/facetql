@@ -4,4 +4,5 @@ pub mod edge;
 pub mod user;
 pub mod history;
 pub mod predicate;
+pub mod go_lower_table;
 pub mod aggregate;

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-const TOKEN: &str = "dev-local-key-change-me";
+pub const TOKEN: &str = "dev-local-key-change-me";
 
 /// A free port, found by binding and immediately releasing one.
 pub fn free_port() -> u16 {
